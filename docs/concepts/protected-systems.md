@@ -16,5 +16,7 @@ In brief:
   authorization
 
 No protected systems are currently declared for BuildRail itself
-(`.buildrail/config.yml` has `protected_systems: []`), since there is no
-functional implementation yet to protect.
+(`.buildrail/config.yml` has `protected_systems: []`). BR1 introduced
+BuildRail's first functional implementation (the CLI skeleton), but
+protected-path enforcement is not implemented until later phases (see
+`docs/PROTECTED_SYSTEMS.md`), so no declaration is meaningful yet.

@@ -1,6 +1,10 @@
 # BR1 — CLI Skeleton
 
-**Status: AUTHORIZED / IMPLEMENTATION NOT YET STARTED**
+**Status: COMPLETE / INDEPENDENTLY APPROVED / HUMAN QA PASSED / MERGED / FROZEN**
+
+Approved implementation candidate: `36f7b0a569eeee0cd1c5d7472cf176763c818a2e`
+
+Merged on main: `3b695399eae01720804ec496e7735d636edaed41`
 
 For the authoritative BR1 implementation contract (architectural boundary,
 command behavior, build/execution model, dependency policy, testing
