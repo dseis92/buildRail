@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: PREFLIGHT
+  lifecycle_state: IMPLEMENTING
   development_phase: BR1
 
 authorization:
