@@ -31,12 +31,15 @@ the governance model itself.
 
 **BR0 (Constitution) is complete, independently approved, and frozen** at
 baseline `04c93767510c51916fcc51f60b85b674c7d6f1cc` (see
-`.buildrail/state.yml`). **BR1 (CLI Skeleton) is human-authorized for
-implementation** per `.buildrail/specs/BR1-CLI-SKELETON.md` — but
-implementation has not yet started. An implementation agent must still run
-BR1 preflight before beginning any actual `packages/cli/**` changes.
-**BR2–BR8 remain planned only** — do not begin implementation on them. See
-`docs/ROADMAP.md` and `docs/development/` for what each phase covers.
+`.buildrail/state.yml`). **BR1 (CLI Skeleton) is complete, independently
+approved, Human-QA-passed, merged, and frozen** at approved candidate
+`36f7b0a569eeee0cd1c5d7472cf176763c818a2e` (merged to `main` as
+`3b695399eae01720804ec496e7735d636edaed41`). BuildRail now has a real,
+executable `buildrail` CLI shell (`packages/cli`) — see
+`.buildrail/specs/BR1-CLI-SKELETON.md`. **No implementation phase is
+currently authorized.** BR2–BR8 remain planning only — do not begin
+implementation on them. See `docs/ROADMAP.md` and `docs/development/` for
+what each phase covers.
 
 For the full governance model, see `docs/GOVERNANCE.md`.
 

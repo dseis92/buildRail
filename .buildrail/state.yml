@@ -9,35 +9,46 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: PENDING_REVIEW
+  lifecycle_state: FROZEN
   development_phase: BR1
 
 authorization:
   id: BR1
   type: feature
   title: CLI Skeleton
-  status: authorized
+  status: completed
   specification: .buildrail/specs/BR1-CLI-SKELETON.md
   granted_by: human
 
 candidate:
-  branch: feature/br1-cli-skeleton
-  base_sha: a7bcd07680a0ad21011a374812b14dae1b1a120c
+  branch: null
+  base_sha: null
   candidate_sha: null
 
 # Immutable approved checkpoints for completed/frozen phases. Distinct from
 # `candidate` above, which tracks the exact in-progress candidate still
 # moving through implementation/review — not a completed phase's record.
+#
+# `approved_sha` is the exact independently reviewed and Human-QA-approved
+# implementation candidate, not the merge commit that later brought it into
+# main. The merge commit for BR1 was 3b695399eae01720804ec496e7735d636edaed41
+# — a separate repository checkpoint, recorded here for reference only.
 baselines:
   BR0:
     approved_sha: 04c93767510c51916fcc51f60b85b674c7d6f1cc
     status: frozen
+  BR1:
+    approved_sha: 36f7b0a569eeee0cd1c5d7472cf176763c818a2e
+    status: frozen
 
-# BR0 has been independently reviewed, approved, and frozen at the SHA
-# recorded under `baselines.BR0`. BR1 is now authorized (see `authorization`
-# above) but not yet completed, implemented, or baselined.
+# BR0 and BR1 have each been independently reviewed, approved, and frozen
+# at the SHAs recorded under `baselines`. No implementation authorization
+# is currently active. BR1 established the first real, executable
+# BuildRail CLI (packages/cli) — governance/state/config loading, Git
+# inspection, and verification remain unimplemented until later phases.
 completed_phases:
   - BR0
+  - BR1
 
 planned_phases:
   - BR2

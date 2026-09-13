@@ -49,7 +49,8 @@ quality_gates:
     required: true
     note: "Required for BR1 executable build."
 
-# No protected paths are defined yet. BuildRail's own source tree has no
-# functional implementation during BR0, so there is nothing to protect
-# beyond normal Git history.
+# No protected paths are defined yet. BR1 introduced BuildRail's first
+# functional implementation (the CLI skeleton in packages/cli), but
+# protected-path enforcement itself is not implemented until BR2/BR3 (see
+# docs/PROTECTED_SYSTEMS.md), so no declaration here would be enforceable.
 protected_systems: []

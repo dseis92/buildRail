@@ -45,9 +45,11 @@ happen to mention them.
 
 ## Status
 
-`.buildrail/config.yml` currently declares `protected_systems: []` because
-BuildRail's own source tree has no functional implementation yet during
-BR0 — there is nothing meaningful to protect. Real protected-system
+`.buildrail/config.yml` currently declares `protected_systems: []`. BR1
+introduced BuildRail's first functional implementation (the CLI skeleton
+in `packages/cli`), but no protected-path declaration or enforcement
+exists yet — path-matching enforcement itself is not implemented until
+BR2/BR3 (see "Planned path matching" above). Real protected-system
 declarations, for BuildRail itself or for BuildRail-managed projects, come
 later as actual sensitive systems (e.g. the governance engine's core
-policy logic) are built.
+policy logic) are built and as enforcement becomes real.
