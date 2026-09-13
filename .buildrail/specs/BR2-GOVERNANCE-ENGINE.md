@@ -1292,31 +1292,57 @@ function completeAndFreezePhase(
 **Contract**, performed atomically (all checks pass and every field below
 changes together, or nothing changes) — **every one of the following
 preconditions must hold before `completeAndFreezePhase` succeeds; failing
-any one of them fails the whole call with no partial state change:**
+any one of them fails the whole call with no partial state change.**
+Checks are grouped into two ordered phases: **(A) the canonical
+authorization-policy check, reused verbatim from §13, not reimplemented**,
+followed by **(B) closure-specific checks unique to this operation**.
 
-1. `state.current.lifecycle_state === "PRODUCTION_VERIFIED"` — otherwise
+**(A) Canonical authorization-policy check — composed, not
+reimplemented:** `completeAndFreezePhase` calls
+`checkImplementationAllowed(state, state.current.development_phase)`
+(§13) as its authorization check, and propagates whatever `PolicyError`
+it returns, **unchanged**, as `completeAndFreezePhase`'s own failure.
+This is the same function `applyTransition` already composes for its 11
+authorization-gated edges (§15's "Composition with authorization policy"
+subsection) — `completeAndFreezePhase` does not invent a second,
+independently-maintained authorization-classification path that could
+drift from it. Concretely, this means `completeAndFreezePhase` inherits
+§13's exact, mandatory check order and its exact failure codes:
+
+1. `authorization` absent → `AUTHORIZATION_MISSING`
+2. `authorization.status === "revoked"` → `AUTHORIZATION_REVOKED`
+   **specifically — never `AUTHORIZATION_INACTIVE`**, exactly as §13
+   mandates for every other caller of `checkImplementationAllowed`. An
+   earlier draft of this contract listed its own, separate ordered check
+   list that collapsed `"draft"`, `"revoked"`, and `"completed"` all into
+   a single `AUTHORIZATION_INACTIVE` outcome — that duplicate,
+   divergent classification is retracted here. There is exactly one
+   authorization-classification path in BR2, and `completeAndFreezePhase`
+   uses it.
+3. `authorization.status` is `"draft"` or `"completed"` (having already
+   ruled out `"revoked"` and confirmed presence) → `AUTHORIZATION_INACTIVE`
+4. `authorization.id !== state.current.development_phase` →
+   `AUTHORIZATION_PHASE_MISMATCH`
+5. `authorization.specification`/`granted_by` semantic checks (§13) →
+   the corresponding `AUTHORIZATION_*` code
+
+**(B) Closure-specific checks**, evaluated only after (A) succeeds:
+
+6. `state.current.lifecycle_state === "PRODUCTION_VERIFIED"` — otherwise
    `LIFECYCLE_TRANSITION_ILLEGAL`, mirroring what `applyTransition`
    reports for any other illegal `from` state.
-2. `actor === "human_owner"` — otherwise `LIFECYCLE_AUTHORITY_REQUIRED`,
+7. `actor === "human_owner"` — otherwise `LIFECYCLE_AUTHORITY_REQUIRED`,
    matching `docs/STATE_MACHINE.md`'s explicit "Freezing" rule and §15's
    table entry for this edge.
-3. `state.authorization` is present — otherwise `AUTHORIZATION_MISSING`.
-   There is no phase-closure semantics to apply without an authorization
-   record identifying which phase is being closed.
-4. `state.authorization.id === state.current.development_phase` —
-   otherwise `AUTHORIZATION_PHASE_MISMATCH`. The authorization being
-   closed out must actually be the one for the phase currently active.
-5. `state.authorization.status` is `"authorized"` or `"in_progress"` —
-   otherwise `AUTHORIZATION_INACTIVE` (this correctly rejects, among
-   other things, a second `completeAndFreezePhase` call against a phase
-   whose authorization has already transitioned to `"completed"` by a
-   prior successful call — see checks 6–7 below for the equivalent,
-   more specific rejection at the `completed_phases`/`baselines` layer).
-6. **`state.current.development_phase` is NOT already present in
+8. **`state.current.development_phase` is NOT already present in
    `state.completed_phases`** — otherwise `LIFECYCLE_TRANSITION_ILLEGAL`.
    A phase that has already been recorded as completed cannot be closed
-   a second time.
-7. **`state.current.development_phase` is NOT already a key in
+   a second time. (In practice this is largely redundant with check 3
+   above — a phase already in `completed_phases` normally also already
+   has `authorization.status: "completed"` — but this check exists as
+   its own explicit, independently-enforced invariant rather than relying
+   on that correlation always holding.)
+9. **`state.current.development_phase` is NOT already a key in
    `state.baselines`** — otherwise `LIFECYCLE_TRANSITION_ILLEGAL`. A
    phase that already has a frozen baseline cannot be given a second one.
    **`completeAndFreezePhase` must never overwrite an existing baseline
@@ -1325,21 +1351,18 @@ any one of them fails the whole call with no partial state change:**
    `planned_phases` removal (which is deliberately idempotent, §15), phase
    *closure* is a one-time, non-repeatable event: a caller retrying a
    failed persistence step must re-run `completeAndFreezePhase` only
-   against a state that has not yet actually been persisted as closed:
-   an earlier draft of this contract described `completed_phases`/
-   `baselines` updates as themselves idempotent ("if not already
-   present... appending is idempotent," "gains (or replaces...)") — that
-   description is retracted. Checks 6 and 7 make closure a strict
-   one-time transition instead: attempting to close an already-closed
-   phase is rejected, not silently treated as a successful no-op.
-8. `request.approvedSha` matches `^[0-9a-f]{40}$` (the same pattern
-   `state.schema.json`'s `#/$defs/baseline.approved_sha` already
-   requires) — otherwise `BASELINE_SHA_INVALID` (§18). This is a
-   semantic, format-level check (§9's "boundary" note above) —
-   `completeAndFreezePhase` does not verify the SHA actually exists in
-   any Git repository or corresponds to a real commit; BR2 has no Git
-   capability (§4, §6) to do so. Confirming the SHA is real is BR3's
-   concern; BR2 only confirms the *shape* is well-formed.
+   against a state that has not yet actually been persisted as closed.
+   Checks 8 and 9 make closure a strict one-time transition: attempting
+   to close an already-closed phase is rejected, not silently treated as
+   a successful no-op.
+10. `request.approvedSha` matches `^[0-9a-f]{40}$` (the same pattern
+    `state.schema.json`'s `#/$defs/baseline.approved_sha` already
+    requires) — otherwise `BASELINE_SHA_INVALID` (§18). This is a
+    semantic, format-level check (§9's "boundary" note above) —
+    `completeAndFreezePhase` does not verify the SHA actually exists in
+    any Git repository or corresponds to a real commit; BR2 has no Git
+    capability (§4, §6) to do so. Confirming the SHA is real is BR3's
+    concern; BR2 only confirms the *shape* is well-formed.
 
 **On success**, returns a new `BuildRailState` with **all** of the
 following changed together — this is exactly the closure shape
@@ -1352,19 +1375,32 @@ rolling over *from*, by construction:
   `"completed"` meaning; `completeAndFreezePhase` does not otherwise
   alter any other field of the `authorization` object)
 - `completed_phases` gains `state.current.development_phase` appended
-  **exactly once** (check 6 above guarantees it was not already present,
-  so this is a genuine append, never a duplicate-avoiding no-op)
-- `baselines` gains **a new entry** (check 7 above guarantees no entry
+  **exactly once** (check 8 above guarantees it was not already present,
+  so this is a genuine append, never a duplicate-avoiding no-op). Unlike
+  `candidate` and `baselines` (below), `completed_phases` **is** in
+  `state.schema.json`'s top-level `required` array (§9, §12) — a validly
+  `loadState`-loaded `BuildRailState` therefore always has it present (as
+  an array, possibly empty), so `completeAndFreezePhase` never needs to
+  create it from scratch; it only ever appends to an already-present
+  array.
+- `baselines` gains **a new entry** (check 9 above guarantees no entry
   for this phase id already exists, so this is always a fresh insert,
   never an overwrite) keyed by `state.current.development_phase` with
-  `approved_sha: request.approvedSha` and `status: "frozen"`
-- `candidate.branch` set to `null`
-- `candidate.base_sha` set to `null`
-- `candidate.candidate_sha` set to `null` — closing a phase always clears
-  any in-flight candidate recorded against it, so the next phase
-  activated via `activatePhase` finds `candidate` already fully `null`
-  (satisfying `activatePhase`'s own precondition, §15, without requiring
-  a separate manual reset step)
+  `approved_sha: request.approvedSha` and `status: "frozen"`. **If
+  `state.baselines` itself is absent** (schema-optional — see "Optional
+  `candidate` and `baselines`" below), `completeAndFreezePhase` treats it
+  as an empty map and creates it, containing exactly this one new entry —
+  absence of the whole map is never an error, and is never confused with
+  "the current phase's key already exists" (check 9), which requires the
+  map to be present *and* contain that specific key.
+- `candidate.branch`, `candidate.base_sha`, and `candidate.candidate_sha`
+  all set to `null` — see "Optional `candidate` and `baselines`" below
+  for the exact, deterministic behavior when `state.candidate` itself is
+  absent going in. Closing a phase always leaves behind the canonical
+  fully-`null` `candidate` object, so the next phase activated via
+  `activatePhase` finds `candidate` in exactly the shape its own
+  precondition (§15) requires, without requiring a separate manual reset
+  step.
 
 **Preserved unchanged:** `current.development_phase`, `planned_phases`,
 `project`, `schema_version`, `review`, `protected_systems`, and every
@@ -1373,6 +1409,69 @@ other `baselines`/`completed_phases` entry not being added.
 Pure, like `applyTransition`/`authorizeSpecifiedWork`/`activatePhase` —
 no file I/O; persisting the result to `.buildrail/state.yml` remains the
 caller's responsibility (§7).
+
+#### Optional `candidate` and `baselines` — deterministic handling of schema-optional absence
+
+**Both `candidate` and `baselines` are schema-optional in
+`state.schema.json` today** — neither appears in the schema's top-level
+`required` array (§12 already established this for `authorization`; the
+same is true of these two properties). An earlier draft of this
+specification contained wording suggesting `candidate` "might" become
+optional "if the schema is ever loosened to allow that" — that statement
+was factually wrong as written: the schema already permits `candidate`'s
+absence today, with no future loosening required. That wording is
+retracted; both properties' current optionality is treated as an
+existing fact BR2 must handle, not a hypothetical future one.
+
+**`candidate`:**
+
+- `completeAndFreezePhase` must not access `state.candidate.branch` (or
+  `.base_sha`/`.candidate_sha`) without first handling the case where
+  `state.candidate` itself is `undefined` — doing so unconditionally
+  would be an unguarded property access on a possibly-absent object.
+- **On successful closure:** if `state.candidate` is present,
+  `completeAndFreezePhase` sets all three of its fields to `null` in
+  place. If `state.candidate` is absent, `completeAndFreezePhase`
+  *creates* the canonical candidate object — `{ branch: null, base_sha:
+  null, candidate_sha: null }` — rather than leaving it absent. Either
+  way, the output always has a `candidate` object present with all three
+  fields `null`; a caller of `completeAndFreezePhase` never needs to
+  branch on whether `candidate` existed going in.
+- **`activatePhase`'s "no in-flight candidate" precondition (§15) is
+  defined to accept exactly two equivalent shapes, not one:**
+  - **(A)** `state.candidate` is absent entirely, or
+  - **(B)** `state.candidate` is present with `branch`, `base_sha`, and
+    `candidate_sha` all `null`.
+  Both (A) and (B) mean "no in-flight candidate" and are equally
+  acceptable to `activatePhase`. Any other shape — `candidate` present
+  with any one of the three fields non-`null`, or partially populated —
+  remains a closure-invariant failure (`LIFECYCLE_TRANSITION_ILLEGAL`),
+  exactly as already specified. In practice, a phase closed via
+  `completeAndFreezePhase` always produces shape (B) (never (A) — see
+  above), so `activatePhase` following a `completeAndFreezePhase` call
+  always sees (B); shape (A) exists in this precondition specifically to
+  also accept a state that never had `candidate` populated at all (e.g.
+  a hand-constructed fixture, or a project state predating BR3's
+  candidate-tracking).
+
+**`baselines`:**
+
+- `completeAndFreezePhase` must define behavior when `state.baselines`
+  is absent, not merely when it is present-but-missing-the-current-key.
+  **On successful first closure**, an absent `state.baselines` is
+  treated as an empty map: `completeAndFreezePhase` creates it, and the
+  created map contains exactly the one new frozen-baseline entry for the
+  phase being closed.
+- **If `state.baselines` already exists** (from a prior phase's
+  closure), `completeAndFreezePhase` preserves every existing entry
+  unchanged and inserts the new entry alongside them — never replacing
+  the map wholesale, only adding to it.
+- Check 9 above (rejecting a phase already present as a `baselines` key)
+  applies identically whether `state.baselines` was already present with
+  other entries or is being created fresh by this very call — "the map
+  is absent" and "the map is present but lacks this key" are the only
+  two states check 9 must treat as passing; "the map is present and
+  contains this key already" is the only state check 9 rejects.
 
 **`applyTransition`'s own behavior for this specific pair is precisely
 defined:** `applyTransition(state, "FROZEN", actor)` where
@@ -1640,11 +1739,25 @@ directly instead of asking the caller to compute and pass it.)
    - `current.development_phase` appears in `state.completed_phases`
    - `current.development_phase` appears as a key in `state.baselines`,
      and that entry's `status === "frozen"`
-   - `state.candidate`'s three fields (`branch`, `base_sha`,
-     `candidate_sha`) are all `null` (or the `candidate` object is
-     entirely absent, if the schema is ever loosened to allow that) — no
-     in-flight candidate should still be recorded against a phase that is
-     being rolled over from
+   - **No in-flight candidate**, per the "Optional `candidate` and
+     `baselines`" subsection above: either `state.candidate` is present
+     with all three fields (`branch`, `base_sha`, `candidate_sha`) `null`
+     (shape B), **or** `state.candidate` is absent entirely (shape A) —
+     `candidate` is schema-optional in `state.schema.json` today, not a
+     hypothetical future loosening, and both shapes are accepted as
+     equally valid "no in-flight candidate" evidence. Any other shape
+     (present with one or more non-`null` fields, or partially populated)
+     fails this precondition.
+   The `completed_phases`/`baselines` bullets above require
+   `current.development_phase` to actually *appear* in each — which is
+   only possible if both are present (non-absent) and populated, so this
+   precondition never needs to separately branch on `completed_phases`/
+   `baselines` being schema-optionally absent: an absent map or array
+   trivially fails to contain the required key/entry, and the
+   precondition fails the same way it would for a present-but-missing-key
+   map. (`completeAndFreezePhase`, above, is the operation responsible for
+   creating both when they are absent — see "Optional `candidate` and
+   `baselines`.")
    If any of these does not hold, `activatePhase` fails with
    `LIFECYCLE_TRANSITION_ILLEGAL` — you cannot roll over to a new phase
    while the current one is still mid-flight, or is `FROZEN` in
@@ -2030,13 +2143,39 @@ Rationale:
   site handle them explicitly (TypeScript's type system forces the caller
   to check `ok` before accessing `value`), which directly serves BR2's
   goal of deterministic, non-crashing governance behavior.
-- Actual exceptions (thrown `Error`/subclasses) are reserved for genuinely
-  unexpected, programmer-error-class failures: `createRegistry()` throwing
-  `SchemaReferenceUnresolvedError` is the one deliberate exception in this
-  spec, because a broken schema file is a BuildRail installation defect,
-  not a per-project data problem a caller should be expected to handle
-  gracefully inline — it should fail loudly and immediately, ideally
-  crashing a build/CI step rather than being silently caught.
+- **Internal setup exceptions exist, but never escape past
+  `loadConfig`/`loadState` — they are always translated into the `Result`
+  world before reaching any caller.** `createRegistry()` (§10's "Schema
+  error taxonomy") may throw one of two distinctly-typed internal
+  exceptions on a registration-time failure — a `SchemaReferenceUnresolvedError`
+  when every schema file loaded and parsed but an internal `$ref` among
+  them could not be resolved, or some other registry-setup exception for
+  every other registration-time failure (a missing schema asset, an
+  unreadable file, malformed JSON). **An earlier draft of this
+  specification described `SchemaReferenceUnresolvedError` as "the one
+  deliberate exception in this spec" and said a broken schema file
+  "should fail loudly and immediately, ideally crashing a build/CI step
+  rather than being silently caught" — that framing is retracted.** It
+  predates §10's schema error taxonomy (which distinguishes two internal
+  exception kinds, not one) and, more importantly, it is incompatible
+  with `loadConfig`/`loadState`'s own `Result`-returning contract: those
+  two functions call `createRegistry()` inside a `try/catch` as their
+  first step (§10) and **must** catch both exception kinds — neither is
+  permitted to propagate out of `loadConfig`/`loadState` as an unhandled
+  exception, and no caller of either function (including
+  `buildrail status`) is expected to wrap a normal loader call in its own
+  `try/catch` to survive a schema installation defect. "Fail loudly" for
+  a broken schema installation means **returning a clearly identified,
+  typed installation-integrity error** — `SCHEMA_REFERENCE_UNRESOLVED` or
+  `SCHEMA_SETUP_FAILED` respectively (§10, §18) — through the ordinary
+  `Result` channel, not crashing the CLI process or leaking a raw stack
+  trace to a `buildrail status` user. `buildrail status` therefore always
+  receives a typed loader error for this case, exactly as it does for
+  every other `loadConfig`/`loadState` failure, and translates it the
+  same way (§19's "CLI translation is a separate layer," below).
+  Exceptions in BR2 are reserved, in this narrow, fully-contained sense,
+  for signaling *within* the loader's own setup step — never for
+  signaling failure *to* a `loadConfig`/`loadState` caller.
 - **CLI translation is a separate layer.** `packages/cli/src/commands/status.ts`
   receives `Result` values from `@buildrail/core` and is responsible for
   converting `{ok: false, error}` into BR1-contract-compliant stdout text
@@ -2524,6 +2663,7 @@ not merely a suggested one):
 - Fails with `LIFECYCLE_AUTHORITY_REQUIRED` for any actor other than `"human_owner"`
 - Fails with `LIFECYCLE_TRANSITION_ILLEGAL` when `current.lifecycle_state` is not `"FROZEN"`
 - **Each closure invariant is tested independently as a rejection case (no bootstrap exception — the specific defect this correction fixes):** a fixture at `current.lifecycle_state: "FROZEN"` but with `authorization.status` still `"authorized"`/`"in_progress"` (not yet `"completed"`) fails with `LIFECYCLE_TRANSITION_ILLEGAL`; a fixture where the frozen phase is missing from `completed_phases` fails the same way; a fixture where it is missing from `baselines`, or present with `status` other than `"frozen"`, fails the same way; a fixture with a non-null `candidate.branch`/`base_sha`/`candidate_sha` left over fails the same way — proving `activatePhase` genuinely requires full closure, not merely `lifecycle_state === "FROZEN"` in isolation
+- **Accepts `candidate` absent as "no in-flight candidate" (required test, §15's "Optional `candidate` and `baselines`"):** a fixture otherwise satisfying every closure invariant, but with no `candidate` key at all (shape A), succeeds identically to the equivalent fixture with `candidate` present and all three fields `null` (shape B) — proving `activatePhase` treats both shapes as equally valid evidence of "no in-flight candidate," not merely the fully-`null`-object shape a phase closed via `completeAndFreezePhase` always produces
 - **Rejects reactivating a closed phase ID (the other specific defect this correction fixes):** a call with `request.newPhaseId` equal to a key already present in `state.baselines` (e.g. `"BR1"`) fails with `LIFECYCLE_TRANSITION_ILLEGAL` — proving BR2 does not silently allow reusing an already-frozen phase ID as a new activation target
 - The same rejection is confirmed for `request.newPhaseId` already present in `state.completed_phases`, independent of whether it's also a `baselines` key
 - Fails with `AUTHORIZATION_INACTIVE` when `request.newAuthorization.status` is not `"authorized"`
@@ -2544,10 +2684,28 @@ not merely a suggested one):
   all set to `null`
 - Fails with `LIFECYCLE_AUTHORITY_REQUIRED` for any actor other than `"human_owner"`
 - Fails with `LIFECYCLE_TRANSITION_ILLEGAL` when `current.lifecycle_state` is not `"PRODUCTION_VERIFIED"`
-- Fails with `AUTHORIZATION_MISSING` when `state.authorization` is absent
-- Fails with `AUTHORIZATION_PHASE_MISMATCH` when `state.authorization.id !== state.current.development_phase`
-- Fails with `AUTHORIZATION_INACTIVE` when `state.authorization.status` is
-  `"draft"`, `"completed"`, or `"revoked"` (not `"authorized"`/`"in_progress"`)
+- **Composes `checkImplementationAllowed` verbatim (the specific defect
+  this correction fixes) — every authorization-failure case is tested
+  with the exact §13 code, not a collapsed/reimplemented classification:**
+  - Fails with `AUTHORIZATION_MISSING` when `state.authorization` is absent
+  - **Fails with `AUTHORIZATION_REVOKED` — never `AUTHORIZATION_INACTIVE`
+    — when `state.authorization.status === "revoked"`**, even when every
+    other precondition (lifecycle state, actor, phase match, no prior
+    closure) is otherwise satisfied. This is the exact required test: a
+    revoked-authorization fixture must produce `AUTHORIZATION_REVOKED`
+    from `completeAndFreezePhase`, proving it reuses §13's canonical,
+    correctly-ordered classification rather than maintaining its own,
+    divergent one that would collapse `revoked` into `inactive`.
+  - Fails with `AUTHORIZATION_INACTIVE` when `state.authorization.status`
+    is `"draft"` or `"completed"` specifically (having ruled out
+    `"revoked"` above — not `"authorized"`/`"in_progress"`)
+  - Fails with `AUTHORIZATION_PHASE_MISMATCH` when `state.authorization.id !== state.current.development_phase`
+  - The check-order proof from §13/§22's Authorization-policy category
+    (a record simultaneously `revoked` and otherwise-invalid still
+    produces `AUTHORIZATION_REVOKED`, not a later-order failure) is
+    confirmed to hold identically when reached via
+    `completeAndFreezePhase`, not only via direct
+    `checkImplementationAllowed` calls
 - **Rejects closing an already-completed phase (no idempotent re-closure
   — the specific defect this correction fixes):** a fixture whose
   `current.development_phase` is already present in
@@ -2575,6 +2733,21 @@ not merely a suggested one):
   subsequent `activatePhase` call (with a fresh `newPhaseId`/
   `newAuthorization`) succeeds, proving the two operations' contracts are
   genuinely compatible end to end, not merely documented as compatible
+- **Closure with `candidate` absent (required test, §15's "Optional
+  `candidate` and `baselines`"):** a fixture that satisfies every other
+  precondition but has no `candidate` key at all succeeds, and the
+  returned state has a `candidate` object present with `branch`,
+  `base_sha`, and `candidate_sha` all `null` — proving
+  `completeAndFreezePhase` creates the canonical candidate object rather
+  than erroring on, or silently leaving absent, a schema-optional missing
+  `candidate`
+- **Closure with `baselines` absent (required test):** a fixture that
+  satisfies every other precondition but has no `baselines` key at all
+  succeeds, and the returned state has a `baselines` map present
+  containing exactly one entry — the newly-created frozen baseline for
+  the closing phase — proving `completeAndFreezePhase` treats an absent
+  map as empty and creates it, rather than erroring on it or requiring
+  the caller to pre-populate an empty map
 - `applyTransition(state, "FROZEN", actor)` — the generic function,
   called directly for this specific pair — fails with
   `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` (does not silently succeed as
@@ -2830,19 +3003,27 @@ existing shape exactly.
 - **X.** `completeAndFreezePhase` (§15) is the exclusive path from
   `PRODUCTION_VERIFIED → FROZEN` — a bare `applyTransition` call for that
   pair fails with `LIFECYCLE_DEDICATED_OPERATION_REQUIRED`, never a
-  silent lifecycle-only update — requires an active, phase-matching
-  authorization and requires the closing phase to be absent from both
-  `completed_phases` and `baselines` (never overwriting an existing
-  baseline, never treating an already-closed phase as idempotently
-  re-closable), and on success atomically sets `current.lifecycle_state`,
-  `authorization.status: "completed"`, `completed_phases`, a new
-  `baselines` entry (keyed by the closing phase, `status: "frozen"`,
-  `approved_sha` taken from `request.approvedSha`), and clears all three
-  `candidate.*` fields to `null` — producing exactly the closure shape
-  `activatePhase`'s own precondition requires — rejecting a malformed SHA
-  with the new `BASELINE_SHA_INVALID` code — proven by the dedicated test
-  matrix in §22, including the end-to-end
-  `completeAndFreezePhase` → `activatePhase` compatibility test.
+  silent lifecycle-only update. **Its authorization check is
+  `checkImplementationAllowed` composed verbatim (§13), not a
+  reimplemented classification** — in particular, a revoked authorization
+  produces `AUTHORIZATION_REVOKED`, never `AUTHORIZATION_INACTIVE`, via
+  `completeAndFreezePhase` exactly as it would via any other caller of
+  `checkImplementationAllowed`. It requires the closing phase to be
+  absent from both `completed_phases` and `baselines` (never overwriting
+  an existing baseline, never treating an already-closed phase as
+  idempotently re-closable), and on success atomically sets
+  `current.lifecycle_state`, `authorization.status: "completed"`,
+  `completed_phases`, a new `baselines` entry (keyed by the closing
+  phase, `status: "frozen"`, `approved_sha` taken from
+  `request.approvedSha`, creating the map fresh if it was absent), and
+  sets all three `candidate.*` fields to `null` (creating the `candidate`
+  object fresh if it was absent) — producing exactly the closure shape
+  `activatePhase`'s own precondition requires, which in turn accepts
+  either an absent `candidate` or a fully-`null` one as equivalent "no
+  in-flight candidate" evidence — rejecting a malformed SHA with the new
+  `BASELINE_SHA_INVALID` code — proven by the dedicated test matrix in
+  §22, including the end-to-end `completeAndFreezePhase` → `activatePhase`
+  compatibility test and the candidate-absent/baselines-absent tests.
 - **Y.** `loadConfig`/`loadState` correctly implement the complete
   three-outcome schema error taxonomy (§10): an unregistered schema id
   passed to a healthy `validate()` call returns `{ registered: false }`
@@ -3064,14 +3245,21 @@ The independent reviewer must specifically examine, for BR2:
   24 legal edges
 - Whether `completeAndFreezePhase` (§15) atomically performs every part
   of phase closure (`lifecycle_state`, `authorization.status`,
-  `completed_phases`, the new `baselines` entry, clearing all three
-  `candidate.*` fields) together, requires an active phase-matching
-  authorization, genuinely rejects (never overwrites, never idempotently
-  no-ops) closing a phase already present in `completed_phases` or
-  `baselines`, rejects a malformed SHA with `BASELINE_SHA_INVALID`, is
-  the only path that reaches `FROZEN` from `PRODUCTION_VERIFIED`, and
-  produces output that satisfies `activatePhase`'s own closure-invariant
-  precondition directly
+  `completed_phases`, the new `baselines` entry, setting all three
+  `candidate.*` fields to `null`) together, **composes
+  `checkImplementationAllowed` verbatim for its authorization check
+  rather than reimplementing a divergent classification — specifically,
+  whether a revoked authorization produces `AUTHORIZATION_REVOKED`, not
+  `AUTHORIZATION_INACTIVE`**, genuinely rejects (never overwrites, never
+  idempotently no-ops) closing a phase already present in
+  `completed_phases` or `baselines`, correctly creates `candidate`/
+  `baselines` from scratch when either is absent going in rather than
+  erroring or leaving them absent, rejects a malformed SHA with
+  `BASELINE_SHA_INVALID`, is the only path that reaches `FROZEN` from
+  `PRODUCTION_VERIFIED`, and produces output that satisfies
+  `activatePhase`'s own closure-invariant precondition directly —
+  including `activatePhase`'s acceptance of both an absent and a
+  fully-`null` `candidate` as equivalent
 - Whether `requiredActor` returns the fully deterministic three-way
   contract (`Actor` value / `null` / `undefined`) specified in §15's API
   section, never throwing for an illegal pair — the corrected replacement
@@ -3086,6 +3274,12 @@ The independent reviewer must specifically examine, for BR2:
   throwing distinctly-typed exceptions per kind that `loadConfig`/
   `loadState` translate by type, never an unhandled exception escaping
   either loader
+- **Whether a broken schema installation genuinely surfaces as a typed
+  loader error to `buildrail status`, not a crash or raw stack trace
+  (§19)** — simulate a `createRegistry()` setup failure and confirm
+  `buildrail status` prints a deterministic, translated error message and
+  exits `1` (per BR1's error contract), rather than the process crashing
+  or an uncaught exception's stack trace appearing in stdout/stderr
 - Whether `packages/core/package.json`'s final shape matches §20.4's
   target contract exactly, and whether a clean `npm ci` + root `npm run
   build` genuinely builds `@buildrail/core` before `@buildrail/cli`
