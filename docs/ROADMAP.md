@@ -8,7 +8,7 @@ authorized, regardless of how "obviously next" it may seem.
 |-------|------|---------|--------|
 | BR0 | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. | **COMPLETE + INDEPENDENTLY APPROVED + FROZEN** (baseline `04c93767510c51916fcc51f60b85b674c7d6f1cc`) |
 | BR1 | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` | **COMPLETE + INDEPENDENTLY APPROVED + HUMAN QA PASSED + FROZEN** (approved candidate `36f7b0a569eeee0cd1c5d7472cf176763c818a2e`, merged as `3b695399eae01720804ec496e7735d636edaed41`) |
-| BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions | PLANNED |
+| BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions | **SPECIFIED** (not implementation-authorized) |
 | BR3 | Git Inspection | Branch detection, HEAD/remote SHA, working tree, diff inspection, protected-path/deletion/rename detection | PLANNED |
 | BR4 | Verification | Quality gate commands, candidate-bound verification, `buildrail verify`, evidence reports | PLANNED |
 | BR5 | Agent Skills | Planning, preflight, implementation, verification, review, completion, handoff skills | PLANNED |

@@ -37,9 +37,11 @@ approved, Human-QA-passed, merged, and frozen** at approved candidate
 `3b695399eae01720804ec496e7735d636edaed41`). BuildRail now has a real,
 executable `buildrail` CLI shell (`packages/cli`) — see
 `.buildrail/specs/BR1-CLI-SKELETON.md`. **No implementation phase is
-currently authorized.** BR2–BR8 remain planning only — do not begin
-implementation on them. See `docs/ROADMAP.md` and `docs/development/` for
-what each phase covers.
+currently authorized.** BR2 (Governance Engine) has a detailed
+specification (`.buildrail/specs/BR2-GOVERNANCE-ENGINE.md`) but is not
+implementation-authorized. BR3–BR8 remain planning only — do not begin
+implementation on any of BR2–BR8. See `docs/ROADMAP.md` and
+`docs/development/` for what each phase covers.
 
 For the full governance model, see `docs/GOVERNANCE.md`.
 

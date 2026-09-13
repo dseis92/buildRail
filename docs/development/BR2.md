@@ -1,6 +1,16 @@
 # BR2 — Governance Engine
 
-**Status: PLANNED / NOT IMPLEMENTATION AUTHORIZED**
+**Status: SPECIFIED / NOT IMPLEMENTATION AUTHORIZED**
+
+See `.buildrail/specs/BR2-GOVERNANCE-ENGINE.md` for the detailed BR2
+specification (architectural boundary, config/state loading contracts,
+schema registry and `$ref` resolution strategy, active/historical
+authorization semantics, lifecycle engine, CLI integration, error model,
+dependency proposals, test architecture, and acceptance criteria). That
+document is the authoritative BR2 specification; this page remains a
+short summary. Writing that specification does not authorize
+implementation — a separate human-owner governance activation is required
+before BR2 implementation may begin.
 
 ## Goal
 
@@ -45,11 +55,13 @@ and enforcing legal lifecycle transitions.
 
 - BR1 (CLI surface to expose this through)
 
-## Deferred from BR0 review
+## Deferred from BR0 review — resolved at specification level
 
 The independent BR0 review flagged that
 `packages/core/schemas/state.schema.json`'s `authorization` property uses
 `"$ref": "authorization.schema.json"` — a bare relative reference that
 requires a schema loader to register both files under a shared base
-URI/registry to resolve correctly. This should be clarified or resolved as
-part of implementing schema validation in this phase.
+URI/registry to resolve correctly. The detailed BR2 specification
+(`.buildrail/specs/BR2-GOVERNANCE-ENGINE.md` §11) resolves this with a
+concrete schema-registry `$ref`-resolution strategy. Actually implementing
+that strategy remains BR2 implementation work, not yet performed.
