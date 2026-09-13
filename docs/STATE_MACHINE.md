@@ -64,9 +64,32 @@ cannot perform them on its own initiative:
 - `HUMAN_QA → MERGE_AUTHORIZED` (authorizing merge)
 - `MERGED → PRODUCTION_VERIFIED` (confirming production reality, unless a
   deterministic, pre-authorized check performs this)
-- `* → FROZEN` (freezing a system or piece of work)
+- `PRODUCTION_VERIFIED → FROZEN` (freezing a piece of work) — see
+  "Freezing" below for the exact, non-wildcard scope of this rule
 - Any transition that would resume from `BLOCKED` or `CORRECTION_REQUIRED`
   by expanding or reinterpreting the original authorization
+
+## Freezing
+
+Freezing always requires Human Owner authority. In the current lifecycle
+graph, the legal freeze transition is exactly:
+
+- `PRODUCTION_VERIFIED → FROZEN`
+
+There is no implicit wildcard transition from an arbitrary state to
+`FROZEN`. In particular, `BLOCKED` and `CORRECTION_REQUIRED` have no
+direct edge to `FROZEN` — a unit of work sitting in either of those
+states must first resume back onto the primary path and reach
+`PRODUCTION_VERIFIED` before it can be frozen through the normal path.
+
+An administrative "abandon and freeze in place" path — freezing a unit of
+work directly from `BLOCKED`, `CORRECTION_REQUIRED`, or some other
+non-terminal state, without it ever reaching `PRODUCTION_VERIFIED` —
+is not part of the current lifecycle graph. If that capability is ever
+needed, it requires an explicit future specification/policy change that
+adds the corresponding edge(s) here, not an assumption that the general
+"freezing requires human authority" principle already implies their
+existence.
 
 ## Transitions an agent may perform within active authorization
 

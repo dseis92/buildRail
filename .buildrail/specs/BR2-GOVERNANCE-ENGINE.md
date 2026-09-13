@@ -276,8 +276,28 @@ Additional state-specific behavior:
 | `baselines` | Validated per `#/$defs/baseline` for each entry; `approved_sha` must match `^[0-9a-f]{40}$`. A `baselines` entry with a malformed SHA is `STATE_SCHEMA_INVALID`, not silently accepted. |
 | `completed_phases` / `planned_phases` | Plain string arrays per schema; BR2 does not cross-validate phase IDs against a canonical phase list (e.g. rejecting `"BR99"`) — that would require domain knowledge the schema doesn't encode, and is out of scope for BR2's schema-driven validation. This is a known, accepted limitation (see §28). |
 | Lifecycle state enum | Validated against the closed enum in `state.schema.json`'s `$defs.lifecycleState` (the 16 states from §12 of BR1's spec / `docs/STATE_MACHINE.md`) |
-| Unresolved `authorization` `$ref` | If schema registration/compilation itself fails (not a data-validation failure — a schema-setup failure), this is `SCHEMA_REFERENCE_UNRESOLVED`, distinct from `STATE_SCHEMA_INVALID` (§18). This should be effectively unreachable once §11 is implemented correctly, but the distinct error code exists so a broken schema registration fails loudly and specifically rather than masquerading as a data problem. |
-| "Contradictory state BR2 can deterministically detect" | BR2 detects exactly one class of this: **when `authorization` is present** and its `status` is `authorized` or `in_progress` (see §12), `current.development_phase` not equal to `authorization.id` — surfaced as a `PolicyError`, not a `StateError`, since it's a policy-layer concern, not a schema-layer one. This check is vacuously skipped when `authorization` is absent (there is no `authorization.id` to compare). BR2 does **not** attempt to detect other forms of contradiction (e.g. "phase in both `completed_phases` and `planned_phases`") — flagged as a deferred item (§28) rather than invented ad hoc. |
+| Unresolved `authorization` `$ref` | Neither is a data-validation failure, so neither is `STATE_SCHEMA_INVALID` (§18) — but which of two distinct codes applies depends on *how* resolution failed (§10's "Schema-setup error boundary"): if `createRegistry()` itself throws (e.g. a schema file is missing entirely), `loadState` surfaces `SCHEMA_SETUP_FAILED`; if the registry constructs but `state.schema.json`'s `$ref` to `authorization.schema.json` specifically cannot be resolved against the registered set, `SCHEMA_REFERENCE_UNRESOLVED` applies instead. Both should be effectively unreachable once §11 is implemented correctly, but each distinct code exists so a broken schema installation fails loudly and specifically, in a way that names *which* kind of setup problem occurred, rather than masquerading as a data problem or collapsing two different failure classes into one code. |
+| "Contradictory state BR2 can deterministically detect" | BR2 detects exactly one class of this: **when `authorization` is present** and its `status` is `authorized` or `in_progress` (see §12), `current.development_phase` not equal to `authorization.id` — surfaced as a `PolicyError`, not a `StateError`, since it's a policy-layer concern, not a schema-layer one. This check is vacuously skipped when `authorization` is absent (there is no `authorization.id` to compare). BR2 does **not** attempt to detect other forms of contradiction (e.g. "phase in both `completed_phases` and `planned_phases`") — flagged as a deferred item (§27 item 4) rather than invented ad hoc. |
+
+**Boundary: `loadState` performs full JSON-Schema validation; `authorizeSpecifiedWork`/`activatePhase`
+(§15) do not.** `loadState` is the only place a `BuildRailState` value is
+validated against `state.schema.json` in full (every property, every
+nested `$ref`, every enum). `authorizeSpecifiedWork` and `activatePhase`
+operate on an already-loaded, already-schema-valid `BuildRailState` and
+an already-constructed `Authorization` argument; the checks they perform
+on that `Authorization` argument (non-empty `specification`, `granted_by
+=== "human"`, `status` equal to a specific expected value, `id` matching
+the target phase) are exactly §13's **semantic** policy checks, not a
+second full-schema validation pass. A caller that hand-constructs an
+`Authorization` object satisfying §13's semantic checks but violating
+some other `authorization.schema.json` constraint `loadState` would have
+caught (e.g. an extra property forbidden by the schema, if the schema
+were ever tightened to disallow one) is not guaranteed to be rejected by
+`authorizeSpecifiedWork`/`activatePhase` — those two functions are a
+policy boundary, not a schema-validation boundary. This is an accepted
+scope limitation, not an oversight: re-running full schema validation
+inside every pure lifecycle function would duplicate `loadState`'s job
+and blur the I/O-vs-pure-logic separation (§7).
 
 ## 10. Schema Registry
 
@@ -390,6 +410,57 @@ function createRegistry(): SchemaRegistry; // throws only on registration-time f
   CLI output formatting — it operates purely on already-parsed JS
   values and schema identifiers, making it independently testable and
   reusable by BR4.
+
+### Schema-setup error boundary — `SCHEMA_SETUP_FAILED` vs. `SCHEMA_REFERENCE_UNRESOLVED`
+
+**Problem this resolves:** `createRegistry()` *throws* on failure (an
+exception, per §19's "reserved for genuinely unexpected... failures"
+rationale — a broken schema installation is exactly that kind of
+failure). But `loadConfig`/`loadState` are `Result`-returning functions
+(§19) that must never let an unhandled exception escape to their own
+caller — including an exception raised by the registry they depend on.
+Something in `loadConfig`/`loadState` must catch that throw and translate
+it into the typed `Result` world, and the resulting typed code must be
+distinguishable from an ordinary per-project data problem.
+
+**Resolution:**
+
+- `loadConfig`/`loadState` call `createRegistry()` (or a shared,
+  lazily-created singleton — §10's "Compile strategy") inside a `try/catch`
+  as their very first step, before attempting to read or parse
+  `.buildrail/config.yml`/`state.yml` at all.
+- If `createRegistry()` throws, `loadConfig`/`loadState` catch it and
+  return `{ ok: false, error: { code: "SCHEMA_SETUP_FAILED", message,
+  details: <caught error> } }` — a new error code (§18), **not**
+  `SCHEMA_REFERENCE_UNRESOLVED`, and **not** `CONFIG_SCHEMA_INVALID` /
+  `STATE_SCHEMA_INVALID`.
+- **Why a new, third code rather than reusing `SCHEMA_REFERENCE_UNRESOLVED`:**
+  `SCHEMA_REFERENCE_UNRESOLVED` (§18) is reserved for a validation-time
+  situation where the registry itself came up fine but a *specific
+  requested schema id* was never registered (`SchemaValidateResult`'s
+  `{ registered: false }` branch, §10) — a caller-addressing problem
+  against a healthy registry. `SCHEMA_SETUP_FAILED` is different in kind:
+  the registry could not be constructed **at all** for this call — no
+  schema was successfully registered, so there is no healthy registry to
+  ask "is this id registered?" in the first place. Collapsing the two
+  would make it impossible for a caller (or a test, or a human reading
+  `buildrail status` output) to tell "BuildRail's own schema installation
+  is broken" apart from "you asked this healthy registry for something it
+  doesn't have."
+- **Why not `CONFIG_SCHEMA_INVALID`/`STATE_SCHEMA_INVALID`:** those codes
+  mean "the loaded *document* failed validation against a schema that
+  itself loaded and compiled successfully." A `createRegistry()` throw
+  means validation never ran at all — there is no verdict about the
+  document to report, so reusing a document-verdict code would be a false
+  claim about what was actually checked.
+- This is a BuildRail installation-integrity failure (a missing/malformed
+  schema file shipped with `@buildrail/core` itself), not a per-project
+  data problem — `buildrail status` (§17.1) surfaces it as a distinct,
+  clearly-worded failure rather than folding it into ordinary
+  config/state error messaging, and it is expected to be effectively
+  unreachable in a correctly-packaged release (its purpose is to fail
+  loudly and specifically if packaging ever breaks, not to handle an
+  expected runtime condition).
 
 ### Registry scope: 3 schemas, not 5
 
@@ -543,10 +614,14 @@ resolved via the validator's built-in reference registry — no
    out to the network.
 6. **Failure behavior:** if `authorization.schema.json` is missing,
    unreadable, or fails to parse, `createRegistry()` throws before any
-   `loadConfig`/`loadState` call can proceed — this is a BuildRail
-   installation-integrity failure, not a per-project data problem, and
-   must be surfaced distinctly (not folded into `CONFIG_SCHEMA_INVALID` or
-   `STATE_SCHEMA_INVALID`).
+   `loadConfig`/`loadState` call can proceed — `loadConfig`/`loadState`
+   catch this and surface it as `SCHEMA_SETUP_FAILED` (§10's "Schema-setup
+   error boundary," §18) — this is a BuildRail installation-integrity
+   failure, not a per-project data problem, and must be surfaced
+   distinctly (not folded into `CONFIG_SCHEMA_INVALID` or
+   `STATE_SCHEMA_INVALID`, and not `SCHEMA_REFERENCE_UNRESOLVED` either,
+   which is reserved for a registry that constructed successfully but
+   rejects one specific unresolvable `$ref`).
 
 ## 12. Active/Historical Authorization Semantics
 
@@ -690,6 +765,24 @@ function authorizationCoversPhase(state: BuildRailState, phaseId: string): Polic
 function checkImplementationAllowed(state: BuildRailState, phaseId: string): PolicyResult;
 ```
 
+**These four functions have distinct, non-interchangeable return shapes —
+do not describe one function's behavior using another's return
+vocabulary, in implementation, comments, or tests:**
+
+- `isAuthorizationActive` returns a plain `boolean`. It never returns,
+  throws, or otherwise surfaces a `PolicyError` code such as
+  `AUTHORIZATION_MISSING` — "no authorization present" is simply `false`,
+  the same `false` as "an authorization is present but its status is
+  `completed`." Callers that need to know *which* inactive reason applies
+  must use `checkImplementationAllowed`, not `isAuthorizationActive`.
+- `getActiveAuthorization` returns `Authorization | null`. It returns
+  `null` for every case where no *active* authorization exists (absent,
+  draft, completed, or revoked) — it does not distinguish among those
+  reasons either, and never returns a code.
+- `authorizationCoversPhase` and `checkImplementationAllowed` are the only
+  two of the four that return `PolicyResult` (a `Result`-shaped value
+  carrying one of §18's `AUTHORIZATION_*` codes on failure).
+
 `checkImplementationAllowed` is the composed, primary entry point,
 performing these checks **in this exact, mutually exclusive order** and
 returning the first failure (or success if all pass). The order matters:
@@ -823,45 +916,30 @@ policy as of this specification.
 | `HUMAN_QA` | `MERGE_AUTHORIZED` | `human_owner` | Explicit ("authorizing merge"). |
 | `MERGE_AUTHORIZED` | `MERGED` | *(none)* | `docs/STATE_MACHINE.md` does not list this edge in either explicit list. Explicit choice: **actor-neutral** (`requiredActor: null`) — the human owner already made the merge *decision* at the prior edge (`HUMAN_QA → MERGE_AUTHORIZED`); actually recording that the merge happened (e.g. after a `git merge`/PR-merge completes) is a factual, mechanical follow-up, not a second independent human decision point, and mirrors BR1's own governance practice where the implementation agent recorded `MERGED`-equivalent state after an already-human-authorized merge completed. `applyTransition` permits any actor value for this edge. |
 | `MERGED` | `PRODUCTION_VERIFIED` | `human_owner` | Explicit ("unless a deterministic, pre-authorized check performs this" — BR2 does not build such a check, so BR2's `requiredActor` for this edge is unconditionally `human_owner`; a future phase that adds a deterministic production-verification check would need to revisit this specific row, not BR2). |
-| `PRODUCTION_VERIFIED` | `FROZEN` | `human_owner` | See "Resolving `* → FROZEN`" immediately below — **this is the only legal `X → FROZEN` edge in BR2's table.** |
+| `PRODUCTION_VERIFIED` | `FROZEN` | `human_owner` | See "`docs/STATE_MACHINE.md`'s freeze policy — resolved, not merely interpreted" immediately below — **this is the only legal `X → FROZEN` edge in BR2's table, and this transition is a dedicated operation (`completeAndFreezePhase`), not a bare `applyTransition` call — see "`PRODUCTION_VERIFIED → FROZEN` is also a dedicated operation" further below.** |
 
-#### Resolving `docs/STATE_MACHINE.md`'s `* → FROZEN` wildcard
+#### `docs/STATE_MACHINE.md`'s freeze policy — resolved, not merely interpreted
 
-`docs/STATE_MACHINE.md` lists `* → FROZEN` under "Transitions requiring
-human authority," which read literally suggests *any* state — including
-`BLOCKED` or `CORRECTION_REQUIRED` — could transition directly to
-`FROZEN`. That literal reading is incompatible with this specification's
-own design principle (§15's opening paragraph: "not an implementation
-deliverable to be invented while coding... exactly this table, verbatim")
-of an exhaustive, fully-enumerated edge set with no implicit wildcard
-edges — an unenumerated "any state" edge cannot coexist with a table that
-claims to be complete.
+`docs/STATE_MACHINE.md` now states this directly, in its own "Freezing"
+section: freezing always requires Human Owner authority, the legal freeze
+transition is exactly `PRODUCTION_VERIFIED → FROZEN`, there is no
+implicit wildcard from an arbitrary state, and an "abandon and freeze in
+place" path from `BLOCKED`/`CORRECTION_REQUIRED` is not part of the
+current lifecycle graph absent a future explicit specification change.
+This is no longer a gap this specification interprets around — it is the
+canonical source document's own resolved policy, and §15's table encodes
+it directly: `FROZEN` is legally reachable in BR2's lifecycle graph from
+exactly one state, `PRODUCTION_VERIFIED`, matching
+`docs/STATE_MACHINE.md`'s "Freezing" section word for word.
+`BLOCKED`/`CORRECTION_REQUIRED` have no direct edge to `FROZEN` in BR2's
+edge table (confirmed: no such row exists in either subsection below),
+consistent with `docs/STATE_MACHINE.md`'s explicit statement that such an
+edge does not currently exist.
 
-**Chosen resolution: the restricted interpretation. `FROZEN` is legally
-reachable in BR2's lifecycle graph from exactly one state:
-`PRODUCTION_VERIFIED`.** `docs/STATE_MACHINE.md`'s `* → FROZEN` is
-reinterpreted, for BR2's purposes, as shorthand for "freezing is always a
-`human_owner`-only decision, wherever it is legal" — a statement about
-*authority*, not a claim that freezing is legal from *every* state. Under
-this reading, `BLOCKED`/`CORRECTION_REQUIRED` do **not** have a legal
-direct edge to `FROZEN` in BR2's 26-edge table (confirmed: no such row
-exists in either subsection below), and the earlier draft's note claiming
-they were "also subject to this same rule if ever entered from those
-states" was itself the error being corrected here — that note
-contradicted the table it was attached to and is now removed.
-
-**This is a documented interpretive choice, not a silent one, and it
-narrows `docs/STATE_MACHINE.md`'s literal wildcard.** Per §27 (Deferred
-Items), reconciling `docs/STATE_MACHINE.md`'s wording with this
-restricted interpretation — either by narrowing the doc's own language to
-match, or by a future specification instead choosing to enumerate
-additional `X → FROZEN` edges (e.g. `BLOCKED → FROZEN`,
-`CORRECTION_REQUIRED → FROZEN`, for an "abandon and freeze in place"
-administrative action) — is flagged as unresolved and is **not** decided
-by BR2 implementation on its own initiative. BR2 implementation must
-encode only the single `PRODUCTION_VERIFIED → FROZEN` edge; it must not
-add any other `X → FROZEN` edge without a specification update
-authorizing it.
+BR2 implementation must encode only the single
+`PRODUCTION_VERIFIED → FROZEN` edge; it must not add any other
+`X → FROZEN` edge without both `docs/STATE_MACHINE.md` and this
+specification being updated together to authorize it.
 
 #### `SPECIFIED → AUTHORIZED` is a dedicated operation, not a bare `applyTransition` call
 
@@ -891,8 +969,13 @@ function authorizeSpecifiedWork(
   state: BuildRailState,
   authorization: Authorization,
   actor: Actor
-): Result<BuildRailState, LifecycleError>;
+): Result<BuildRailState, TransitionError>;
 ```
+
+(`TransitionError` — `LifecycleError | PolicyError` — is defined in §15's
+"API" section below; it is used here, and by `activatePhase` and
+`completeAndFreezePhase`, because each of these functions can fail with
+either a lifecycle-layer code or an `AUTHORIZATION_*` policy-layer code.)
 
 **Contract**, performed atomically (all checks pass and both fields
 change together, or nothing changes):
@@ -996,7 +1079,7 @@ BuildRail governance must not depend on state nothing actually persists.
   oversight, and not something implementation may silently attempt to
   paper over with undocumented history-tracking of its own invention.
 - **Exact-origin tracking is explicitly deferred** (§27, deferred item
-  8) until a future specification designs a persisted resume-state field
+  6) until a future specification designs a persisted resume-state field
   (a `state.schema.json` change — out of scope for this document, which
   is instructed not to propose schema changes) and specifies how the
   lifecycle engine would read and enforce it. Until that exists, the
@@ -1075,43 +1158,203 @@ primary-path edges + 5 `BLOCKED` entries + 5 `BLOCKED` returns + 2
 above, every reflexive pair (`X → X`), and every backwards primary-path
 pair not listed as a `BLOCKED`/`CORRECTION_REQUIRED` edge — are illegal
 (`isLegalTransition` returns `false`), and `requiredActor` for an illegal
-pair is not meaningful to call (see the API note below).
+pair returns `undefined` (see the API section below — this is now a
+deterministic, specified return, not "unspecified behavior").
+
+#### Legal graph edges vs. edges executable via generic `applyTransition` — a distinction, not a synonym
+
+**These 26 edges answer exactly one question: "is `(from, to)` a legal
+state transition, and which actor may perform it?"** That question is
+answered uniformly by `isLegalTransition`/`requiredActor` for all 26
+pairs, with no exceptions — the graph itself does not carve any edge out.
+
+A **separate** question is: "can a caller actually *execute* this
+transition by calling the single generic `applyTransition(state, to,
+actor)` function?" For **24 of the 26** edges, the answer is yes —
+`applyTransition` alone fully performs the transition (subject to the
+authorization-composition rule below, for the 11 edges where that
+applies). For **exactly 2 of the 26** edges, the answer is no:
+`SPECIFIED → AUTHORIZED` and (see the new operation defined below)
+`PRODUCTION_VERIFIED → FROZEN`. Both are graph-legal — `isLegalTransition`
+returns `true` for both, and `requiredActor` returns `"human_owner"` for
+both — but neither can be completed by `applyTransition` alone, because
+each requires additional input `applyTransition`'s `(state, to, actor)`
+signature has no room for (a new `Authorization` record for the first; an
+approved candidate SHA to seal into `baselines` for the second) and each
+must atomically update more than just `current.lifecycle_state`.
+
+**A caller that calls `applyTransition(state, to, actor)` for one of
+these 2 edges receives a new, distinct error: `LIFECYCLE_DEDICATED_OPERATION_REQUIRED`
+(§18)** — not `LIFECYCLE_TRANSITION_ILLEGAL` (the edge *is* legal — that
+would be a false claim) and not a silent partial update (§15's existing
+"`SPECIFIED → AUTHORIZED` is a dedicated operation" section already
+established this for that one edge; this section generalizes the pattern
+and gives the general case its own dedicated, typed error rather than
+reusing `LIFECYCLE_TRANSITION_ILLEGAL` as had been implied). The error's
+`details` names the dedicated function the caller must use instead
+(`authorizeSpecifiedWork` or `completeAndFreezePhase`, respectively).
+
+**Restated precisely:** of the 26 legal graph edges, 24 are "generic-apply
+edges" (executable via `applyTransition`) and exactly 2 are "dedicated-
+operation edges" (`isLegalTransition` says yes, `applyTransition` itself
+refuses and directs the caller elsewhere). This 24/2 split is now the
+authoritative count alongside the 26-edge total — a claim such as
+"`applyTransition` implements all 26 edges" is not accurate and must not
+appear in implementation documentation or comments; the accurate claim is
+"the lifecycle module, across `applyTransition` plus its two dedicated
+operations, together implement all 26 edges."
+
+#### `PRODUCTION_VERIFIED → FROZEN` is also a dedicated operation: `completeAndFreezePhase`
+
+**Problem this resolves:** like `SPECIFIED → AUTHORIZED`,
+`PRODUCTION_VERIFIED → FROZEN` needs to atomically do more than change
+`current.lifecycle_state`. Freezing a phase is precisely the moment its
+approved candidate SHA becomes a permanent `baselines` entry and its
+phase id is recorded in `completed_phases` — exactly the bookkeeping
+BR0's and BR1's own real closure commits performed by hand
+(`baselines.BR0`/`baselines.BR1` gaining entries, `completed_phases`
+gaining `"BR0"`/`"BR1"`). A bare `applyTransition(state, "FROZEN", actor)`
+call has no parameter through which the approved SHA could be supplied,
+and cannot itself decide what `baselines`/`completed_phases` values to
+write — inventing that behavior implicitly inside `applyTransition` would
+mean a generic, four-argument-free function silently performing
+phase-closure bookkeeping no caller asked it to perform.
+
+**Chosen resolution: a dedicated operation, `completeAndFreezePhase`,
+mirroring `authorizeSpecifiedWork`'s and `activatePhase`'s pattern.**
+
+```ts
+interface PhaseClosureRequest {
+  approvedSha: string; // must match ^[0-9a-f]{40}$, per baselines.<phase>.approved_sha's schema shape
+}
+
+function completeAndFreezePhase(
+  state: BuildRailState,
+  request: PhaseClosureRequest,
+  actor: Actor
+): Result<BuildRailState, TransitionError>;
+```
+
+**Contract**, performed atomically (all checks pass and every field below
+changes together, or nothing changes):
+
+1. Requires `state.current.lifecycle_state === "PRODUCTION_VERIFIED"` —
+   otherwise `LIFECYCLE_TRANSITION_ILLEGAL`, mirroring what
+   `applyTransition` reports for any other illegal `from` state.
+2. Requires `actor === "human_owner"` — otherwise
+   `LIFECYCLE_AUTHORITY_REQUIRED`, matching `docs/STATE_MACHINE.md`'s
+   explicit "Freezing" rule and §15's table entry for this edge.
+3. Requires `request.approvedSha` to match `^[0-9a-f]{40}$` (the same
+   pattern `state.schema.json`'s `#/$defs/baseline.approved_sha` already
+   requires) — otherwise a new error code, `BASELINE_SHA_INVALID` (§18).
+   This is a semantic, format-level check (§9's "boundary" note above) —
+   `completeAndFreezePhase` does not verify the SHA actually exists in
+   any Git repository or corresponds to a real commit; BR2 has no Git
+   capability (§4, §6) to do so. Confirming the SHA is real is BR3's
+   concern; BR2 only confirms the *shape* is well-formed.
+4. On success, returns a new `BuildRailState` with **all** of the
+   following changed together:
+   - `current.lifecycle_state` set to `"FROZEN"`
+   - `authorization.status` set to `"completed"` (the authorization that
+     covered this phase's work is now fulfilled — mirroring §12's
+     documented `"completed"` meaning; `completeAndFreezePhase` does not
+     otherwise alter any other field of the `authorization` object)
+   - `completed_phases` gains `state.current.development_phase` appended
+     (if not already present — appending is idempotent, not
+     duplicate-inserting, matching how a caller might reasonably retry a
+     failed persistence step)
+   - `baselines` gains (or replaces, if a key with this phase id somehow
+     already exists — though §15's `activatePhase` precondition #3 makes
+     this practically unreachable via BR2's own governed path) an entry
+     keyed by `state.current.development_phase` with
+     `approved_sha: request.approvedSha` and `status: "frozen"`
+5. **Preserved unchanged:** `current.development_phase`, `planned_phases`,
+   `project`, `schema_version`, `review`, `protected_systems`, and every
+   other `baselines`/`completed_phases` entry not being added.
+   `completeAndFreezePhase` does not touch `candidate` — clearing or
+   resetting any `candidate.*` field (if BR3/BR4 ever populate one) is
+   not this operation's responsibility; it is not part of BR2's schema
+   knowledge of when/how `candidate` should be cleared, and this
+   specification does not invent that behavior.
+6. Pure, like `applyTransition`/`authorizeSpecifiedWork`/`activatePhase` —
+   no file I/O; persisting the result to `.buildrail/state.yml` remains
+   the caller's responsibility (§7).
+
+**`applyTransition`'s own behavior for this specific pair is precisely
+defined:** `applyTransition(state, "FROZEN", actor)` where
+`state.current.lifecycle_state === "PRODUCTION_VERIFIED"` fails with
+`LIFECYCLE_DEDICATED_OPERATION_REQUIRED` (per the distinction established
+above), not `LIFECYCLE_TRANSITION_ILLEGAL` and not a silent
+lifecycle-only update that leaves `baselines`/`completed_phases`
+unpopulated. `completeAndFreezePhase` is the one and only authoritative
+path for this transition, exactly as `authorizeSpecifiedWork` is for
+`SPECIFIED → AUTHORIZED` and `activatePhase` is for cross-phase rollover.
 
 ### API
 
 ```ts
+type TransitionError = LifecycleError | PolicyError;
+
 function isLegalTransition(from: LifecycleState, to: LifecycleState): boolean;
-function requiredActor(from: LifecycleState, to: LifecycleState): Actor | null; // undefined behavior (throws) if !isLegalTransition
+function requiredActor(from: LifecycleState, to: LifecycleState): Actor | null | undefined;
 function applyTransition(
   state: BuildRailState,
   to: LifecycleState,
   actor: Actor
-): Result<BuildRailState, LifecycleError>;
+): Result<BuildRailState, TransitionError>;
 ```
 
+- **`TransitionError` is the one, explicit error-type union used
+  consistently by every lifecycle-engine function that can fail for
+  either a graph/authority reason or an authorization-policy reason:**
+  `applyTransition`, `authorizeSpecifiedWork`, `activatePhase`, and
+  `completeAndFreezePhase` are all typed to return
+  `Result<BuildRailState, TransitionError>` — not four independently-typed
+  return signatures that happen to overlap. This makes explicit, at the
+  type level, what §18's prose already states: these functions can
+  surface `AUTHORIZATION_*` codes (a `PolicyError`), not only
+  `LIFECYCLE_*` codes. A caller handling any of these four functions'
+  result handles one union, not four ad hoc shapes.
 - `isLegalTransition` and `requiredActor` are pure, synchronous, and
   total over the full `LifecycleState × LifecycleState` space (every pair
   either is or isn't legal — no exceptions for "unknown" states, since the
   schema enum is closed). `isLegalTransition(from, to)` is `true` for
   exactly the 26 pairs enumerated above and `false` for every other pair.
-- `requiredActor(from, to)` returns one of the three `Actor` values for
-  every legal edge that names a required actor, and `null` for the two
-  edges explicitly marked actor-neutral above (`IDEA → SPECIFIED`,
-  `MERGE_AUTHORIZED → MERGED`) — `null` is a meaningful, deliberate return
-  value for those two specific edges, not a generic "unspecified" default.
-  For any pair where `isLegalTransition(from, to)` is `false`,
-  `requiredActor(from, to)`'s return value is unspecified and must not be
-  relied upon by callers — callers must check `isLegalTransition` first.
+- **`requiredActor(from, to)`'s three-way return is now fully
+  deterministic, never "unspecified," for every input in the full
+  `LifecycleState × LifecycleState` space:**
+  - one of the three `Actor` string values, for every legal edge that
+    names a required actor;
+  - `null`, for the two edges explicitly marked actor-neutral
+    (`IDEA → SPECIFIED`, `MERGE_AUTHORIZED → MERGED`) — a meaningful,
+    deliberate "no restriction" value, not a generic default;
+  - `undefined`, for every pair where `isLegalTransition(from, to)` is
+    `false` — deterministically distinguishing "this pair is illegal, so
+    the question of which actor is required does not apply" from `null`'s
+    "this pair is legal, and specifically requires no particular actor."
+  `requiredActor` never throws. A prior draft of this specification
+  described `requiredActor`'s behavior for an illegal pair as "undefined
+  behavior (throws)" — that language is retracted; the corrected,
+  deterministic three-way contract above supersedes it.
 - `applyTransition` is pure (no file I/O — it returns a new in-memory
   `BuildRailState` value; *persisting* that value to
   `.buildrail/state.yml` is the caller's responsibility, consistent with
   §7's I/O-vs-pure-logic separation). It fails with:
   - `LIFECYCLE_TRANSITION_ILLEGAL` if `isLegalTransition(from, to)` is
     false
+  - `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` if `(from, to)` is one of the
+    2 dedicated-operation edges (`SPECIFIED → AUTHORIZED`,
+    `PRODUCTION_VERIFIED → FROZEN`) — see the distinction established
+    above; the caller must use `authorizeSpecifiedWork` or
+    `completeAndFreezePhase` instead
   - `LIFECYCLE_AUTHORITY_REQUIRED` if `requiredActor(from, to)` is
     non-`null` and does not equal the supplied `actor` (an actor-neutral
     edge, where `requiredActor` returns `null`, never produces this
     error — any of the three `Actor` values is accepted)
+  - one of the `AUTHORIZATION_*` codes (a `PolicyError`, per
+    `TransitionError`'s union above) for one of the 11
+    authorization-gated edges (§15's composition section below) when the
+    active-authorization check fails
 - **Backwards transitions:** `docs/STATE_MACHINE.md`'s primary path is
   strictly forward; `applyTransition` rejects any `to` that is not either
   the next state on the primary path from `from`, or one of the 13
@@ -1160,7 +1403,7 @@ which do not:
 | `BLOCKED → PENDING_REVIEW` | **Yes** | Same |
 | `CORRECTION_REQUIRED → IMPLEMENTING` | **Yes** | Resumes agent-governed implementation work — see "Closing the resume bypass" below |
 | `IDEA → SPECIFIED` | No | No authorization exists yet at this point by definition — requiring one would make this edge permanently unreachable |
-| `SPECIFIED → AUTHORIZED` | N/A — not performed by `applyTransition` at all; see `authorizeSpecifiedWork` (§15) | This edge is carved out of `applyTransition`'s generic handling entirely — its own dedicated function performs its own validation (§15's "dedicated operation" section), which supersedes this table's generic composition rule for this one row |
+| `SPECIFIED → AUTHORIZED` | N/A — not performed by `applyTransition` at all (`LIFECYCLE_DEDICATED_OPERATION_REQUIRED`); see `authorizeSpecifiedWork` (§15) | This edge is carved out of `applyTransition`'s generic handling entirely — its own dedicated function performs its own validation (§15's "dedicated operation" section), which supersedes this table's generic composition rule for this one row |
 | `PENDING_REVIEW → REVIEW_APPROVED` | No | Independent review of already-implemented work does not re-check implementation authorization — it checks the *work*, not whether work was allowed to start (that was already gated earlier in the same lifecycle run) |
 | `PENDING_REVIEW → CORRECTION_REQUIRED` | No | Entering `CORRECTION_REQUIRED` doesn't itself resume implementation — it's the *return* to `IMPLEMENTING` that does, and that edge is gated above |
 | `HUMAN_QA → CORRECTION_REQUIRED` | No | Same rationale |
@@ -1168,7 +1411,7 @@ which do not:
 | `HUMAN_QA → MERGE_AUTHORIZED` | No | Same rationale |
 | `MERGE_AUTHORIZED → MERGED` | No | Same rationale |
 | `MERGED → PRODUCTION_VERIFIED` | No | Same rationale |
-| `PRODUCTION_VERIFIED → FROZEN` | No | Freezing is a human decision independent of the original authorization's active/inactive status — by this point the authorization is expected to become `completed` (§12), which is correctly *not* active, and `FROZEN` must still be reachable |
+| `PRODUCTION_VERIFIED → FROZEN` | N/A — not performed by `applyTransition` at all (`LIFECYCLE_DEDICATED_OPERATION_REQUIRED`); see `completeAndFreezePhase` (§15) | Freezing is a human decision independent of the original authorization's active/inactive status, and this edge additionally requires an approved SHA `applyTransition`'s signature has no room for — carved out of `applyTransition`'s generic handling entirely, exactly like `SPECIFIED → AUTHORIZED` above |
 
 **Closing the resume bypass (correcting an earlier draft's governance
 gap):** an earlier version of this specification exempted *all*
@@ -1188,11 +1431,12 @@ the *return* edges specifically, because authorization can change state
    still succeed (graph-legal, actor-correct), silently resuming
    implementation work under a revoked authorization.
 
-This is now closed: **all 10 resume-into-active-workflow edges
+This is now closed: **all 6 resume-into-active-workflow edges
 (`BLOCKED → {PREFLIGHT, IMPLEMENTING, IMPLEMENTED, VERIFYING,
-PENDING_REVIEW}` and `CORRECTION_REQUIRED → IMPLEMENTING`) require the
-same active-authorization composition as the 5 original primary-path
-edges — 11 gated edges in total, not 5.** `BLOCKED`/`CORRECTION_REQUIRED`
+PENDING_REVIEW}` — 5 edges — plus `CORRECTION_REQUIRED → IMPLEMENTING` —
+1 edge — for 6 total) require the same active-authorization composition
+as the 5 original forward-progress primary-path edges — 11 gated edges in
+total (5 + 6 = 11), not 5.** `BLOCKED`/`CORRECTION_REQUIRED`
 *entry* edges (`{PREFLIGHT, IMPLEMENTING, IMPLEMENTED, VERIFYING,
 PENDING_REVIEW} → BLOCKED`, `PENDING_REVIEW → CORRECTION_REQUIRED`,
 `HUMAN_QA → CORRECTION_REQUIRED`) remain ungated — entering a blocked/
@@ -1216,15 +1460,15 @@ depending on every caller remembering to check separately.
 above, must call `checkImplementationAllowed(state, phaseId)` (where
 `phaseId` is `state.current.development_phase`) internally, before
 returning success, and propagate any `PolicyError` it produces as
-`applyTransition`'s own failure (mapped through the same
-`Result<BuildRailState, LifecycleError>` return type — a `PolicyError`
-occurring inside `applyTransition` is still reported via
-`LifecycleError`'s union, not a separate untyped throw; the exact
-sub-type mapping, e.g. wrapping `PolicyError` inside a
-`LifecycleError` variant, is an implementation detail as long as the
-caller can distinguish "graph-illegal," "authority-insufficient," and
-"authorization-inactive/missing/revoked/mismatched" from each other in
-the returned error).
+`applyTransition`'s own failure — this is exactly what `TransitionError`
+(§15's API section, `type TransitionError = LifecycleError |
+PolicyError`) exists to type precisely: a `PolicyError` occurring inside
+`applyTransition` is reported directly as a member of `TransitionError`'s
+union, not wrapped, not a separate untyped throw, and not requiring an
+implementation-chosen sub-type mapping — the caller distinguishes
+"graph-illegal," "dedicated-operation-required," "authority-insufficient,"
+and "authorization-inactive/missing/revoked/mismatched" from each other
+by the `code` field of whichever `TransitionError` member came back.
 
 **No second, unchecked path exists.** `checkImplementationAllowed` remains
 independently exported and independently callable (e.g. a `buildrail
@@ -1269,7 +1513,7 @@ function activatePhase(
   state: BuildRailState,
   request: PhaseActivationRequest,
   actor: Actor
-): Result<BuildRailState, LifecycleError>;
+): Result<BuildRailState, TransitionError>;
 ```
 
 **`PhaseActivationRequest` deliberately contains only these two fields —
@@ -1290,13 +1534,49 @@ directly instead of asking the caller to compute and pass it.)
    version of this operation. Any other actor value fails with
    `LIFECYCLE_AUTHORITY_REQUIRED`, exactly as an under-authorized
    `applyTransition` call would.
-2. **Precondition — closure state:** the *current* work item must
-   already be at `current.lifecycle_state === "FROZEN"` (or, for the
-   very first phase ever activated — BR0 — the precondition is instead
-   "no prior authorization exists," a one-time bootstrap case).
-   Attempting `activatePhase` from any other `lifecycle_state` fails with
+2. **Precondition — full closure invariants, no bootstrap exception:**
+   `activatePhase` requires **all** of the following to hold of the
+   *current* work item before it will roll over to a new one — there is
+   no special-cased "first phase ever" bootstrap exemption from any of
+   them:
+   - `current.lifecycle_state === "FROZEN"`
+   - `authorization` is present and `authorization.status === "completed"`
+   - `authorization.id === current.development_phase` (the just-closed
+     phase's own authorization, not some other stale record)
+   - `current.development_phase` appears in `state.completed_phases`
+   - `current.development_phase` appears as a key in `state.baselines`,
+     and that entry's `status === "frozen"`
+   - `state.candidate`'s three fields (`branch`, `base_sha`,
+     `candidate_sha`) are all `null` (or the `candidate` object is
+     entirely absent, if the schema is ever loosened to allow that) — no
+     in-flight candidate should still be recorded against a phase that is
+     being rolled over from
+   If any of these does not hold, `activatePhase` fails with
    `LIFECYCLE_TRANSITION_ILLEGAL` — you cannot roll over to a new phase
-   while the current one is still mid-flight.
+   while the current one is still mid-flight, or is `FROZEN` in
+   `current.lifecycle_state` alone without the rest of closure having
+   genuinely completed. **This specification does not carve out a special
+   case for BR0's own historical bootstrap.** BR0's actual activation was
+   performed by hand, before BR2's governance engine existed to enforce
+   anything (§27 item 1) — it is a historical fact about how BuildRail's
+   own development began, not a code path `activatePhase` needs to
+   reproduce or accommodate. `activatePhase` is specified for BuildRail's
+   *future* phase rollovers (BR2 onward, once BR2 itself is authorized
+   and implemented) — by the time any such rollover calls
+   `activatePhase`, the *previous* phase (including BR0-as-`completed_phases`-
+   entry, if that rollover is the very first one `activatePhase` is ever
+   used for) is expected to already satisfy every invariant above, because
+   a correctly governed closure (via `completeAndFreezePhase`, defined
+   above) is what produces exactly this shape. An earlier draft of this
+   specification's precondition included the parenthetical "(or, for the
+   very first phase ever activated — BR0 — the precondition is instead
+   'no prior authorization exists,' a one-time bootstrap case)" — that
+   carve-out is removed. It was unnecessary (BR0's activation does not go
+   through `activatePhase` at all, bootstrap or otherwise — see §27 item
+   1) and it weakened the precondition for every future caller by
+   creating an ambiguous alternate branch with no way to distinguish a
+   legitimate first-ever call from a caller merely lacking a prior
+   authorization for some other, illegitimate reason.
 3. **Precondition — no reactivating a closed phase ID:**
    `request.newPhaseId` must not already appear as a key in
    `state.baselines`, and must not already appear in
@@ -1309,7 +1589,7 @@ directly instead of asking the caller to compute and pass it.)
    genuine need for that ever arises (e.g. correcting BR1 after BR2 is
    underway), it requires a distinct, explicitly-designed
    reopen/revision policy this specification does not define (flagged as
-   a deferred item, §27) — `activatePhase` must not silently permit it by
+   deferred item 7, §27) — `activatePhase` must not silently permit it by
    omission.
 4. **Atomicity:** `activatePhase` returns a single new `BuildRailState`
    value with all of the following changed together, or none of them (it
@@ -1317,15 +1597,22 @@ directly instead of asking the caller to compute and pass it.)
    - `current.development_phase` set to `request.newPhaseId`
    - `current.lifecycle_state` set to `"AUTHORIZED"`
    - `authorization` replaced wholesale with `request.newAuthorization`
-     (this is the *only* place in BR2 where the top-level `authorization`
-     object is replaced, not merely read — consistent with §12's
-     "replaced wholesale at each phase transition" model)
+     (consistent with §12's "replaced wholesale at each phase transition"
+     model — **not** the only place this happens in BR2:
+     `authorizeSpecifiedWork` also replaces the top-level `authorization`
+     object wholesale, for the `SPECIFIED → AUTHORIZED` edge within a
+     single work item's lifecycle, per its own contract above. An earlier
+     draft of this section claimed `activatePhase` was "the *only* place
+     in BR2 where the top-level `authorization` object is replaced" — that
+     claim was false as written and is corrected here: both dedicated
+     operations replace it, each for its own distinct edge, and neither
+     is exclusive.)
    - `planned_phases` set to `state.planned_phases` **with
      `request.newPhaseId` removed, if present** — `activatePhase` derives
      this itself from the input state; the caller supplies only
      `newPhaseId` and `newAuthorization`, nothing else. If
-     `request.newPhaseId` is not present in `state.planned_phases` (e.g.
-     BR0's own bootstrap activation, where nothing was ever "planned"),
+     `request.newPhaseId` is not present in `state.planned_phases` (e.g. a
+     phase activated outside the normal roadmap-planned sequence),
      `planned_phases` is left unchanged — removal is a no-op, not an
      error.
 5. **Preserved unchanged (untouched by `activatePhase`):** `baselines`,
@@ -1407,6 +1694,46 @@ assigned to any specific future phase by this specification — it is a
 product question, not one this spec resolves.
 
 ## 17. CLI Integration
+
+### 17.0 CLI project-root definition
+
+**`buildrail status`'s `projectRoot` argument to `loadConfig`/`loadState`
+(§8/§9) is exactly `process.cwd()` — the directory the `buildrail`
+process was invoked from. Nothing more elaborate.** Specifically:
+
+- **No parent-directory walking.** BR2 does not search upward from
+  `process.cwd()` looking for the nearest `.buildrail/` directory (the
+  way, e.g., `git` walks up to find `.git/`, or some Node tooling walks up
+  to find the nearest `package.json`). If `.buildrail/config.yml` is not
+  present directly under `process.cwd()/.buildrail/`, this is
+  `CONFIG_NOT_FOUND` (§8) even if a `.buildrail/` directory exists two
+  levels up.
+- **No Git-root discovery.** BR2 does not shell out to `git rev-parse
+  --show-toplevel` or inspect `.git/` to determine a project root — that
+  would be a Git-inspection capability BR2 does not have (§4, §6), and
+  would also contradict "no shell command execution for governance
+  loading" (§21). Running `buildrail status` from inside a Git repository
+  is not treated specially; the rule is always simply
+  `process.cwd()/.buildrail/config.yml`.
+- This is deliberately the simplest possible rule, consistent with §8's
+  existing "always this exact relative path — no search/discovery logic,
+  no walking up parent directories" statement for `loadConfig` itself;
+  this subsection makes explicit, at the CLI-integration layer, that
+  `buildrail status`'s own invocation does not add a project-root-
+  discovery layer of its own on top of that already-simple loader
+  contract. If root-discovery convenience is ever wanted (e.g. so
+  `buildrail status` works from a subdirectory of a real project), that
+  is a future, separately-specified CLI feature — not something BR2
+  implementation may add on its own initiative.
+- **Relation to §10's package-relative schema resolution:** this is the
+  other half of a distinction already established in §10 and restated
+  here for clarity now that both halves are fully specified —
+  *governance files* (`.buildrail/config.yml`, `.buildrail/state.yml`)
+  are resolved relative to `process.cwd()` (this section), while *schema
+  assets* (`packages/core/schemas/*.json`) are resolved relative to the
+  executing module's own location, never `process.cwd()` (§10). Changing
+  the shell's working directory changes which project's governance files
+  get loaded, but never changes which schemas validate them.
 
 ### 17.1 `buildrail status`
 
@@ -1541,13 +1868,16 @@ interface BuildRailError {
 | `STATE_READ_FAILED` | state | File exists but could not be read |
 | `STATE_YAML_INVALID` | state | File content is not valid YAML syntax, or the YAML document is empty. Same non-object-root exclusion as `CONFIG_YAML_INVALID` above — see `STATE_SCHEMA_INVALID`. |
 | `STATE_SCHEMA_INVALID` | state | Syntactically valid, non-empty YAML that fails `state.schema.json` validation (including nested `authorization`), including a wrong-type root value |
-| `SCHEMA_REFERENCE_UNRESOLVED` | schema | Registry setup failed — a schema file is missing/malformed, or a `$ref` cannot be resolved against the registered set (registration-time, not validation-time) |
+| `SCHEMA_REFERENCE_UNRESOLVED` | schema | Registration succeeded overall, but a specific `$ref` inside a registered schema cannot be resolved against the registered set (registration-time, not validation-time) — see §10's "Schema-setup error boundary" for how this differs from `SCHEMA_SETUP_FAILED` |
+| `SCHEMA_SETUP_FAILED` | schema | `createRegistry()` threw when `loadConfig`/`loadState` called it — the registry could not be constructed at all for this call (missing/malformed schema file, or any other registration-time exception), so no validation could run. Distinct from `SCHEMA_REFERENCE_UNRESOLVED` (a registry that came up fine but rejects one bad `$ref`) and from `CONFIG_SCHEMA_INVALID`/`STATE_SCHEMA_INVALID` (a verdict about a *document*, which requires a working registry to have been reached in the first place) — see §10. |
 | `AUTHORIZATION_MISSING` | policy | No authorization present, or a required field (e.g. `granted_by`) fails BR2's defense-in-depth check |
 | `AUTHORIZATION_INACTIVE` | policy | Authorization present but `status` is `draft` or `completed` (§12) |
 | `AUTHORIZATION_REVOKED` | policy | Authorization present with `status: revoked` |
 | `AUTHORIZATION_PHASE_MISMATCH` | policy | Active authorization's `id` does not match the requested phase |
 | `LIFECYCLE_TRANSITION_ILLEGAL` | lifecycle | Requested `from → to` pair is not in the legal transition graph |
+| `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` | lifecycle | Requested `from → to` pair **is** graph-legal, but is one of the 2 dedicated-operation edges (`SPECIFIED → AUTHORIZED`, `PRODUCTION_VERIFIED → FROZEN`) that `applyTransition` itself refuses to perform — see §15's "Legal graph edges vs. edges executable via generic `applyTransition`." `details` names the required dedicated function (`authorizeSpecifiedWork` or `completeAndFreezePhase`). |
 | `LIFECYCLE_AUTHORITY_REQUIRED` | lifecycle | Transition is legal but the supplied actor lacks authority to perform it |
+| `BASELINE_SHA_INVALID` | lifecycle | `completeAndFreezePhase`'s `request.approvedSha` does not match `^[0-9a-f]{40}$` (§15) — a format-level check only; BR2 does not confirm the SHA corresponds to a real commit |
 | `INTERNAL_UNSUPPORTED` | any | Reserved catch-all for a genuinely unanticipated internal failure (e.g. an assertion that should be unreachable) — must not become a dumping ground for cases that deserve their own code; adding a new specific code is always preferred to reusing this one |
 
 Ordinary governance failures (any of the above except `INTERNAL_UNSUPPORTED`
@@ -1557,18 +1887,25 @@ this extends BR1's existing Error Contract principle
 governance-layer failures, not just CLI-usage failures.
 
 **`applyTransition` can surface `AUTHORIZATION_*` codes, not just
-`LIFECYCLE_*` ones.** Per §15's authorization-composition rule, calling
-`applyTransition` for one of the 11 authorization-gated transitions
-(the 5 forward-progress edges plus the 6 resume-into-active-workflow
-edges — `BLOCKED`'s five returns and `CORRECTION_REQUIRED → IMPLEMENTING`)
-can fail with any of `AUTHORIZATION_MISSING`, `AUTHORIZATION_INACTIVE`,
-`AUTHORIZATION_REVOKED`, or `AUTHORIZATION_PHASE_MISMATCH` — these are
-not exclusively `checkImplementationAllowed`'s own return codes; they are
-shared codes that both functions can produce, because `applyTransition`
-internally calls into the same policy logic for those specific
-transitions (§15). A caller distinguishing "why did `applyTransition`
-fail" must handle the full code set above, not only the two
-`LIFECYCLE_*` codes.
+`LIFECYCLE_*` ones — this is exactly what its `TransitionError` return
+type (§15) makes explicit.** Per §15's authorization-composition rule,
+calling `applyTransition` for one of the 11 authorization-gated
+transitions (the 5 forward-progress edges plus the 6
+resume-into-active-workflow edges — `BLOCKED`'s five returns and
+`CORRECTION_REQUIRED → IMPLEMENTING`) can fail with any of
+`AUTHORIZATION_MISSING`, `AUTHORIZATION_INACTIVE`, `AUTHORIZATION_REVOKED`,
+or `AUTHORIZATION_PHASE_MISMATCH` — these are not exclusively
+`checkImplementationAllowed`'s own return codes; they are shared codes
+that both functions can produce, because `applyTransition` internally
+calls into the same policy logic for those specific transitions (§15).
+Separately, calling `applyTransition` for either of the 2
+dedicated-operation edges (`SPECIFIED → AUTHORIZED`,
+`PRODUCTION_VERIFIED → FROZEN`) fails with the lifecycle-layer
+`LIFECYCLE_DEDICATED_OPERATION_REQUIRED`, never an `AUTHORIZATION_*`
+code — `applyTransition` refuses those two edges before any policy check
+would run. A caller distinguishing "why did `applyTransition` fail" must
+handle the full `TransitionError` union, not only the `LIFECYCLE_*`
+codes.
 
 ## 19. Result/Error Propagation Strategy
 
@@ -1732,16 +2069,25 @@ uncontrollably printed. If a future consumer (e.g. a `buildrail status
 `diagnostics` explicitly — BR2 itself does not.
 
 **YAML resource-exhaustion safety:** because `.buildrail/config.yml` and
-`.buildrail/state.yml` are untrusted input (§21), `parseDocument` calls
-must preserve `yaml`'s built-in finite alias-expansion limit
-(`maxAliasCount`, which defaults to a bounded value in the library) —
-**`maxAliasCount: -1` (unbounded) must never be set.** If conversion to a
-JS value (`.toJS()`) throws due to exceeding this limit (a
-resource-exhaustion protection tripping, not a normal parse error
-surfaced via `doc.errors`), that exception is caught and translated into
-`CONFIG_YAML_INVALID`/`STATE_YAML_INVALID` (§18) — a raw
-`ReferenceError`/library exception must never propagate to the CLI as an
-unhandled exception or stack trace.
+`.buildrail/state.yml` are untrusted input (§21), the alias-expansion
+limit must stay finite. **This is precisely a `.toJS()`-time conversion
+option, not a `parseDocument`-time parsing option** — `maxAliasCount` is
+read by `Document.prototype.toJS()` when it walks the parsed document
+tree and expands anchors/aliases into plain JS values, not by
+`parseDocument()` itself (which only builds the CST/AST and does not
+expand aliases). BR2 must therefore call
+`doc.toJS({ maxAliasCount: 100 })` explicitly — **the specific value `100`
+unless a future revision of this specification documents a different
+value** (this mirrors the library's own built-in default order of
+magnitude; BR2 does not invent a novel threshold, it makes the choice
+explicit and pinned rather than relying on whatever the library's default
+happens to be release to release) — and **`maxAliasCount: -1` (unbounded)
+must never be set.** If `toJS({ maxAliasCount: 100 })` throws due to
+exceeding this limit (a resource-exhaustion protection tripping, not a
+normal parse error surfaced via `doc.errors`), that exception is caught
+and translated into `CONFIG_YAML_INVALID`/`STATE_YAML_INVALID` (§18) — a
+raw `ReferenceError`/library exception must never propagate to the CLI as
+an unhandled exception or stack trace.
 
 **Required tests:**
 
@@ -1760,12 +2106,13 @@ unhandled exception or stack trace.
    *error*, appearing in `doc.errors`, not `doc.warnings` — using it
    would test the wrong code path.)
 2. **Resource-exhaustion bounded test:** a fixture YAML document
-   constructed to exceed the default `maxAliasCount` (a bounded,
+   constructed to exceed `maxAliasCount: 100` (a bounded,
    deliberately-crafted small-but-over-the-limit alias expansion — not an
    actually dangerous/unbounded "billion laughs"-style payload) is loaded
    and confirmed to fail with `CONFIG_YAML_INVALID`/`STATE_YAML_INVALID`
-   (via the caught-exception path above), not an unhandled exception, not
-   a hang, and not a raw stack trace surfaced through the CLI.
+   (via the caught `toJS({ maxAliasCount: 100 })` exception path above),
+   not an unhandled exception, not a hang, and not a raw stack trace
+   surfaced through the CLI.
 
 ### 20.2 JSON Schema validator: `ajv` only — `ajv-formats` is explicitly NOT a BR2 dependency
 
@@ -1812,6 +2159,72 @@ Per the human owner's explicit instruction, this document proposes exact
 package choices and rationale but performs no `npm install` — that occurs
 only once BR2 implementation is separately authorized.
 
+### 20.4 `packages/core/package.json` target contract
+
+**This section specifies the exact final shape BR2 implementation must
+produce — it does not itself edit `packages/core/package.json`.** The
+file's current actual content (§3) is a BR0-era placeholder: `"main":
+"src/index.ts"`, no dependencies, no scripts, and a stale description
+("No functional implementation yet (BR0)"). BR2 implementation replaces
+it with a shape mirroring `packages/cli/package.json`'s existing,
+already-real pattern:
+
+| Field | Target value | Rationale |
+|---|---|---|
+| `"type"` | `"module"` | Unchanged — already correct, matches `packages/cli/package.json` |
+| `"main"` | `"dist/index.js"` | Not `"src/index.ts"` — consumers (the CLI, tests) import the compiled output, exactly as `packages/cli/package.json`'s `"main": "dist/index.js"` already does. The current `"src/index.ts"` value is stale and must be corrected as part of BR2 implementation, not left as a known issue. |
+| `"types"` | `"dist/index.d.ts"` | New field — `packages/cli/package.json` has no `"types"` field because the CLI has no external consumers needing its type declarations; `@buildrail/core` does (the CLI itself, and later BR4/BR5), so `tsc` must emit `.d.ts` output and this field must point to it |
+| `"engines"` | `{"node": ">=22"}` | Mirrors `packages/cli/package.json`'s existing `engines.node` exactly (§25) |
+| `dependencies` | `{"yaml": "^<pinned>", "ajv": "^<pinned>"}` | Exactly the two runtime dependencies §20.1/§20.2 justify — nothing else. `ajv-formats` is explicitly excluded (§20.2). |
+| `devDependencies` | `{"typescript": "^<pinned>", "@types/node": "^<pinned>"}` | See "Dev-tooling strategy" below |
+| `scripts` | `build`, `clean`, `typecheck`, `build:tests`, `test` | Mirroring `packages/cli/package.json`'s existing script set and pattern exactly — same script *names*, same relative meaning (`build` compiles `src/` to `dist/`, `typecheck` runs `tsc --noEmit`, `build:tests` compiles `tests/` for `node:test` to execute, `test` runs the compiled tests) |
+| `description` | Updated to describe BR2's real, implemented governance engine | The current "No functional implementation yet (BR0)" string becomes false the moment BR2 ships and must not be left stale (the same category of issue §17.2 already flags for `status --help`'s text) |
+
+**Dev-tooling strategy — `typescript` and `@types/node` are approved dev
+dependencies, not a violation of "only `yaml` and `ajv`":** §20.2/§20's
+"only `yaml` and `ajv`" framing, and Acceptance Criterion V's "no
+dependency beyond `yaml` and `ajv`," refer specifically to **runtime**
+`dependencies` — the packages `@buildrail/core`'s shipped, executing code
+actually imports. `typescript` and `@types/node` are **devDependencies**:
+build-time-only tooling that compiles `src/**/*.ts` to `dist/**/*.js` and
+provides Node's own type declarations for the compiler, exactly the same
+role they already play in `packages/cli/package.json` (which already
+lists both as `devDependencies` per §3's "Current Repository Reality").
+This mirrors an already-established, already-approved pattern — it is not
+a new category of dependency being introduced by BR2, and does not
+require separate justification beyond noting the distinction explicitly
+here so "only yaml and ajv" is never misread as also forbidding the
+ordinary TypeScript build toolchain.
+
+### 20.5 Build order and workspace integration
+
+- **Build order: `@buildrail/core` before `@buildrail/cli`.** Once
+  `packages/cli/package.json` gains a `dependencies` entry on
+  `@buildrail/core` (§5, item 6), `packages/cli/src/commands/status.ts`
+  imports compiled output from `@buildrail/core` (per `"main":
+  "dist/index.js"` above) — so `packages/core`'s `dist/` must exist and
+  be current before `packages/cli` is built or type-checked. Root-level
+  `npm run build`/`npm run typecheck` (§24) must invoke
+  `--workspace=@buildrail/core` before `--workspace=@buildrail/cli`, not
+  in parallel and not in the reverse order.
+- **`npm ci` from a clean checkout must work end-to-end** with no manual
+  intermediate step: `npm ci` installs all workspace dependencies (both
+  packages' `dependencies`/`devDependencies`), then `npm run build`
+  (root) builds Core, then CLI, using Core's freshly-built `dist/` output
+  — not stale or manually-built artifacts, and not `packages/core/src/`
+  directly. A reviewer verifying this (§28) should be able to `rm -rf
+  packages/*/dist node_modules && npm ci && npm run build && npm test`
+  and see everything pass from that clean state.
+- **`packages/cli` resolves compiled Core, never `src`.** Nothing in
+  `packages/cli/src/**` may import a path under `packages/core/src/**`
+  directly (e.g. a relative `../../core/src/...` import bypassing the
+  package boundary) — all cross-package access goes through
+  `@buildrail/core`'s published entry point (`dist/index.js`, per its
+  `"main"` field), exactly as npm workspace resolution intends. This
+  preserves the package boundary `docs/ARCHITECTURE.md` establishes and
+  prevents the CLI from silently depending on Core's internal,
+  non-exported structure.
+
 ## 21. Security
 
 | Concern | BR2 requirement |
@@ -1856,7 +2269,7 @@ not merely a suggested one):
 - Invalid enum value (e.g. `git.force_push: "sometimes"`) → `CONFIG_SCHEMA_INVALID`
 - Valid `protected_systems` array with one well-formed entry validates
 - Invalid `protected_systems` entry (missing required `name`/`status`/`paths`) → `CONFIG_SCHEMA_INVALID`
-- A YAML document that produces a parser **warning** (not a hard error — e.g. a duplicate map key) via `YAML.parseDocument` still loads successfully, produces zero stdout/stderr output as a side effect, and the warning is captured in the result per §20's YAML diagnostics handling
+- A YAML document that produces a parser **warning** (not a hard error — an unresolved custom tag, per §20's "Real warning fixture," e.g. `%TAG ! tag:example.com,2026:app/\n---\nvalue: !foo hello`; **not** a duplicate map key, which is a hard `doc.errors` entry under `yaml`'s default `uniqueKeys: true` and would test the wrong code path) via `YAML.parseDocument` still loads successfully, produces zero stdout/stderr output as a side effect, and the warning is captured in the result per §20's YAML diagnostics handling
 
 **State loading**
 - Valid state loads and validates successfully
@@ -1891,13 +2304,35 @@ not merely a suggested one):
 - Each of the 5 `BLOCKED` entries and each of the 5 `BLOCKED` returns is tested individually as legal, with the correct actor (`implementation_agent` for entries, `human_owner` for returns)
 - Each of the 2 `CORRECTION_REQUIRED` entries (from `PENDING_REVIEW` with `independent_reviewer`, from `HUMAN_QA` with `human_owner`) and the 1 `CORRECTION_REQUIRED → IMPLEMENTING` return (with `implementation_agent`) are tested individually as legal with their correct actors
 - At least one attempted edge not in the 26-entry table (e.g. `IDEA → FROZEN`, `BLOCKED → SPECIFIED`, `REVIEW_APPROVED → CORRECTION_REQUIRED`) is confirmed illegal (`isLegalTransition` returns `false`)
+- `requiredActor` is confirmed to return `undefined` (not `null`, not a thrown exception) for at least one illegal pair (e.g. `IDEA → FROZEN`) — proving the corrected three-way `Actor | null | undefined` contract (§15's API section) is actually implemented, not the retracted "throws" behavior a prior draft described
+
+**Graph-legal vs. generic-apply-executable (§15)**
+- Both dedicated-operation edges (`SPECIFIED → AUTHORIZED`,
+  `PRODUCTION_VERIFIED → FROZEN`) are confirmed graph-legal:
+  `isLegalTransition` returns `true` for both, and `requiredActor` returns
+  `"human_owner"` for both
+- `applyTransition(state, "AUTHORIZED", "human_owner")` from `SPECIFIED`
+  fails with `LIFECYCLE_DEDICATED_OPERATION_REQUIRED`, **not**
+  `LIFECYCLE_TRANSITION_ILLEGAL` and not a silent partial update —
+  `details` names `authorizeSpecifiedWork`
+- `applyTransition(state, "FROZEN", "human_owner")` from
+  `PRODUCTION_VERIFIED` fails with
+  `LIFECYCLE_DEDICATED_OPERATION_REQUIRED`, **not**
+  `LIFECYCLE_TRANSITION_ILLEGAL` and not a silent partial update —
+  `details` names `completeAndFreezePhase`
+- For every one of the other 24 legal edges, `applyTransition` does
+  **not** return `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` — spot-checked
+  across at least one edge from each of the primary-path/`BLOCKED`-entry/
+  `BLOCKED`-return/`CORRECTION_REQUIRED`-entry/`CORRECTION_REQUIRED`-return
+  categories, proving the dedicated-operation carve-out is exactly these
+  2 edges and not accidentally broader
 
 **Authorization policy**
 - An `authorized`-status record is accepted as active
 - A `completed`-status record is rejected as active (`AUTHORIZATION_INACTIVE`) — the specific case the human owner's task called out
 - A `revoked`-status record produces `AUTHORIZATION_REVOKED` specifically — **not** `AUTHORIZATION_INACTIVE` — proving the §13 check ordering (revoked checked before active-status) is actually implemented, not just documented
 - A `draft`-status record is rejected as active (`AUTHORIZATION_INACTIVE`)
-- No `authorization` present at all — a schema-valid state (§9's new test above confirms `loadState` itself succeeds) whose `authorization` is `undefined` — is rejected **at the policy layer** by `checkImplementationAllowed`/`isAuthorizationActive` (`AUTHORIZATION_MISSING`), distinct from and never confused with a `StateError`
+- No `authorization` present at all — a schema-valid state (§9's new test above confirms `loadState` itself succeeds) whose `authorization` is `undefined` — is rejected **at the policy layer**, distinctly per function: `isAuthorizationActive` returns `false` (its `boolean` contract — it never returns or throws a code), `getActiveAuthorization` returns `null` (its `Authorization | null` contract), and `checkImplementationAllowed` is the one of the three that returns the typed `PolicyResult` failure `AUTHORIZATION_MISSING` — these three return shapes must never be conflated with one another in implementation, tests, or documentation, and none of them is a `StateError`
 - An active authorization whose `id` does not match the requested phase is rejected (`AUTHORIZATION_PHASE_MISMATCH`)
 - `granted_by !== "human"` is rejected (`AUTHORIZATION_MISSING`) even if `status` is otherwise `authorized`
 - The full check order itself is tested directly: a record that is simultaneously `status: revoked` *and* would otherwise fail a later check (e.g. missing `specification`) still produces `AUTHORIZATION_REVOKED`, not the later-order failure — proving `checkImplementationAllowed` returns the *first* applicable failure in the mandated order (§13), not merely *some* correct-looking failure
@@ -1908,7 +2343,7 @@ not merely a suggested one):
 - The same call against a fixture with `authorization.id` for a different phase fails with `AUTHORIZATION_PHASE_MISMATCH`
 - The same call against a fixture with a genuinely active, correctly-scoped authorization succeeds
 - At least one of the 4 other forward-progress authorization-gated transitions (`PREFLIGHT → IMPLEMENTING`, `IMPLEMENTING → IMPLEMENTED`, `IMPLEMENTED → VERIFYING`, `VERIFYING → PENDING_REVIEW`) is spot-checked with the same inactive-authorization-blocks pattern, confirming the composition isn't accidentally limited to only the first gated edge
-- **Resume-bypass closure (the specific defect this correction fixes):** `applyTransition(state, "IMPLEMENTING", "implementation_agent")` for the `CORRECTION_REQUIRED → IMPLEMENTING` edge, against a fixture with `authorization.status: revoked`, fails with `AUTHORIZATION_REVOKED` — **not** a successful resume — proving a revoked authorization cannot be silently bypassed by resuming through `CORRECTION_REQUIRED` while graph-legality and actor-correctness (`human_owner` approved the resume) are both satisfied
+- **Resume-bypass closure (the specific defect this correction fixes):** `applyTransition(state, "IMPLEMENTING", "implementation_agent")` for the `CORRECTION_REQUIRED → IMPLEMENTING` edge, against a fixture with `authorization.status: revoked`, fails with `AUTHORIZATION_REVOKED` — **not** a successful resume — proving a revoked authorization cannot be silently bypassed by resuming through `CORRECTION_REQUIRED` while graph-legality and actor-correctness (this edge requires `actor: "implementation_agent"`, per §15's table — not `human_owner`) are both satisfied
 - At least one `BLOCKED → X` return (e.g. `BLOCKED → IMPLEMENTING`, with `actor: "human_owner"`) is spot-checked the same way: graph-legal, actor-correct, but `authorization.status: revoked` (or `completed`/missing) — the call fails with the appropriate `AUTHORIZATION_*` code, not a successful resume, confirming the fix covers `BLOCKED` returns too, not only `CORRECTION_REQUIRED`
 - The same `BLOCKED → IMPLEMENTING` / `CORRECTION_REQUIRED → IMPLEMENTING` calls succeed when the authorization is genuinely active and phase-matching — confirming the new gate doesn't break the ordinary, legitimate resume path
 - At least one non-gated transition (e.g. `PENDING_REVIEW → REVIEW_APPROVED`, or a `BLOCKED`/`CORRECTION_REQUIRED` *entry* edge such as `PREFLIGHT → BLOCKED`) succeeds even when `state.authorization.status` is `completed`/`revoked` — proving the composition is correctly scoped to exactly the 11 gated edges (§15's table), not applied blanket to every transition
@@ -1923,15 +2358,82 @@ not merely a suggested one):
 - `applyTransition(state, "AUTHORIZED", actor)` — the generic function, called directly for this specific pair — fails (does not silently succeed as a lifecycle-only, authorization-less change) when `current.lifecycle_state === "SPECIFIED"`, proving this edge is genuinely carved out of `applyTransition`'s generic handling
 
 **`activatePhase` (§15)**
-- Succeeds against a fixture at `current.lifecycle_state: "FROZEN"` (e.g. a BR1-frozen-shaped fixture), `actor: "human_owner"`, `request: {newPhaseId: "BR2", newAuthorization: {id: "BR2", status: "authorized", granted_by: "human", ...}}` — returning a state with `current.development_phase: "BR2"`, `current.lifecycle_state: "AUTHORIZED"`, `authorization` replaced with the supplied record, and `baselines`/`completed_phases` unchanged
-- The fixture's `planned_phases` (which includes `"BR2"` before the call) has `"BR2"` removed after a successful call — proving `activatePhase` derives this itself rather than requiring the caller to supply a pre-modified array (the specific defect this correction fixes)
-- A fixture whose `planned_phases` does **not** contain `request.newPhaseId` (e.g. reactivating BR0's own bootstrap case) still succeeds, with `planned_phases` left unchanged — proving removal is a no-op, not an error, when the phase ID isn't present
+- Succeeds against a fixture satisfying every closure invariant in §15's
+  precondition 2 (`current.lifecycle_state: "FROZEN"`,
+  `authorization.status: "completed"`, `authorization.id` matching
+  `current.development_phase`, that phase present in both
+  `completed_phases` and `baselines` with `status: "frozen"`, `candidate`
+  fields all `null`), `actor: "human_owner"`, `request: {newPhaseId:
+  "BR3", newAuthorization: {id: "BR3", status: "authorized", granted_by:
+  "human", ...}}` — returning a state with `current.development_phase:
+  "BR3"`, `current.lifecycle_state: "AUTHORIZED"`, `authorization`
+  replaced with the supplied record, and `baselines`/`completed_phases`
+  unchanged
+- The fixture's `planned_phases` (which includes `"BR3"` before the call) has `"BR3"` removed after a successful call — proving `activatePhase` derives this itself rather than requiring the caller to supply a pre-modified array (the specific defect this correction fixes)
+- A fixture whose `planned_phases` does **not** contain `request.newPhaseId` still succeeds, with `planned_phases` left unchanged — proving removal is a no-op, not an error, when the phase ID isn't present
 - Fails with `LIFECYCLE_AUTHORITY_REQUIRED` for any actor other than `"human_owner"`
-- Fails with `LIFECYCLE_TRANSITION_ILLEGAL` when `current.lifecycle_state` is not `"FROZEN"` (and is not the one-time BR0 bootstrap case)
+- Fails with `LIFECYCLE_TRANSITION_ILLEGAL` when `current.lifecycle_state` is not `"FROZEN"`
+- **Each closure invariant is tested independently as a rejection case (no bootstrap exception — the specific defect this correction fixes):** a fixture at `current.lifecycle_state: "FROZEN"` but with `authorization.status` still `"authorized"`/`"in_progress"` (not yet `"completed"`) fails with `LIFECYCLE_TRANSITION_ILLEGAL`; a fixture where the frozen phase is missing from `completed_phases` fails the same way; a fixture where it is missing from `baselines`, or present with `status` other than `"frozen"`, fails the same way; a fixture with a non-null `candidate.branch`/`base_sha`/`candidate_sha` left over fails the same way — proving `activatePhase` genuinely requires full closure, not merely `lifecycle_state === "FROZEN"` in isolation
 - **Rejects reactivating a closed phase ID (the other specific defect this correction fixes):** a call with `request.newPhaseId` equal to a key already present in `state.baselines` (e.g. `"BR1"`) fails with `LIFECYCLE_TRANSITION_ILLEGAL` — proving BR2 does not silently allow reusing an already-frozen phase ID as a new activation target
 - The same rejection is confirmed for `request.newPhaseId` already present in `state.completed_phases`, independent of whether it's also a `baselines` key
 - Fails with `AUTHORIZATION_INACTIVE` when `request.newAuthorization.status` is not `"authorized"`
 - Fails with `AUTHORIZATION_PHASE_MISMATCH` when `request.newAuthorization.id !== request.newPhaseId`
+
+**`completeAndFreezePhase` (§15)**
+- Succeeds against a fixture at `current.lifecycle_state:
+  "PRODUCTION_VERIFIED"`, `actor: "human_owner"`, `request: {approvedSha:
+  "<40-hex-char SHA>"}` — returning a state with
+  `current.lifecycle_state: "FROZEN"`, `authorization.status:
+  "completed"`, `completed_phases` gaining
+  `current.development_phase`, and `baselines` gaining an entry keyed by
+  `current.development_phase` with `approved_sha: request.approvedSha`
+  and `status: "frozen"`
+- Fails with `LIFECYCLE_AUTHORITY_REQUIRED` for any actor other than `"human_owner"`
+- Fails with `LIFECYCLE_TRANSITION_ILLEGAL` when `current.lifecycle_state` is not `"PRODUCTION_VERIFIED"`
+- Fails with `BASELINE_SHA_INVALID` when `request.approvedSha` does not
+  match `^[0-9a-f]{40}$` (e.g. too short, uppercase hex, non-hex
+  characters) — the specific new error code this operation introduces
+- A call whose `completed_phases`/`baselines` already (idempotently)
+  contain the current phase does not duplicate the entry — appending is
+  a no-op for `completed_phases`, and the `baselines` entry is set once,
+  not accumulated
+- Other fields (`current.development_phase`, `planned_phases`, `project`,
+  `schema_version`, `review`, `protected_systems`, every other
+  `baselines`/`completed_phases` entry) are confirmed unchanged after a
+  successful call
+- `applyTransition(state, "FROZEN", actor)` — the generic function,
+  called directly for this specific pair — fails with
+  `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` (does not silently succeed as
+  a lifecycle-only update leaving `baselines`/`completed_phases`
+  unpopulated) when `current.lifecycle_state === "PRODUCTION_VERIFIED"`,
+  proving this edge is genuinely carved out of `applyTransition`'s
+  generic handling
+
+**Schema-setup error boundary (§10)**
+- A `createRegistry()` call that throws (simulated via a fixture
+  directory or injected fault representing a missing/malformed schema
+  file) is caught by `loadConfig`/`loadState` and surfaces as
+  `{ ok: false, error: { code: "SCHEMA_SETUP_FAILED", ... } }` — not an
+  unhandled exception propagating out of `loadConfig`/`loadState`, and
+  not `SCHEMA_REFERENCE_UNRESOLVED` or `CONFIG_SCHEMA_INVALID`/
+  `STATE_SCHEMA_INVALID`
+- `SCHEMA_SETUP_FAILED` and `SCHEMA_REFERENCE_UNRESOLVED` are confirmed
+  distinct: a scenario producing each is tested separately, and neither
+  fixture's expected code is interchangeable with the other's
+
+**Package and build integration (§20.4, §20.5)**
+- A clean-checkout sequence (`npm ci`, then root `npm run build`, then
+  root `npm test`) succeeds, covering both `packages/core` and
+  `packages/cli`
+- `packages/core/package.json`'s published shape matches §20.4's target
+  contract: `"main": "dist/index.js"`, `"types": "dist/index.d.ts"`,
+  `engines.node: ">=22"`, `dependencies` containing exactly `yaml` and
+  `ajv` (no `ajv-formats`), `devDependencies` containing `typescript` and
+  `@types/node`
+- Building `@buildrail/cli` after `@buildrail/core` (the required order,
+  §20.5) succeeds; nothing in `packages/cli/src/**` imports a path under
+  `packages/core/src/**` directly (checked by inspection/lint-equivalent
+  assertion, not merely "the build happens to pass")
 
 **CLI status integration**
 - `buildrail status` against a valid, BR0+BR1-frozen-shaped fixture project prints the required field set (§17.1) and exits `0`
@@ -1940,6 +2442,7 @@ not merely a suggested one):
 - `buildrail status` against a fixture with missing `.buildrail/` files behaves the same way
 - `buildrail status` against a fixture whose `state.yml` has a **populated** `candidate` (non-null `branch`/`base_sha`/`candidate_sha`) correctly **includes** those values in its output — proving the allowed category (§17.1) is actually surfaced, not suppressed
 - Output contains no evidence of **live Git inspection** having occurred — no invocation of any Git command/library, and no value present in the output that isn't traceable to the loaded `state.yml`/`config.yml` fixture content (this is the precise, checkable form of "no live Git facts": every branch-or-SHA-shaped string in the output must correspond exactly to a `candidate.*` or `baselines.*.approved_sha` value in the input fixture, not to anything computed from the real filesystem/Git state of the test environment) — asserted by tracing output values back to fixture input, not merely by pattern-matching for "SHA-shaped strings"
+- `buildrail status` invoked with the process's working directory set to a fixture project directory (via the subprocess's `cwd`, per BR1's existing subprocess-testing pattern) reads that fixture's `.buildrail/` files — proving `projectRoot` is genuinely `process.cwd()` (§17.0), with no parent-directory walking: a variant fixture where `.buildrail/` exists only in a *parent* of the invoked `cwd` (not directly under it) is confirmed to fail with `CONFIG_NOT_FOUND`, not to find the parent's files
 
 ## 23. Fixtures
 
@@ -2047,11 +2550,16 @@ existing shape exactly.
   — proven by the cwd-independence test in §22 (config/state loading
   succeeds when invoked from a working directory unrelated to BuildRail's
   own source tree).
-- **H.** `isLegalTransition`/`requiredActor`/`applyTransition` correctly
-  implement **all 26 legal edges** of the complete transition table in
-  §15 (not a sample), each with its correct required actor including
-  both actor-neutral edges, proven by the exhaustive transition test
-  matrix in §22.
+- **H.** `isLegalTransition`/`requiredActor` correctly classify **all 26
+  legal edges** of the complete transition table in §15 (not a sample),
+  each with its correct required actor including both actor-neutral edges
+  and `requiredActor`'s deterministic `undefined` for illegal pairs, and
+  `applyTransition` correctly executes the **24** of those 26 edges that
+  are generic-apply edges while deterministically refusing the other **2**
+  (`SPECIFIED → AUTHORIZED`, `PRODUCTION_VERIFIED → FROZEN`) with
+  `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` — proven by the exhaustive
+  transition test matrix and the graph-vs-generic-apply test category in
+  §22.
 - **I.** `checkImplementationAllowed` correctly distinguishes
   active/authorized, active/in-progress, inactive/completed,
   inactive/draft, and revoked authorization states — implementing the
@@ -2084,10 +2592,45 @@ existing shape exactly.
 - **L.** `activatePhase` (§15) atomically sets `development_phase`,
   `lifecycle_state`, `authorization`, and a self-derived `planned_phases`
   (with `newPhaseId` removed if present — never requiring the caller to
-  compute and pass a modified array), requires `human_owner`, requires a
-  `FROZEN` (or bootstrap) precondition, and **rejects reactivating a
-  phase ID already present in `baselines` or `completed_phases`** —
-  proven by the dedicated test matrix in §22.
+  compute and pass a modified array), requires `human_owner`, requires
+  the **full closure-invariant precondition** (`FROZEN` +
+  `authorization.status: completed` + matching `authorization.id` +
+  presence in both `completed_phases` and `baselines` with `status:
+  frozen` + a fully-`null` `candidate` — with no BR0-bootstrap exception),
+  and **rejects reactivating a phase ID already present in `baselines` or
+  `completed_phases`** — proven by the dedicated test matrix in §22,
+  including each closure-invariant rejection case tested independently.
+- **W.** `authorizeSpecifiedWork`, `activatePhase`, and
+  `completeAndFreezePhase` are all typed to return
+  `Result<BuildRailState, TransitionError>` (§15's API section,
+  `TransitionError = LifecycleError | PolicyError`) — no ad hoc,
+  independently-shaped error type per function.
+- **X.** `completeAndFreezePhase` (§15) is the exclusive path from
+  `PRODUCTION_VERIFIED → FROZEN` — a bare `applyTransition` call for that
+  pair fails with `LIFECYCLE_DEDICATED_OPERATION_REQUIRED`, never a
+  silent lifecycle-only update — and atomically sets
+  `current.lifecycle_state`, `authorization.status: "completed"`,
+  `completed_phases`, and a new `baselines` entry (keyed by the closing
+  phase, `status: "frozen"`, `approved_sha` taken from
+  `request.approvedSha`) together, rejecting a malformed SHA with the new
+  `BASELINE_SHA_INVALID` code — proven by the dedicated test matrix in
+  §22.
+- **Y.** `loadConfig`/`loadState` catch a `createRegistry()` setup
+  failure and surface it as the distinct `SCHEMA_SETUP_FAILED` code —
+  never an unhandled exception, and never conflated with
+  `SCHEMA_REFERENCE_UNRESOLVED` or the `*_SCHEMA_INVALID` codes — proven
+  by the schema-setup-boundary test category in §22.
+- **Z.** `packages/core/package.json`'s final shape matches §20.4's
+  target contract exactly (`"main": "dist/index.js"`, `"types":
+  "dist/index.d.ts"`, `engines.node: ">=22"`, runtime `dependencies`
+  limited to `yaml` and `ajv`, `typescript`/`@types/node` as
+  `devDependencies`), and a clean `npm ci` followed by root `npm run
+  build` builds `@buildrail/core` before `@buildrail/cli` consumes its
+  compiled output (§20.5) — proven by the package-and-build-integration
+  test category in §22.
+- **AA.** `buildrail status` resolves governance files using exactly
+  `process.cwd()` as `projectRoot` (§17.0) — no parent-directory walking,
+  no Git-root discovery — proven by the CLI project-root test in §22.
 - **M.** `buildrail status` produces the required field set (§17.1),
   including `state.yml`-recorded Git-related metadata
   (`candidate.branch`/`base_sha`/`candidate_sha`,
@@ -2136,7 +2679,13 @@ resolve at the *specification* level:
    `status: authorized`, `current.development_phase: BR2`,
    `current.lifecycle_state: AUTHORIZED`) — exactly as BR1's own
    `governance(BR1): authorize CLI skeleton implementation` commit did.
-   This specification does not perform that activation.
+   This specification does not perform that activation. **This activation
+   is itself performed by hand** (the same hand-maintained pattern
+   BR0→BR1 used), **not** via `activatePhase` — BR2's own governance
+   engine, including `activatePhase`, does not exist yet at the moment
+   BR2 itself is activated, so it cannot govern its own activation. Every
+   phase after BR2 (BR3 onward) is expected to activate via `activatePhase`
+   instead, per §15's "Why this must exist now" note.
 2. **`buildrail init` real ownership.** Still unresolved (§17.4) —
    carried forward unchanged from BR1, not narrowed or assigned by this
    document.
@@ -2151,27 +2700,10 @@ resolve at the *specification* level:
    contradictions (e.g., a phase appearing in both `completed_phases` and
    `planned_phases` simultaneously) are not detected by BR2 — noted as a
    possible future policy addition, not invented here.
-5. **`docs/concepts/authorization.md` prose update.** Should be updated
-   during BR2 implementation to state the canonical active/historical
-   model from §12 explicitly, replacing its current more general "Only one
-   authorization is normally active at a time per work item" language with
-   the concrete status-table from §12. This is a documentation-consistency
-   task for BR2 *implementation*, not performed by this specification.
-6. **Actor authentication.** Explicitly out of scope for BR2 (§6, §16)
+5. **Actor authentication.** Explicitly out of scope for BR2 (§6, §16)
    and not assigned to any future phase by this document — a genuinely
    open product question.
-7. **`docs/STATE_MACHINE.md`'s `* → FROZEN` wildcard reconciliation.**
-   §15 ("Resolving `docs/STATE_MACHINE.md`'s `* → FROZEN` wildcard")
-   adopts a restricted interpretation for BR2 — `FROZEN` is legally
-   reachable only from `PRODUCTION_VERIFIED` — because the literal "any
-   state" wildcard reading is incompatible with an exhaustively-enumerated
-   edge table. Whether `docs/STATE_MACHINE.md` itself should be narrowed
-   to match, or whether a future specification should instead add
-   additional explicit `X → FROZEN` edges (e.g. an administrative
-   "abandon and freeze" path from `BLOCKED`/`CORRECTION_REQUIRED`), is
-   left open. BR2 implementation must encode only the one edge this
-   specification defines and must not add others on its own initiative.
-8. **Exact `BLOCKED` resume-origin enforcement.** §15's "Return from
+6. **Exact `BLOCKED` resume-origin enforcement.** §15's "Return from
    `BLOCKED`" section documents that BR2's pure lifecycle functions
    cannot themselves verify a `BLOCKED → X` return targets the exact
    state `BLOCKED` was entered from (only that `X` is *some* legal return
@@ -2181,7 +2713,7 @@ resolve at the *specification* level:
    judged necessary, a future specification must design that schema
    addition explicitly rather than have it invented ad hoc during
    implementation.
-9. **Phase reactivation/reopening policy.** `activatePhase` (§15)
+7. **Phase reactivation/reopening policy.** `activatePhase` (§15)
    deliberately rejects reactivating a phase ID already present in
    `baselines` or `completed_phases` — BR2 has no concept of reopening or
    revising an already-completed/frozen phase under its original ID. If
@@ -2190,6 +2722,17 @@ resolve at the *specification* level:
    a distinct, explicitly-designed reopen/revision policy — a new
    specification, not an `activatePhase` behavior change made ad hoc
    during some future phase's implementation.
+8. **Administrative "abandon and freeze" path.** `docs/STATE_MACHINE.md`'s
+   "Freezing" section and §15's table both now state, definitively, that
+   the only legal freeze edge is `PRODUCTION_VERIFIED → FROZEN` — this is
+   resolved, not deferred. What remains genuinely open is whether a
+   *different* capability — freezing a unit of work directly from
+   `BLOCKED`, `CORRECTION_REQUIRED`, or another non-terminal state without
+   it ever reaching `PRODUCTION_VERIFIED` (an "abandon in place" action) —
+   should ever be added. If it is, it requires a future explicit
+   specification/policy change to both `docs/STATE_MACHINE.md` and this
+   document together, adding the corresponding new edge(s) — it is not
+   implied by anything already resolved here.
 
 ## 28. Independent Review Requirements
 
@@ -2266,9 +2809,51 @@ The independent reviewer must specifically examine, for BR2:
   call for that pair is genuinely rejected rather than silently
   performing a partial, authorization-less update
 - Whether `activatePhase` (§15) correctly derives its own `planned_phases`
-  update (rather than requiring an impossible caller-supplied field) and
+  update (rather than requiring an impossible caller-supplied field),
   correctly rejects reactivating a phase ID already present in
-  `baselines`/`completed_phases`
+  `baselines`/`completed_phases`, and — with no BR0-bootstrap exception —
+  genuinely enforces every closure invariant in its precondition
+  (`FROZEN`, `authorization.status: completed`, matching `authorization.id`,
+  presence in both `completed_phases` and `baselines` with `status:
+  frozen`, and a fully-`null` `candidate`), each tested as an independent
+  rejection case
+- Whether `applyTransition` correctly refuses both dedicated-operation
+  edges (`SPECIFIED → AUTHORIZED`, `PRODUCTION_VERIFIED → FROZEN`) with
+  `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` specifically — not
+  `LIFECYCLE_TRANSITION_ILLEGAL`, and not a silent partial update — and
+  whether it correctly does *not* return that code for any of the other
+  24 legal edges
+- Whether `completeAndFreezePhase` (§15) atomically performs every part
+  of phase closure (`lifecycle_state`, `authorization.status`,
+  `completed_phases`, the new `baselines` entry) together, rejects a
+  malformed SHA with `BASELINE_SHA_INVALID`, and is the only path that
+  reaches `FROZEN` from `PRODUCTION_VERIFIED`
+- Whether `requiredActor` returns the fully deterministic three-way
+  contract (`Actor` value / `null` / `undefined`) specified in §15's API
+  section, never throwing for an illegal pair — the corrected replacement
+  for a prior draft's retracted "undefined behavior (throws)" language
+- Whether `SCHEMA_SETUP_FAILED` is correctly distinguished from
+  `SCHEMA_REFERENCE_UNRESOLVED` (§10) — a `createRegistry()` setup
+  failure surfaces as the former, never the latter, and never an
+  unhandled exception escaping `loadConfig`/`loadState`
+- Whether `packages/core/package.json`'s final shape matches §20.4's
+  target contract exactly, and whether a clean `npm ci` + root `npm run
+  build` genuinely builds `@buildrail/core` before `@buildrail/cli`
+  consumes its compiled `dist/` output, with no direct
+  `packages/core/src/**` import from CLI code (§20.5)
+- Whether `buildrail status` resolves governance files using exactly
+  `process.cwd()` (§17.0), with no parent-directory walking and no
+  Git-root discovery — confirmed by the CLI project-root test, not merely
+  by reading the specification's claim
+- Whether `docs/STATE_MACHINE.md` and this specification's §15 now agree,
+  word for word in substance, on the freeze policy (exactly
+  `PRODUCTION_VERIFIED → FROZEN`, no wildcard, no implicit
+  `BLOCKED`/`CORRECTION_REQUIRED` freeze path)
+- Whether `docs/concepts/authorization.md` accurately reflects the final
+  resolved model (top-level `state.authorization`, schema-optional,
+  active/inactive status table, historical representation via
+  `completed_phases`/`baselines`) rather than the prior draft's more
+  general, `current.authorization`-referencing language
 
 This document does not itself authorize BR2 implementation — see §1 and
 §27 item 1.
