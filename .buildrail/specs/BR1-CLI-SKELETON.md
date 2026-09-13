@@ -2,12 +2,12 @@
 
 ## Status
 
-**DRAFT — specification only. Not implementation-authorized.**
+**APPROVED SPECIFICATION**
 
-This document specifies BR1. Writing this specification does not
-authorize implementation. BR1 remains `PLANNED — NOT IMPLEMENTATION
-AUTHORIZED` in `.buildrail/state.yml` until the human owner explicitly
-grants a separate implementation authorization.
+This document is the approved BR1 implementation contract. Current
+implementation authorization is tracked canonically in
+`.buildrail/state.yml`; this specification does not grant authorization by
+itself — see the Authorization section below.
 
 ## Authorization
 
@@ -15,11 +15,15 @@ grants a separate implementation authorization.
   INDEPENDENTLY APPROVED + FROZEN` at baseline
   `04c93767510c51916fcc51f60b85b674c7d6f1cc`, governance closure
   `530cf9fce46c11eeb5b603884e1ec3ba3f9df135`).
-- **This document's authorization scope:** specification authoring only.
-- **Implementation authorization:** NOT GRANTED. A human owner must
-  explicitly authorize BR1 implementation as a separate act before any
-  code in `packages/cli/src/` may be changed under this spec.
-- **Granted by (specification task):** human.
+- **This document's role:** the approved implementation contract for BR1.
+  It does not itself grant or revoke implementation authorization.
+  Implementation authorization is granted only by the human owner, and its
+  current status is recorded canonically in `.buildrail/state.yml`
+  (`current.lifecycle_state`, `current.development_phase`, and
+  `authorization`) — consult that file, not this document's prose, for the
+  live authorization status.
+- **Granted by (specification approval):** human, following independent
+  review.
 
 ## Goal
 
@@ -671,13 +675,14 @@ BR1 must not attempt to resolve either item.
 
 ## Entry Conditions
 
-- BR0 is reviewed, approved, and frozen (satisfied: baseline
+- BR0 is reviewed, approved, and frozen (baseline
   `04c93767510c51916fcc51f60b85b674c7d6f1cc`, closure
   `530cf9fce46c11eeb5b603884e1ec3ba3f9df135`)
-- This specification exists and has been independently reviewed
-- BR1 is explicitly authorized for implementation by the human owner
-  (NOT yet satisfied — this document does not itself grant that
-  authorization)
+- This specification exists and has been independently reviewed and
+  approved
+- BR1 is explicitly authorized for implementation by the human owner —
+  this document does not itself grant that authorization; see
+  `.buildrail/state.yml` for current, canonical authorization status
 - As part of that authorization step (not as a separate follow-up, and not
   deferred to BR1 completion), `.buildrail/config.yml`'s `quality_gates`
   entries for `tests`, `typecheck`, and `build` are updated to
