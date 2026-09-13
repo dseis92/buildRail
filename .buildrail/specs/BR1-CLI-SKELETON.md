@@ -131,8 +131,8 @@ Usage:
   buildrail <command> [options]
 
 Commands:
-  init        Initialize BuildRail in a repository
-  status      Show BuildRail project status
+  init        Show initialization availability
+  status      Show status availability
   help        Show help
 
 Options:
@@ -142,6 +142,13 @@ Options:
 Build with AI agents without losing control of project state,
 authorization, verification, or approved work.
 ```
+
+Command descriptions in global help must accurately represent what the
+command does *in BR1* — they must never claim or imply that `init`
+actually initializes a project or that `status` actually reports project
+status, since neither is implemented yet (see `buildrail init` and
+`buildrail status` below). Future phases must update these descriptions
+once the underlying operations become real.
 
 ### `buildrail --version` / `-v`
 
@@ -170,9 +177,12 @@ Project initialization is implemented in a later BuildRail phase.
 `buildrail init` during BR1 must NOT create `.buildrail/`, `AGENTS.md`,
 skill files, adapter files, config, or state — in this repository or in
 any target project. It must not simulate, partially perform, or imply
-that initialization occurred. It exits successfully (`0`) only because the
-CLI successfully reported its own boundary, not because initialization
-ran.
+that initialization occurred. Because the command could not perform the
+operation the user actually requested (initializing a project), it must
+exit with code `1` (see Exit Code Contract) — BuildRail must not
+communicate programmatic success for an operation it did not perform.
+`buildrail init --help` is a distinct, successful operation (showing help)
+and exits `0`.
 
 **Open roadmap question (not resolved by this spec):** which future phase
 formally owns implementing real `buildrail init` scaffolding — BR2
@@ -197,6 +207,11 @@ implemented.
 `buildrail status` during BR1 must NOT parse `.buildrail/state.yml`, infer
 project state manually, return fabricated status, or add a YAML dependency
 for this purpose. It must not implement any partial slice of BR2 behavior.
+Because the command could not perform the operation the user actually
+requested (reporting real project status), it must exit with code `1` (see
+Exit Code Contract) — BuildRail must not communicate programmatic success
+for an operation it did not perform. `buildrail status --help` is a
+distinct, successful operation (showing help) and exits `0`.
 
 ### Command-specific help
 
@@ -322,17 +337,21 @@ above.
 
 ## Runtime Support
 
-**Minimum supported Node version: Node.js 20 (LTS).**
+**Minimum supported Node version: Node.js 22.**
 
-Rationale: Node 20 is an actively maintained LTS line at the time of this
-specification, supports the language/runtime features
-`tsconfig.base.json` already targets (`ES2022`, `NodeNext` module
-resolution), and is a conservative, widely-available baseline that avoids
-requiring BuildRail's nontechnical/semi-technical target audience to
-install an unusually new Node version. Implementation must document this
-baseline (e.g. an `engines.node` field on `packages/cli/package.json`, and
-a note in `packages/cli/README.md`) rather than leaving it undocumented or
-silently assumed.
+Rationale: Node 22 is a currently supported LTS release (Node 20 has
+reached end-of-life and must not be adopted as BuildRail's minimum
+baseline), supports the language/runtime features `tsconfig.base.json`
+already targets (`ES2022`, `NodeNext` module resolution) as well as the
+Node APIs BR1 needs (including the built-in `util.parseArgs` evaluated
+under Dependency Policy below), and is a conservative, currently-maintained
+baseline that avoids requiring BuildRail's nontechnical/semi-technical
+target audience to install an unusually new Node version while also
+avoiding an already-EOL runtime. Implementation must document this
+baseline via an `engines.node` field on `packages/cli/package.json` (e.g.
+`">=22"`, without pinning an exact minor/patch version absent a specific
+justification), and a note in `packages/cli/README.md`, rather than
+leaving it undocumented or silently assumed.
 
 BuildRail is conceptually cross-platform (macOS, Linux, Windows). The CLI
 must not introduce shell-dependent behavior (e.g. POSIX-only shell
@@ -344,7 +363,7 @@ platform-neutral way.
 
 BR1 must prefer the smallest reasonable dependency surface. Implementation
 must first evaluate whether Node's built-in `util.parseArgs` (stable since
-Node 18.3/20, matching the Runtime Support baseline above) is sufficient
+Node 18.3, well within the Runtime Support baseline above) is sufficient
 for BR1's small, fixed command surface (two commands, help, version, no
 subcommand trees, no complex flag types).
 
@@ -369,14 +388,18 @@ otherwise.
 
 | Code | Meaning |
 |------|---------|
-| `0` | Successful command execution (including BR1 boundary responses from `init`/`status`, which succeed at reporting their boundary) |
-| `1` | Command/runtime failure (an error occurred while attempting to run a recognized command) |
-| `2` | Invalid CLI usage / invalid or unrecognized arguments (includes unknown commands) |
+| `0` | Successful operation — the command actually performed what the user asked. Examples: `--help`, `-h`, `help`, `--version`, `-v`, `init --help`, `status --help`. |
+| `1` | Recognized command could not perform the requested operation. During BR1 this includes `buildrail init` and `buildrail status` — the commands exist and are registered, but the real operation they name (initializing a project, reporting real project status) is not implemented yet. |
+| `2` | Invalid CLI usage — unknown command, unsupported option, or invalid argument. |
 
-Placeholder BR1 commands (`init`, `status`) must return exit code `0` only
-because they successfully performed their BR1-defined behavior (printing
-the boundary message) — never because a governance operation actually
-succeeded. Their output must not imply governance operations occurred.
+BuildRail must not communicate programmatic success (exit `0`) for an
+operation it did not perform. `buildrail init` and `buildrail status`
+truthfully report their BR1 boundary, but because that boundary message
+means the requested operation was *not* carried out, both commands must
+exit `1`, not `0`. This is distinct from `buildrail init --help` and
+`buildrail status --help`, which succeed at the operation they actually
+perform (showing help) and correctly exit `0`. No BR1 command's output or
+exit code may imply a governance operation occurred when it did not.
 
 ## Output Contract
 
@@ -439,9 +462,9 @@ quality gates. Required acceptance-test coverage, at minimum:
 3. `buildrail help` — same as `--help`
 4. `buildrail --version` — prints version matching `package.json`, exits `0`
 5. `buildrail -v` — same as `--version`
-6. `buildrail init` — registered, prints BR1 boundary message, exits `0`
+6. `buildrail init` — registered, prints truthful BR1 boundary/unavailable message, exits `1`
 7. `buildrail init --help` — prints command-specific help, exits `0`
-8. `buildrail status` — registered, prints BR1 boundary message, exits `0`
+8. `buildrail status` — registered, prints truthful BR1 boundary/unavailable message, exits `1`
 9. `buildrail status --help` — prints command-specific help, exits `0`
 10. `buildrail <unknown-command>` — prints error + suggests `--help`, exits `2`
 11. Invalid argument handling (e.g. an unrecognized flag) — clean error, exits `2`
@@ -478,11 +501,31 @@ run.
 `.buildrail/config.yml`'s existing `quality_gates` entries (currently all
 `required: false`, each noting the condition under which they become
 required — e.g. tests "Required beginning when executable product code
-exists") are expected to flip `tests`, `typecheck`, and `build` to
-`required: true` once BR1 delivers executable product code. This
-specification does not perform that config change itself — it documents
-that BR1 implementation (or a follow-up governance update at BR1
-completion) is expected to.
+exists") must flip `tests`, `typecheck`, and `build` to `required: true`
+**before** executable BR1 implementation begins, not at BR1 completion.
+`lint` remains `required: false` unless lint tooling is explicitly
+introduced. This specification does not perform that config change
+itself; the intended governance sequence is:
+
+```
+BR1 specification approved
+        ↓
+Human authorizes BR1 implementation
+        ↓
+Governance authorization update sets BR1 active
+AND updates .buildrail/config.yml quality_gates
+(tests/typecheck/build → required: true)
+        ↓
+BR1 implementation begins
+```
+
+Setting these gates to `required: true` only at BR1 completion would let
+implementation proceed against canonical policy that still describes BR1
+as having no executable product code to check — a mismatch between
+policy and reality for the entire duration of implementation. The gates
+must be real and required from the moment BR1 implementation starts, so
+that verification evidence produced during BR1 is measured against the
+policy that actually governs it.
 
 ## Files Expected to Change During Implementation
 
@@ -564,8 +607,8 @@ and process exit code) command-line shell.
 - **F.** `buildrail help` works.
 - **G.** `buildrail --version` works and returns the actual package version.
 - **H.** `buildrail -v` works.
-- **I.** `buildrail init` is registered and truthfully exposes only BR1 behavior (no scaffolding created, no false success claims).
-- **J.** `buildrail status` is registered and truthfully exposes only BR1 behavior (no state parsed, no fabricated status).
+- **I.** `buildrail init` is registered, truthfully exposes only BR1 behavior (no scaffolding created), and exits `1` since it could not perform the requested operation.
+- **J.** `buildrail status` is registered, truthfully exposes only BR1 behavior (no state parsed, no fabricated status), and exits `1` since it could not perform the requested operation.
 - **K.** Command-specific help (`init --help`, `status --help`) works.
 - **L.** Unknown commands produce a useful, non-stack-trace error and suggest `--help`.
 - **M.** Exit codes match the documented Exit Code Contract in every tested case.
@@ -635,6 +678,12 @@ BR1 must not attempt to resolve either item.
 - BR1 is explicitly authorized for implementation by the human owner
   (NOT yet satisfied — this document does not itself grant that
   authorization)
+- As part of that authorization step (not as a separate follow-up, and not
+  deferred to BR1 completion), `.buildrail/config.yml`'s `quality_gates`
+  entries for `tests`, `typecheck`, and `build` are updated to
+  `required: true` (see Quality Gates § above) — BR1 implementation must
+  not begin while canonical policy still describes these gates as
+  optional
 
 ## Exit Conditions
 
