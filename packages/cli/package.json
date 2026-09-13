@@ -2,11 +2,25 @@
   "name": "@buildrail/cli",
   "version": "0.1.0",
   "private": true,
-  "description": "The buildrail CLI. No functional commands yet (BR0).",
+  "description": "The buildrail CLI.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
   "bin": {
-    "buildrail": "src/index.ts"
+    "buildrail": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true }); require('node:fs').rmSync('dist-tests', { recursive: true, force: true })\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:tests": "tsc -p tsconfig.test.json",
+    "test": "npm run build && npm run build:tests && node --test \"dist-tests/tests/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "typescript": "^5.9.3"
   },
   "license": "Apache-2.0"
 }

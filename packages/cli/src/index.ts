@@ -1,8 +1,8 @@
-/**
- * buildrail CLI entry point
- *
- * Planned implementation phase: BR1.
- * BR0 intentionally contains no functional CLI.
- */
+#!/usr/bin/env node
 
-export {};
+import { runCli } from "./cli.js";
+
+const result = runCli(process.argv.slice(2));
+
+process.stdout.write(result.stdout);
+process.exitCode = result.exitCode;
