@@ -6,15 +6,17 @@
 
 ## Status
 
-**Experimental — BR0 Constitution complete, independently approved, and frozen.**
+**Experimental — BR0 complete and frozen; BR1 authorized, implementation not yet started.**
 
 BuildRail's foundational phase (BR0) is complete and frozen at baseline
-`04c93767510c51916fcc51f60b85b674c7d6f1cc`. There is no functional CLI,
-governance engine, or agent adapter yet. This repository currently contains
-the project's specification, governance model, architecture, schemas, and
-scaffolding — not a working product. No implementation phase is currently
-authorized; BR1–BR8 remain planned. See [Development Phases](#development-phases)
-below for what that means concretely.
+`04c93767510c51916fcc51f60b85b674c7d6f1cc`. BR1 (CLI Skeleton) is now
+authorized for implementation, but implementation has not yet begun —
+there is still no functional CLI, governance engine, or agent adapter.
+This repository currently contains the project's specification, governance
+model, architecture, schemas, and scaffolding — not a working product.
+BR2–BR8 remain planned and not implementation-authorized. See
+[Development Phases](#development-phases) below for what that means
+concretely.
 
 ## What is BuildRail?
 
@@ -137,7 +139,7 @@ discipline it asks of projects that adopt it.
 | Phase | Name | Scope |
 |-------|------|-------|
 | **BR0** | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. — **COMPLETE + FROZEN** |
-| BR1 | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` |
+| **BR1** | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` — **AUTHORIZED** (implementation not yet started) |
 | BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions |
 | BR3 | Git Inspection | Branch/SHA detection, working tree, diffs, protected-path and deletion/rename detection |
 | BR4 | Verification | Quality gate commands, candidate-bound verification, `buildrail verify`, evidence reports |
@@ -146,9 +148,11 @@ discipline it asks of projects that adopt it.
 | BR7 | Codex Adapter | Codex integration |
 | BR8 | End-to-End Dogfood | Govern BuildRail's own development using BuildRail; reference demo app; full lifecycle test |
 
-**BR0 is complete, independently approved, and frozen.** No implementation
-phase is currently authorized — BR1–BR8 are planned but not
-implementation-authorized. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+**BR0 is complete, independently approved, and frozen. BR1 is authorized**
+for implementation (not yet started) per
+[`.buildrail/specs/BR1-CLI-SKELETON.md`](.buildrail/specs/BR1-CLI-SKELETON.md).
+BR2–BR8 remain planned but not implementation-authorized. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/development/`](docs/development/) for phase-by-phase detail.
 
 ## Documentation

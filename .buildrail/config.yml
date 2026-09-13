@@ -31,23 +31,23 @@ human_qa:
 quality_gates:
   tests:
     command: npm test
-    required: false
-    note: "Required beginning when executable product code exists."
+    required: true
+    note: "Required for BR1 executable product code."
 
   typecheck:
     command: npm run typecheck
-    required: false
-    note: "Required beginning when TypeScript implementation starts."
+    required: true
+    note: "Required for BR1 TypeScript implementation."
 
   lint:
     command: npm run lint
     required: false
-    note: "Required beginning when lint configuration exists."
+    note: "Required only when lint configuration exists."
 
   build:
     command: npm run build
-    required: false
-    note: "Required beginning when executable build exists."
+    required: true
+    note: "Required for BR1 executable build."
 
 # No protected paths are defined yet. BuildRail's own source tree has no
 # functional implementation during BR0, so there is nothing to protect

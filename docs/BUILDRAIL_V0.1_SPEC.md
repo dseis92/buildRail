@@ -2,9 +2,12 @@
 
 This is the primary product specification for BuildRail. It describes the
 intended shape of v0.1 across all planned development phases (BR0–BR8).
-**Only BR0 is currently authorized.** Everything described here beyond BR0
-is a design target, not a completed feature — see `docs/ROADMAP.md` and
-`.buildrail/state.yml` for current authorization status.
+**BR0 is complete and frozen; BR1 is currently authorized for
+implementation (not yet started); BR2–BR8 remain planned and not
+implementation-authorized.** Everything described here beyond what has
+actually been implemented is a design target, not a completed feature —
+see `docs/ROADMAP.md` and `.buildrail/state.yml` for current authorization
+status.
 
 ## 1. Problem
 

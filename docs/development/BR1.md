@@ -1,6 +1,6 @@
 # BR1 — CLI Skeleton
 
-**Status: PLANNED / NOT IMPLEMENTATION AUTHORIZED**
+**Status: AUTHORIZED / IMPLEMENTATION NOT YET STARTED**
 
 For the authoritative BR1 implementation contract (architectural boundary,
 command behavior, build/execution model, dependency policy, testing
