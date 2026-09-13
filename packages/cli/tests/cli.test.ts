@@ -4,7 +4,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,9 +26,15 @@ interface RunResult {
   exitCode: number;
 }
 
-async function runCli(args: string[]): Promise<RunResult> {
+interface RunOptions {
+  cwd?: string;
+}
+
+async function runCli(args: string[], options: RunOptions = {}): Promise<RunResult> {
   try {
-    const { stdout, stderr } = await execFileAsync(process.execPath, [cliEntry, ...args]);
+    const { stdout, stderr } = await execFileAsync(process.execPath, [cliEntry, ...args], {
+      cwd: options.cwd,
+    });
     return { stdout, stderr, exitCode: 0 };
   } catch (error) {
     const execError = error as { stdout?: string; stderr?: string; code?: number };
@@ -37,6 +44,10 @@ async function runCli(args: string[]): Promise<RunResult> {
       exitCode: execError.code ?? 1,
     };
   }
+}
+
+function makeScratchDir(): string {
+  return mkdtempSync(join(tmpdir(), "buildrail-cli-test-"));
 }
 
 test("buildrail --help prints usage and exits 0", async () => {
@@ -113,4 +124,40 @@ test("invalid argument to a known command exits 2", async () => {
   const result = await runCli(["init", "--bogus"]);
   assert.equal(result.exitCode, 2);
   assert.match(result.stdout, /BuildRail could not run this command/);
+});
+
+test("buildrail init creates no files in the working directory", async () => {
+  const scratchDir = makeScratchDir();
+  try {
+    const result = await runCli(["init"], { cwd: scratchDir });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stdout, /not available yet/i);
+
+    const entries = readdirSync(scratchDir);
+    assert.ok(!entries.includes(".buildrail"));
+    assert.ok(!entries.includes("AGENTS.md"));
+    assert.ok(!entries.includes("config.yml"));
+    assert.ok(!entries.includes("state.yml"));
+    assert.deepEqual(entries, [], "init must not create any files or directories");
+  } finally {
+    rmSync(scratchDir, { recursive: true, force: true });
+  }
+});
+
+test("buildrail status works without any BuildRail governance files present and creates none", async () => {
+  const scratchDir = makeScratchDir();
+  try {
+    const before = readdirSync(scratchDir);
+    assert.ok(!before.includes(".buildrail"));
+    assert.deepEqual(before, [], "scratch directory must start empty");
+
+    const result = await runCli(["status"], { cwd: scratchDir });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stdout, /requires the governance engine/i);
+
+    const after = readdirSync(scratchDir);
+    assert.deepEqual(after, [], "status must not create any files or directories");
+  } finally {
+    rmSync(scratchDir, { recursive: true, force: true });
+  }
 });
