@@ -276,28 +276,43 @@ Additional state-specific behavior:
 | `baselines` | Validated per `#/$defs/baseline` for each entry; `approved_sha` must match `^[0-9a-f]{40}$`. A `baselines` entry with a malformed SHA is `STATE_SCHEMA_INVALID`, not silently accepted. |
 | `completed_phases` / `planned_phases` | Plain string arrays per schema; BR2 does not cross-validate phase IDs against a canonical phase list (e.g. rejecting `"BR99"`) — that would require domain knowledge the schema doesn't encode, and is out of scope for BR2's schema-driven validation. This is a known, accepted limitation (see §28). |
 | Lifecycle state enum | Validated against the closed enum in `state.schema.json`'s `$defs.lifecycleState` (the 16 states from §12 of BR1's spec / `docs/STATE_MACHINE.md`) |
-| Unresolved `authorization` `$ref` | Neither is a data-validation failure, so neither is `STATE_SCHEMA_INVALID` (§18) — but which of two distinct codes applies depends on *how* resolution failed (§10's "Schema-setup error boundary"): if `createRegistry()` itself throws (e.g. a schema file is missing entirely), `loadState` surfaces `SCHEMA_SETUP_FAILED`; if the registry constructs but `state.schema.json`'s `$ref` to `authorization.schema.json` specifically cannot be resolved against the registered set, `SCHEMA_REFERENCE_UNRESOLVED` applies instead. Both should be effectively unreachable once §11 is implemented correctly, but each distinct code exists so a broken schema installation fails loudly and specifically, in a way that names *which* kind of setup problem occurred, rather than masquerading as a data problem or collapsing two different failure classes into one code. |
+| Unresolved `authorization` `$ref` | Neither is a data-validation failure, so neither is `STATE_SCHEMA_INVALID` (§18) — but which of two distinct codes applies depends on *how* resolution failed (§10's "Schema error taxonomy"): if `createRegistry()` cannot construct a registry at all (e.g. a schema file is missing entirely, unreadable, or malformed JSON), `loadState` surfaces `SCHEMA_SETUP_FAILED`; if all three schema files load and parse fine but `state.schema.json`'s `$ref` to `authorization.schema.json` specifically cannot be resolved against the registered set, `SCHEMA_REFERENCE_UNRESOLVED` applies instead. Both should be effectively unreachable once §11 is implemented correctly, but each distinct code exists so a broken schema installation fails loudly and specifically, in a way that names *which* kind of setup problem occurred, rather than masquerading as a data problem or collapsing two different failure classes into one code. |
 | "Contradictory state BR2 can deterministically detect" | BR2 detects exactly one class of this: **when `authorization` is present** and its `status` is `authorized` or `in_progress` (see §12), `current.development_phase` not equal to `authorization.id` — surfaced as a `PolicyError`, not a `StateError`, since it's a policy-layer concern, not a schema-layer one. This check is vacuously skipped when `authorization` is absent (there is no `authorization.id` to compare). BR2 does **not** attempt to detect other forms of contradiction (e.g. "phase in both `completed_phases` and `planned_phases`") — flagged as a deferred item (§27 item 4) rather than invented ad hoc. |
 
-**Boundary: `loadState` performs full JSON-Schema validation; `authorizeSpecifiedWork`/`activatePhase`
-(§15) do not.** `loadState` is the only place a `BuildRailState` value is
-validated against `state.schema.json` in full (every property, every
-nested `$ref`, every enum). `authorizeSpecifiedWork` and `activatePhase`
-operate on an already-loaded, already-schema-valid `BuildRailState` and
-an already-constructed `Authorization` argument; the checks they perform
-on that `Authorization` argument (non-empty `specification`, `granted_by
-=== "human"`, `status` equal to a specific expected value, `id` matching
-the target phase) are exactly §13's **semantic** policy checks, not a
-second full-schema validation pass. A caller that hand-constructs an
-`Authorization` object satisfying §13's semantic checks but violating
-some other `authorization.schema.json` constraint `loadState` would have
-caught (e.g. an extra property forbidden by the schema, if the schema
-were ever tightened to disallow one) is not guaranteed to be rejected by
-`authorizeSpecifiedWork`/`activatePhase` — those two functions are a
-policy boundary, not a schema-validation boundary. This is an accepted
-scope limitation, not an oversight: re-running full schema validation
-inside every pure lifecycle function would duplicate `loadState`'s job
-and blur the I/O-vs-pure-logic separation (§7).
+**Boundary: `loadState` performs full JSON-Schema validation;
+`authorizeSpecifiedWork`, `activatePhase`, and `completeAndFreezePhase`
+(§15) do not — they perform semantic validation only, and none of them
+claims otherwise.** `loadState` is the only place a `BuildRailState`
+value is validated against `state.schema.json` in full (every property,
+every nested `$ref`, every enum). `authorizeSpecifiedWork` and
+`activatePhase` operate on an already-loaded, already-schema-valid
+`BuildRailState` and an already-constructed `Authorization` argument
+(`completeAndFreezePhase` takes no `Authorization` argument at all — its
+only caller-supplied input is `request.approvedSha`, checked against a
+format regex, §15); the checks `authorizeSpecifiedWork`/`activatePhase`
+perform on their `Authorization` argument (non-empty `specification`,
+`granted_by === "human"`, `status` equal to a specific expected value,
+`id` matching the target phase) are exactly §13's **semantic** policy
+checks, not a second full-schema validation pass, and neither function's
+specification claims its argument "must be schema-valid" — any such
+wording in an earlier draft is retracted; the correct, precise statement
+is that the argument must satisfy these specific named semantic checks.
+A caller that hand-constructs an `Authorization` object satisfying §13's
+semantic checks but violating some other `authorization.schema.json`
+constraint `loadState` would have caught (e.g. an extra property
+forbidden by the schema, if the schema were ever tightened to disallow
+one) is not guaranteed to be rejected by `authorizeSpecifiedWork`/
+`activatePhase` — those two functions are a policy boundary, not a
+schema-validation boundary. **A caller supplying untrusted or raw
+authorization data — as opposed to a value that already passed through
+`loadState`, or one the caller otherwise trusts — is responsible for
+schema-validating that data itself (e.g. via the schema registry's own
+`validate()`, §10) before calling any lifecycle-mutation API
+(`authorizeSpecifiedWork`, `activatePhase`, or `applyTransition`) with
+it.** This is an accepted scope limitation, not an oversight: re-running
+full schema validation inside every pure lifecycle function would
+duplicate `loadState`'s job and blur the I/O-vs-pure-logic separation
+(§7).
 
 ## 10. Schema Registry
 
@@ -339,7 +354,7 @@ interface SchemaValidationErrorDetail {
   keyword: string;    // the JSON Schema keyword that failed, e.g. "enum", "required"
 }
 
-function createRegistry(): SchemaRegistry; // throws only on registration-time failure (malformed schema file, unresolved $ref at setup)
+function createRegistry(): SchemaRegistry; // throws a distinct, typed exception per registration-time failure kind — see "Schema error taxonomy" below
 ```
 
 **Two layers of protection against an unknown-schema call, not one:**
@@ -364,16 +379,18 @@ function createRegistry(): SchemaRegistry; // throws only on registration-time f
    `{ registered: false }` deterministically — it does **not** throw,
    does **not** return `{ registered: true, result: { valid: true,
    errors: [] } }` (which would be a false "it validated" claim), and
-   does **not** reuse `SCHEMA_REFERENCE_UNRESOLVED` (§18) — that code is
-   reserved specifically for *registration-time* failures inside
-   `createRegistry()` (a schema file that itself fails to load or whose
-   own internal `$ref` can't be resolved), which is a categorically
-   different situation from *this* schema having loaded fine but a
-   *different*, unregistered identifier being asked for at *validation*
-   time. Reusing `SCHEMA_REFERENCE_UNRESOLVED` for "you asked for a
-   schema I was never given" would blur those two meanings — a genuine
-   BuildRail installation defect (the reserved meaning) versus a caller
-   error (asking for something never registered) — so a distinct,
+   does **not** reuse `SCHEMA_REFERENCE_UNRESOLVED` or `SCHEMA_SETUP_FAILED`
+   (§18, and the "Schema error taxonomy" subsection below) — those two
+   codes are reserved specifically for *registration-time* failures
+   inside `createRegistry()` itself (a schema file that fails to load, or
+   an internal `$ref` among the three registered schemas that can't be
+   resolved), which is a categorically different situation from *this*
+   schema having loaded fine but a *different*, unregistered identifier
+   being asked for at *validation* time. Reusing either registration-time
+   code for "you asked for a schema I was never given" would blur these
+   into one meaning — a genuine BuildRail installation defect (the
+   registration-time codes' actual meaning) versus a caller error (asking
+   a healthy registry for something it never registered) — so a distinct,
    dedicated `{ registered: false }` result is used instead. Callers
    (i.e., `loadConfig`/`loadState`) must check `registered` before
    reading `result`; `result` is present if and only if `registered` is
@@ -400,67 +417,91 @@ function createRegistry(): SchemaRegistry; // throws only on registration-time f
   and `loadState` each create (or share, via a small module-level
   singleton — implementation's choice) one `SchemaRegistry` instance
   rather than recompiling schemas per call.
-- **Failure behavior when a schema cannot be resolved:** `createRegistry()`
-  throws a `SchemaReferenceUnresolvedError` (not a silent `undefined`
-  validator) if any schema file is missing, malformed JSON, or has a `$ref`
-  that cannot be resolved against the registered set. This is a
-  registration-time failure, distinct from a validation-time
-  `SchemaValidationResult` with `valid: false`.
+- **Failure behavior when registration itself fails:** `createRegistry()`
+  never returns a silent `undefined`/partial validator — every
+  registration-time failure throws, and it throws **one of two distinct,
+  typed exception classes** depending on *which* kind of failure occurred
+  (see "Schema error taxonomy" below for the full rationale and for
+  how `loadConfig`/`loadState` translate each into a typed `Result`
+  error): a `SchemaReferenceUnresolvedError` specifically when all three
+  schema files loaded and parsed but a `$ref` among them cannot be
+  resolved against the registered set, or some other registry-setup
+  exception (e.g. a missing schema asset file, unreadable file, or
+  malformed/unparseable schema JSON) for every other registration-time
+  failure kind. Both are registration-time failures, distinct from a
+  validation-time `SchemaValidationResult` with `valid: false`.
 - This layer has no knowledge of YAML, file paths under `.buildrail/`, or
   CLI output formatting — it operates purely on already-parsed JS
   values and schema identifiers, making it independently testable and
   reusable by BR4.
 
-### Schema-setup error boundary — `SCHEMA_SETUP_FAILED` vs. `SCHEMA_REFERENCE_UNRESOLVED`
+### Schema error taxonomy — three distinct outcomes, never conflated
 
-**Problem this resolves:** `createRegistry()` *throws* on failure (an
-exception, per §19's "reserved for genuinely unexpected... failures"
-rationale — a broken schema installation is exactly that kind of
-failure). But `loadConfig`/`loadState` are `Result`-returning functions
-(§19) that must never let an unhandled exception escape to their own
-caller — including an exception raised by the registry they depend on.
-Something in `loadConfig`/`loadState` must catch that throw and translate
-it into the typed `Result` world, and the resulting typed code must be
-distinguishable from an ordinary per-project data problem.
+**This section is the single authoritative statement of BR2's complete
+schema-failure taxonomy — §11, §18, §22, and §26 all restate this same
+taxonomy and must not describe it any other way.** There are exactly
+three distinct schema-related failure outcomes, each with its own
+distinguishing question and its own exact shape:
 
-**Resolution:**
+| Outcome | Question it answers | Exact shape |
+|---|---|---|
+| **Unknown `validate()` schema id** | "Is this specific schema id, which I'm asking a *successfully-constructed* registry about right now, one it actually registered?" | `{ registered: false }` — a normal, typed return value. **Never an exception. Never `SCHEMA_REFERENCE_UNRESOLVED`.** (§10's "Two layers of protection" above) |
+| **General registry construction failure** | "Could `createRegistry()` build a working registry *at all* for this call?" | `loadConfig`/`loadState` surface `{ code: "SCHEMA_SETUP_FAILED", ... }` (§18). Examples: a schema asset file is missing, a package-owned schema file is unreadable, or a schema file's JSON is malformed. |
+| **Unresolved internal `$ref`** | "Did every schema file load and parse individually, but one schema's `$ref` to another (of the three registered schemas) fail to resolve against the registered set?" | `loadConfig`/`loadState` surface `{ code: "SCHEMA_REFERENCE_UNRESOLVED", ... }` (§18). |
+
+**These three are mutually exclusive and must never be conflated with one
+another — a prior draft of this specification collapsed the second and
+third into a single `SchemaReferenceUnresolvedError`/`SCHEMA_SETUP_FAILED`
+mapping that did not actually distinguish them; that collapse is
+corrected here.**
+
+**`createRegistry()`'s internal exception contract:** `createRegistry()`
+may throw distinct, typed internal exception classes for these two
+registration-time failure kinds — implementation is free to name and
+structure these exception classes as it sees fit, as long as they are
+distinguishable *by type* (e.g. `instanceof` or an equivalent
+discriminant), not merely by inspecting a message string. This
+specification requires at least:
+
+- `SchemaReferenceUnresolvedError` — thrown specifically when all three
+  schema files were found and parsed as valid JSON, but a `$ref` inside
+  one of them could not be resolved against the registered `$id` set.
+- some other, distinctly-typed registry-setup error (implementation names
+  it) — thrown for every other registration-time failure: a schema asset
+  file missing from disk, a schema file that exists but cannot be read
+  (permissions/I/O error), or a schema file that exists and is readable
+  but is not valid JSON.
+
+**`loadConfig`/`loadState` translate by exception type, not by a single
+blanket catch:**
 
 - `loadConfig`/`loadState` call `createRegistry()` (or a shared,
   lazily-created singleton — §10's "Compile strategy") inside a `try/catch`
   as their very first step, before attempting to read or parse
   `.buildrail/config.yml`/`state.yml` at all.
-- If `createRegistry()` throws, `loadConfig`/`loadState` catch it and
+- If the caught exception is (or is recognized as) a
+  `SchemaReferenceUnresolvedError`, `loadConfig`/`loadState` return
+  `{ ok: false, error: { code: "SCHEMA_REFERENCE_UNRESOLVED", message,
+  details: <caught error> } }`.
+- For every other registry-setup exception, `loadConfig`/`loadState`
   return `{ ok: false, error: { code: "SCHEMA_SETUP_FAILED", message,
-  details: <caught error> } }` — a new error code (§18), **not**
-  `SCHEMA_REFERENCE_UNRESOLVED`, and **not** `CONFIG_SCHEMA_INVALID` /
-  `STATE_SCHEMA_INVALID`.
-- **Why a new, third code rather than reusing `SCHEMA_REFERENCE_UNRESOLVED`:**
-  `SCHEMA_REFERENCE_UNRESOLVED` (§18) is reserved for a validation-time
-  situation where the registry itself came up fine but a *specific
-  requested schema id* was never registered (`SchemaValidateResult`'s
-  `{ registered: false }` branch, §10) — a caller-addressing problem
-  against a healthy registry. `SCHEMA_SETUP_FAILED` is different in kind:
-  the registry could not be constructed **at all** for this call — no
-  schema was successfully registered, so there is no healthy registry to
-  ask "is this id registered?" in the first place. Collapsing the two
-  would make it impossible for a caller (or a test, or a human reading
-  `buildrail status` output) to tell "BuildRail's own schema installation
-  is broken" apart from "you asked this healthy registry for something it
-  doesn't have."
-- **Why not `CONFIG_SCHEMA_INVALID`/`STATE_SCHEMA_INVALID`:** those codes
-  mean "the loaded *document* failed validation against a schema that
-  itself loaded and compiled successfully." A `createRegistry()` throw
-  means validation never ran at all — there is no verdict about the
-  document to report, so reusing a document-verdict code would be a false
-  claim about what was actually checked.
-- This is a BuildRail installation-integrity failure (a missing/malformed
-  schema file shipped with `@buildrail/core` itself), not a per-project
-  data problem — `buildrail status` (§17.1) surfaces it as a distinct,
-  clearly-worded failure rather than folding it into ordinary
-  config/state error messaging, and it is expected to be effectively
-  unreachable in a correctly-packaged release (its purpose is to fail
-  loudly and specifically if packaging ever breaks, not to handle an
-  expected runtime condition).
+  details: <caught error> } }`.
+- Neither translated code is ever `CONFIG_SCHEMA_INVALID` /
+  `STATE_SCHEMA_INVALID` — those codes mean "the loaded *document* failed
+  validation against a schema that itself loaded and compiled
+  successfully." A `createRegistry()` throw (of either kind) means
+  validation never ran at all — there is no verdict about the document to
+  report, so reusing a document-verdict code would be a false claim about
+  what was actually checked.
+- Both are BuildRail installation-integrity failures (something wrong
+  with the schema files shipped inside `@buildrail/core` itself), not a
+  per-project data problem — `buildrail status` (§17.1) surfaces either
+  as a distinct, clearly-worded failure rather than folding it into
+  ordinary config/state error messaging, and both are expected to be
+  effectively unreachable in a correctly-packaged release (their purpose
+  is to fail loudly and specifically, and by the correct one of the two
+  codes, if packaging ever breaks — not to handle an expected runtime
+  condition).
 
 ### Registry scope: 3 schemas, not 5
 
@@ -612,16 +653,20 @@ resolved via the validator's built-in reference registry — no
    contains a `$ref` to an unregistered/unknown schema, `createRegistry()`
    fails at setup time (§10) rather than silently ignoring it or reaching
    out to the network.
-6. **Failure behavior:** if `authorization.schema.json` is missing,
-   unreadable, or fails to parse, `createRegistry()` throws before any
-   `loadConfig`/`loadState` call can proceed — `loadConfig`/`loadState`
-   catch this and surface it as `SCHEMA_SETUP_FAILED` (§10's "Schema-setup
-   error boundary," §18) — this is a BuildRail installation-integrity
-   failure, not a per-project data problem, and must be surfaced
-   distinctly (not folded into `CONFIG_SCHEMA_INVALID` or
-   `STATE_SCHEMA_INVALID`, and not `SCHEMA_REFERENCE_UNRESOLVED` either,
-   which is reserved for a registry that constructed successfully but
-   rejects one specific unresolvable `$ref`).
+6. **Failure behavior:** `createRegistry()` throws before any
+   `loadConfig`/`loadState` call can proceed if `authorization.schema.json`
+   (or either of the other two registered schemas) is missing, unreadable,
+   or fails to parse as JSON — `loadConfig`/`loadState` catch this and
+   surface it as `SCHEMA_SETUP_FAILED` (§10's "Schema error taxonomy,"
+   §18). If, instead, all three schema files load and parse fine but
+   `state.schema.json`'s `$ref` to `authorization.schema.json`
+   specifically cannot be resolved against the registered set,
+   `loadConfig`/`loadState` surface `SCHEMA_REFERENCE_UNRESOLVED` instead
+   (§10's taxonomy again — this is the "unresolved internal `$ref`" row,
+   distinct from the "general registry construction failure" row above
+   it). Both are BuildRail installation-integrity failures, not
+   per-project data problems, and neither is ever folded into
+   `CONFIG_SCHEMA_INVALID` or `STATE_SCHEMA_INVALID`.
 
 ## 12. Active/Historical Authorization Semantics
 
@@ -699,8 +744,10 @@ ambiguity, choosing one canonical model.**
   finished) and `baselines` (the exact approved SHA and frozen status for
   each). This is deliberate — it avoids inventing new schema surface for
   something the existing BR0/BR1 closure pattern already represents
-  adequately. `docs/concepts/authorization.md` is updated (as part of BR2
-  implementation, not this spec — see §27) to state this explicitly.
+  adequately. **`docs/concepts/authorization.md` already states this
+  explicitly** — it was updated directly by this specification PR (Round
+  3), not left as a future BR2-implementation task; see its "Relationship
+  to state" section for the canonical prose this bullet summarizes.
 - **BR1-style transition to a future BR2 authorization:** when BR2 itself
   is eventually authorized for implementation, the same wholesale-replace
   pattern applies: `authorization` moves from `{id: BR1, status:
@@ -1013,14 +1060,21 @@ change together, or nothing changes):
 **`applyTransition`'s own behavior for this specific pair is now
 precisely defined, not left ambiguous:** `applyTransition(state,
 "AUTHORIZED", actor)` where `state.current.lifecycle_state ===
-"SPECIFIED"` must itself fail with `LIFECYCLE_TRANSITION_ILLEGAL` (or an
-equivalently distinct, documented rejection) rather than silently
-performing a no-op lifecycle-only change — `applyTransition` does not
-have an `authorization` parameter to populate the required field, so it
-cannot legally complete this edge on its own, and must not pretend to.
-`authorizeSpecifiedWork` is the one and only authoritative path for this
-transition, exactly as `activatePhase` is the one and only authoritative
-path for cross-phase rollover below.
+"SPECIFIED"` must itself fail with exactly
+`LIFECYCLE_DEDICATED_OPERATION_REQUIRED` — **not**
+`LIFECYCLE_TRANSITION_ILLEGAL` (the edge is graph-legal, per §15's
+complete table below; claiming it is illegal would be false) and not any
+other "equivalently distinct" rejection of implementation's own
+invention — rather than silently performing a no-op lifecycle-only
+change. `applyTransition` does not have an `authorization` parameter to
+populate the required field, so it cannot legally complete this edge on
+its own, and must not pretend to. `authorizeSpecifiedWork` is the one and
+only authoritative path for this transition, exactly as `activatePhase`
+is the one and only authoritative path for cross-phase rollover below,
+and exactly as `completeAndFreezePhase` is for
+`PRODUCTION_VERIFIED → FROZEN` (§15's "Legal graph edges vs. edges
+executable via generic `applyTransition`" subsection, further below,
+generalizes this exact rule to both dedicated-operation edges).
 
 #### `BLOCKED` entries and returns
 
@@ -1236,49 +1290,89 @@ function completeAndFreezePhase(
 ```
 
 **Contract**, performed atomically (all checks pass and every field below
-changes together, or nothing changes):
+changes together, or nothing changes) — **every one of the following
+preconditions must hold before `completeAndFreezePhase` succeeds; failing
+any one of them fails the whole call with no partial state change:**
 
-1. Requires `state.current.lifecycle_state === "PRODUCTION_VERIFIED"` —
-   otherwise `LIFECYCLE_TRANSITION_ILLEGAL`, mirroring what
-   `applyTransition` reports for any other illegal `from` state.
-2. Requires `actor === "human_owner"` — otherwise
-   `LIFECYCLE_AUTHORITY_REQUIRED`, matching `docs/STATE_MACHINE.md`'s
-   explicit "Freezing" rule and §15's table entry for this edge.
-3. Requires `request.approvedSha` to match `^[0-9a-f]{40}$` (the same
-   pattern `state.schema.json`'s `#/$defs/baseline.approved_sha` already
-   requires) — otherwise a new error code, `BASELINE_SHA_INVALID` (§18).
-   This is a semantic, format-level check (§9's "boundary" note above) —
+1. `state.current.lifecycle_state === "PRODUCTION_VERIFIED"` — otherwise
+   `LIFECYCLE_TRANSITION_ILLEGAL`, mirroring what `applyTransition`
+   reports for any other illegal `from` state.
+2. `actor === "human_owner"` — otherwise `LIFECYCLE_AUTHORITY_REQUIRED`,
+   matching `docs/STATE_MACHINE.md`'s explicit "Freezing" rule and §15's
+   table entry for this edge.
+3. `state.authorization` is present — otherwise `AUTHORIZATION_MISSING`.
+   There is no phase-closure semantics to apply without an authorization
+   record identifying which phase is being closed.
+4. `state.authorization.id === state.current.development_phase` —
+   otherwise `AUTHORIZATION_PHASE_MISMATCH`. The authorization being
+   closed out must actually be the one for the phase currently active.
+5. `state.authorization.status` is `"authorized"` or `"in_progress"` —
+   otherwise `AUTHORIZATION_INACTIVE` (this correctly rejects, among
+   other things, a second `completeAndFreezePhase` call against a phase
+   whose authorization has already transitioned to `"completed"` by a
+   prior successful call — see checks 6–7 below for the equivalent,
+   more specific rejection at the `completed_phases`/`baselines` layer).
+6. **`state.current.development_phase` is NOT already present in
+   `state.completed_phases`** — otherwise `LIFECYCLE_TRANSITION_ILLEGAL`.
+   A phase that has already been recorded as completed cannot be closed
+   a second time.
+7. **`state.current.development_phase` is NOT already a key in
+   `state.baselines`** — otherwise `LIFECYCLE_TRANSITION_ILLEGAL`. A
+   phase that already has a frozen baseline cannot be given a second one.
+   **`completeAndFreezePhase` must never overwrite an existing baseline
+   entry, and must never treat an already-completed/already-baselined
+   phase as idempotently re-closable** — unlike `activatePhase`'s
+   `planned_phases` removal (which is deliberately idempotent, §15), phase
+   *closure* is a one-time, non-repeatable event: a caller retrying a
+   failed persistence step must re-run `completeAndFreezePhase` only
+   against a state that has not yet actually been persisted as closed:
+   an earlier draft of this contract described `completed_phases`/
+   `baselines` updates as themselves idempotent ("if not already
+   present... appending is idempotent," "gains (or replaces...)") — that
+   description is retracted. Checks 6 and 7 make closure a strict
+   one-time transition instead: attempting to close an already-closed
+   phase is rejected, not silently treated as a successful no-op.
+8. `request.approvedSha` matches `^[0-9a-f]{40}$` (the same pattern
+   `state.schema.json`'s `#/$defs/baseline.approved_sha` already
+   requires) — otherwise `BASELINE_SHA_INVALID` (§18). This is a
+   semantic, format-level check (§9's "boundary" note above) —
    `completeAndFreezePhase` does not verify the SHA actually exists in
    any Git repository or corresponds to a real commit; BR2 has no Git
    capability (§4, §6) to do so. Confirming the SHA is real is BR3's
    concern; BR2 only confirms the *shape* is well-formed.
-4. On success, returns a new `BuildRailState` with **all** of the
-   following changed together:
-   - `current.lifecycle_state` set to `"FROZEN"`
-   - `authorization.status` set to `"completed"` (the authorization that
-     covered this phase's work is now fulfilled — mirroring §12's
-     documented `"completed"` meaning; `completeAndFreezePhase` does not
-     otherwise alter any other field of the `authorization` object)
-   - `completed_phases` gains `state.current.development_phase` appended
-     (if not already present — appending is idempotent, not
-     duplicate-inserting, matching how a caller might reasonably retry a
-     failed persistence step)
-   - `baselines` gains (or replaces, if a key with this phase id somehow
-     already exists — though §15's `activatePhase` precondition #3 makes
-     this practically unreachable via BR2's own governed path) an entry
-     keyed by `state.current.development_phase` with
-     `approved_sha: request.approvedSha` and `status: "frozen"`
-5. **Preserved unchanged:** `current.development_phase`, `planned_phases`,
-   `project`, `schema_version`, `review`, `protected_systems`, and every
-   other `baselines`/`completed_phases` entry not being added.
-   `completeAndFreezePhase` does not touch `candidate` — clearing or
-   resetting any `candidate.*` field (if BR3/BR4 ever populate one) is
-   not this operation's responsibility; it is not part of BR2's schema
-   knowledge of when/how `candidate` should be cleared, and this
-   specification does not invent that behavior.
-6. Pure, like `applyTransition`/`authorizeSpecifiedWork`/`activatePhase` —
-   no file I/O; persisting the result to `.buildrail/state.yml` remains
-   the caller's responsibility (§7).
+
+**On success**, returns a new `BuildRailState` with **all** of the
+following changed together — this is exactly the closure shape
+`activatePhase`'s own precondition (§15) requires of the phase it is
+rolling over *from*, by construction:
+
+- `current.lifecycle_state` set to `"FROZEN"`
+- `authorization.status` set to `"completed"` (the authorization that
+  covered this phase's work is now fulfilled — mirroring §12's documented
+  `"completed"` meaning; `completeAndFreezePhase` does not otherwise
+  alter any other field of the `authorization` object)
+- `completed_phases` gains `state.current.development_phase` appended
+  **exactly once** (check 6 above guarantees it was not already present,
+  so this is a genuine append, never a duplicate-avoiding no-op)
+- `baselines` gains **a new entry** (check 7 above guarantees no entry
+  for this phase id already exists, so this is always a fresh insert,
+  never an overwrite) keyed by `state.current.development_phase` with
+  `approved_sha: request.approvedSha` and `status: "frozen"`
+- `candidate.branch` set to `null`
+- `candidate.base_sha` set to `null`
+- `candidate.candidate_sha` set to `null` — closing a phase always clears
+  any in-flight candidate recorded against it, so the next phase
+  activated via `activatePhase` finds `candidate` already fully `null`
+  (satisfying `activatePhase`'s own precondition, §15, without requiring
+  a separate manual reset step)
+
+**Preserved unchanged:** `current.development_phase`, `planned_phases`,
+`project`, `schema_version`, `review`, `protected_systems`, and every
+other `baselines`/`completed_phases` entry not being added.
+
+Pure, like `applyTransition`/`authorizeSpecifiedWork`/`activatePhase` —
+no file I/O; persisting the result to `.buildrail/state.yml` remains the
+caller's responsibility (§7).
 
 **`applyTransition`'s own behavior for this specific pair is precisely
 defined:** `applyTransition(state, "FROZEN", actor)` where
@@ -1622,13 +1716,22 @@ directly instead of asking the caller to compute and pass it.)
    finished), and must not itself add the *new* phase to either of those
    — adding to `completed_phases`/`baselines` only happens at that new
    phase's own eventual closure, not at its activation.
-6. **Validation:** `request.newAuthorization` must itself be a
-   schema-valid `Authorization` object (§13's `authorization.specification`
-   non-empty and `granted_by === "human"` checks apply here too, at
-   activation time, not deferred to a later `checkImplementationAllowed`
-   call) — `activatePhase` calls the same validation logic §13 uses,
-   rather than duplicating it, so a malformed new-authorization request
-   fails the same way a malformed *existing* authorization would.
+6. **Validation (semantic, not schema):** `request.newAuthorization` must
+   pass the same **semantic** checks §13 already performs on an existing
+   authorization (`authorization.specification` non-empty and
+   `granted_by === "human"`), applied here at activation time rather than
+   deferred to a later `checkImplementationAllowed` call — `activatePhase`
+   calls the same semantic-validation logic §13 uses, rather than
+   duplicating it, so a malformed new-authorization request fails the
+   same way a malformed *existing* authorization would. **This is not
+   full JSON-Schema validation against `authorization.schema.json`** —
+   see §9's "Boundary" note: `activatePhase` does not invoke the schema
+   validator on `request.newAuthorization`, and a value satisfying these
+   semantic checks while still violating some other
+   `authorization.schema.json` constraint is not guaranteed to be
+   rejected here. A caller supplying untrusted or raw authorization data
+   (as opposed to a value already produced by `loadState`) is responsible
+   for schema-validating it itself before calling `activatePhase`.
    `request.newAuthorization.status` must be `"authorized"` specifically
    (mirroring `authorizeSpecifiedWork`'s equivalent check above) —
    anything else fails with `AUTHORIZATION_INACTIVE`.
@@ -1868,8 +1971,8 @@ interface BuildRailError {
 | `STATE_READ_FAILED` | state | File exists but could not be read |
 | `STATE_YAML_INVALID` | state | File content is not valid YAML syntax, or the YAML document is empty. Same non-object-root exclusion as `CONFIG_YAML_INVALID` above — see `STATE_SCHEMA_INVALID`. |
 | `STATE_SCHEMA_INVALID` | state | Syntactically valid, non-empty YAML that fails `state.schema.json` validation (including nested `authorization`), including a wrong-type root value |
-| `SCHEMA_REFERENCE_UNRESOLVED` | schema | Registration succeeded overall, but a specific `$ref` inside a registered schema cannot be resolved against the registered set (registration-time, not validation-time) — see §10's "Schema-setup error boundary" for how this differs from `SCHEMA_SETUP_FAILED` |
-| `SCHEMA_SETUP_FAILED` | schema | `createRegistry()` threw when `loadConfig`/`loadState` called it — the registry could not be constructed at all for this call (missing/malformed schema file, or any other registration-time exception), so no validation could run. Distinct from `SCHEMA_REFERENCE_UNRESOLVED` (a registry that came up fine but rejects one bad `$ref`) and from `CONFIG_SCHEMA_INVALID`/`STATE_SCHEMA_INVALID` (a verdict about a *document*, which requires a working registry to have been reached in the first place) — see §10. |
+| `SCHEMA_REFERENCE_UNRESOLVED` | schema | Every one of the three schema files loaded and parsed as valid JSON, but a `$ref` among them could not be resolved against the registered `$id` set — `createRegistry()` threw a `SchemaReferenceUnresolvedError` specifically, which `loadConfig`/`loadState` translate to this code (registration-time, not validation-time) — see §10's "Schema error taxonomy" for how this differs from `SCHEMA_SETUP_FAILED`. **Never** used for `validate()`'s own `{ registered: false }` runtime result (§10) — that is not an error at all, just a typed non-match. |
+| `SCHEMA_SETUP_FAILED` | schema | `createRegistry()` threw some other, non-`$ref`-specific registration-time exception when `loadConfig`/`loadState` called it — a missing schema asset file, an unreadable package-owned schema file, or malformed/unparseable schema JSON — so the registry could not be constructed at all for this call, and no validation could run. Distinct from `SCHEMA_REFERENCE_UNRESOLVED` (a registry whose files all loaded fine but rejects one bad `$ref` among them) and from `CONFIG_SCHEMA_INVALID`/`STATE_SCHEMA_INVALID` (a verdict about a *document*, which requires a working registry to have been reached in the first place) — see §10's "Schema error taxonomy." |
 | `AUTHORIZATION_MISSING` | policy | No authorization present, or a required field (e.g. `granted_by`) fails BR2's defense-in-depth check |
 | `AUTHORIZATION_INACTIVE` | policy | Authorization present but `status` is `draft` or `completed` (§12) |
 | `AUTHORIZATION_REVOKED` | policy | Authorization present with `status: revoked` |
@@ -2198,32 +2301,79 @@ ordinary TypeScript build toolchain.
 
 ### 20.5 Build order and workspace integration
 
-- **Build order: `@buildrail/core` before `@buildrail/cli`.** Once
-  `packages/cli/package.json` gains a `dependencies` entry on
-  `@buildrail/core` (§5, item 6), `packages/cli/src/commands/status.ts`
-  imports compiled output from `@buildrail/core` (per `"main":
-  "dist/index.js"` above) — so `packages/core`'s `dist/` must exist and
-  be current before `packages/cli` is built or type-checked. Root-level
-  `npm run build`/`npm run typecheck` (§24) must invoke
-  `--workspace=@buildrail/core` before `--workspace=@buildrail/cli`, not
-  in parallel and not in the reverse order.
+- **Build order: `@buildrail/core` before `@buildrail/cli`, for *both*
+  `build` and `typecheck`.** Once `packages/cli/package.json` gains a
+  `dependencies` entry on `@buildrail/core` (§5, item 6),
+  `packages/cli/src/commands/status.ts` imports compiled output from
+  `@buildrail/core` (per `"main": "dist/index.js"`/`"types":
+  "dist/index.d.ts"` above) — so `packages/core`'s `dist/` (including
+  `dist/index.d.ts`) must exist and be current before `packages/cli` is
+  either built *or type-checked*.
+- **The clean-typecheck problem this resolves:** `packages/cli`'s own
+  `tsc --noEmit` run resolves `@buildrail/core`'s types from
+  `dist/index.d.ts` (per its `"types"` field, §20.4) — that file is a
+  *build* output, not something `tsc --noEmit` alone produces. On a
+  genuinely clean checkout (no pre-existing `dist/` from a prior local
+  build), running root `npm run typecheck` in isolation — without first
+  running `npm run build` — would fail for `packages/cli` with an
+  unresolvable-module error, not because either package's *source* has a
+  type error, but because Core's declaration file simply does not exist
+  yet. An earlier draft of this specification did not address this,
+  leaving `npm run typecheck` implicitly dependent on stale `dist/`
+  output left over from a previous `npm run build` — which happens to
+  work on a developer's already-built machine but fails on a genuinely
+  clean checkout (fresh clone, fresh CI runner, or after `rm -rf
+  packages/*/dist`).
+- **Chosen strategy: root `typecheck` builds `@buildrail/core` first, so
+  `dist/index.d.ts` exists, then type-checks both packages.** Root-level
+  `npm run typecheck` is specified to run, in order:
+  1. `npm run build --workspace=@buildrail/core` (producing
+     `packages/core/dist/`, including `dist/index.d.ts`)
+  2. `npm run typecheck --workspace=@buildrail/core` (a `tsc --noEmit`
+     pass over Core's own source — this does not depend on step 1's
+     output, but running it after is harmless and keeps ordering simple)
+  3. `npm run typecheck --workspace=@buildrail/cli` (now able to resolve
+     `@buildrail/core`'s types from the `dist/index.d.ts` step 1 just
+     produced)
+  Exact script spelling (e.g. whether this is expressed as a single root
+  `npm run typecheck` script with `&&`-chained workspace invocations, or
+  as `pre`/`post` npm lifecycle hooks, or some other mechanism) is an
+  implementation detail — the ordering guarantee above is what is
+  specified, not the exact shell syntax. Root-level `npm run build`
+  follows the same Core-before-CLI ordering for the same reason (§20.5's
+  original build-order rule, restated): `packages/cli`'s build also
+  resolves `@buildrail/core`'s compiled output, not its source.
 - **`npm ci` from a clean checkout must work end-to-end** with no manual
-  intermediate step: `npm ci` installs all workspace dependencies (both
-  packages' `dependencies`/`devDependencies`), then `npm run build`
-  (root) builds Core, then CLI, using Core's freshly-built `dist/` output
-  — not stale or manually-built artifacts, and not `packages/core/src/`
-  directly. A reviewer verifying this (§28) should be able to `rm -rf
-  packages/*/dist node_modules && npm ci && npm run build && npm test`
-  and see everything pass from that clean state.
+  intermediate step, for every one of the following commands run
+  independently against a genuinely clean tree — this is now required,
+  clean-typecheck-specific evidence for independent review (§28), not
+  merely "the build passes":
+  ```
+  rm -rf node_modules packages/core/dist packages/cli/dist
+  npm ci
+  npm run typecheck
+  ```
+  must pass without relying on any stale `dist/` output (proven by the
+  `rm -rf` immediately preceding it — there is nothing stale left to rely
+  on), and separately:
+  ```
+  npm ci
+  npm run typecheck
+  npm run build
+  npm test
+  ```
+  (starting from the same clean state) must also pass in full. A reviewer
+  verifying this (§28) runs both sequences themselves rather than trusting
+  a report that they were run.
 - **`packages/cli` resolves compiled Core, never `src`.** Nothing in
   `packages/cli/src/**` may import a path under `packages/core/src/**`
   directly (e.g. a relative `../../core/src/...` import bypassing the
   package boundary) — all cross-package access goes through
-  `@buildrail/core`'s published entry point (`dist/index.js`, per its
-  `"main"` field), exactly as npm workspace resolution intends. This
-  preserves the package boundary `docs/ARCHITECTURE.md` establishes and
-  prevents the CLI from silently depending on Core's internal,
-  non-exported structure.
+  `@buildrail/core`'s published entry point (`dist/index.js`/
+  `dist/index.d.ts`, per its `"main"`/`"types"` fields), exactly as npm
+  workspace resolution intends. This preserves the package boundary
+  `docs/ARCHITECTURE.md` establishes and prevents the CLI from silently
+  depending on Core's internal, non-exported structure.
 
 ## 21. Security
 
@@ -2381,26 +2531,50 @@ not merely a suggested one):
 
 **`completeAndFreezePhase` (§15)**
 - Succeeds against a fixture at `current.lifecycle_state:
-  "PRODUCTION_VERIFIED"`, `actor: "human_owner"`, `request: {approvedSha:
-  "<40-hex-char SHA>"}` — returning a state with
+  "PRODUCTION_VERIFIED"`, `authorization.status: "authorized"` (or
+  `"in_progress"`) with `authorization.id` matching
+  `current.development_phase`, that phase absent from both
+  `completed_phases` and `baselines`, `actor: "human_owner"`, `request:
+  {approvedSha: "<40-hex-char SHA>"}` — returning a state with
   `current.lifecycle_state: "FROZEN"`, `authorization.status:
-  "completed"`, `completed_phases` gaining
-  `current.development_phase`, and `baselines` gaining an entry keyed by
+  "completed"`, `completed_phases` gaining `current.development_phase`
+  appended exactly once, a **new** `baselines` entry keyed by
   `current.development_phase` with `approved_sha: request.approvedSha`
-  and `status: "frozen"`
+  and `status: "frozen"`, and `candidate.branch`/`base_sha`/`candidate_sha`
+  all set to `null`
 - Fails with `LIFECYCLE_AUTHORITY_REQUIRED` for any actor other than `"human_owner"`
 - Fails with `LIFECYCLE_TRANSITION_ILLEGAL` when `current.lifecycle_state` is not `"PRODUCTION_VERIFIED"`
+- Fails with `AUTHORIZATION_MISSING` when `state.authorization` is absent
+- Fails with `AUTHORIZATION_PHASE_MISMATCH` when `state.authorization.id !== state.current.development_phase`
+- Fails with `AUTHORIZATION_INACTIVE` when `state.authorization.status` is
+  `"draft"`, `"completed"`, or `"revoked"` (not `"authorized"`/`"in_progress"`)
+- **Rejects closing an already-completed phase (no idempotent re-closure
+  — the specific defect this correction fixes):** a fixture whose
+  `current.development_phase` is already present in
+  `state.completed_phases` fails with `LIFECYCLE_TRANSITION_ILLEGAL`,
+  even when every other precondition is satisfied — proving
+  `completeAndFreezePhase` treats closure as a strict one-time event, not
+  a retry-safe no-op
+- **Rejects overwriting an existing baseline (the other specific defect
+  this correction fixes):** a fixture whose `current.development_phase`
+  is already a key in `state.baselines` fails with
+  `LIFECYCLE_TRANSITION_ILLEGAL`, and the pre-existing `baselines` entry
+  for that phase is confirmed byte-for-byte unchanged after the failed
+  call (proving no overwrite occurred, not merely that an error was
+  returned)
 - Fails with `BASELINE_SHA_INVALID` when `request.approvedSha` does not
   match `^[0-9a-f]{40}$` (e.g. too short, uppercase hex, non-hex
   characters) — the specific new error code this operation introduces
-- A call whose `completed_phases`/`baselines` already (idempotently)
-  contain the current phase does not duplicate the entry — appending is
-  a no-op for `completed_phases`, and the `baselines` entry is set once,
-  not accumulated
 - Other fields (`current.development_phase`, `planned_phases`, `project`,
   `schema_version`, `review`, `protected_systems`, every other
   `baselines`/`completed_phases` entry) are confirmed unchanged after a
   successful call
+- **The successful-call output is confirmed to satisfy `activatePhase`'s
+  own closure-invariant precondition (§15) directly** — i.e., feeding
+  `completeAndFreezePhase`'s successful return value straight into a
+  subsequent `activatePhase` call (with a fresh `newPhaseId`/
+  `newAuthorization`) succeeds, proving the two operations' contracts are
+  genuinely compatible end to end, not merely documented as compatible
 - `applyTransition(state, "FROZEN", actor)` — the generic function,
   called directly for this specific pair — fails with
   `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` (does not silently succeed as
@@ -2409,22 +2583,42 @@ not merely a suggested one):
   proving this edge is genuinely carved out of `applyTransition`'s
   generic handling
 
-**Schema-setup error boundary (§10)**
-- A `createRegistry()` call that throws (simulated via a fixture
-  directory or injected fault representing a missing/malformed schema
-  file) is caught by `loadConfig`/`loadState` and surfaces as
+**Schema error taxonomy (§10)**
+- A `createRegistry()` call that throws due to a missing schema asset
+  file, an unreadable package-owned schema file, or malformed/unparseable
+  schema JSON (simulated via a fixture directory or injected fault) is
+  caught by `loadConfig`/`loadState` and surfaces as
   `{ ok: false, error: { code: "SCHEMA_SETUP_FAILED", ... } }` — not an
   unhandled exception propagating out of `loadConfig`/`loadState`, and
   not `SCHEMA_REFERENCE_UNRESOLVED` or `CONFIG_SCHEMA_INVALID`/
   `STATE_SCHEMA_INVALID`
+- A `createRegistry()` call where all three schema files load and parse
+  fine but a `$ref` among them cannot be resolved against the registered
+  set (a test-only fixture schema, per §22's Schema-system category) is
+  caught and surfaces as `SCHEMA_REFERENCE_UNRESOLVED` specifically — not
+  `SCHEMA_SETUP_FAILED`
 - `SCHEMA_SETUP_FAILED` and `SCHEMA_REFERENCE_UNRESOLVED` are confirmed
   distinct: a scenario producing each is tested separately, and neither
   fixture's expected code is interchangeable with the other's
+- `validate()`'s `{ registered: false }` runtime result (§10, and §22's
+  Schema-system category) is confirmed to never appear as either
+  `SCHEMA_SETUP_FAILED` or `SCHEMA_REFERENCE_UNRESOLVED` — asking a
+  healthy, successfully-constructed registry for an unregistered schema
+  id is not a registration-time failure at all, and must not be
+  represented as one
 
 **Package and build integration (§20.4, §20.5)**
-- A clean-checkout sequence (`npm ci`, then root `npm run build`, then
-  root `npm test`) succeeds, covering both `packages/core` and
-  `packages/cli`
+- A clean-checkout sequence (`rm -rf node_modules packages/core/dist
+  packages/cli/dist`, then `npm ci`, then root `npm run build`, then root
+  `npm test`) succeeds, covering both `packages/core` and `packages/cli`
+- **Clean typecheck (the specific defect this correction fixes):** from
+  the same clean state (`rm -rf node_modules packages/core/dist
+  packages/cli/dist`), running `npm ci` followed by **only** `npm run
+  typecheck` (with no preceding `npm run build`) succeeds — proving root
+  `typecheck` itself builds `@buildrail/core` first so `dist/index.d.ts`
+  exists before `@buildrail/cli` is type-checked, rather than silently
+  depending on `dist/` output left over from some earlier, unrelated
+  build
 - `packages/core/package.json`'s published shape matches §20.4's target
   contract: `"main": "dist/index.js"`, `"types": "dist/index.d.ts"`,
   `engines.node: ">=22"`, `dependencies` containing exactly `yaml` and
@@ -2482,10 +2676,15 @@ BR2 implementation completion requires actual, passing results for:
 - `npm test` — extended to include `packages/core`'s new test suite
   alongside BR1's existing `packages/cli` suite (both must pass; BR2 does
   not replace or weaken BR1's existing 14 tests)
-- `npm run typecheck` — extended to include `packages/core`
+- `npm run typecheck` — extended to include `packages/core`, and ordered
+  so `@buildrail/core` is built (not merely type-checked) before
+  `@buildrail/cli` is type-checked (§20.5's "clean-typecheck problem" —
+  `packages/cli`'s type-check resolves `@buildrail/core`'s
+  `dist/index.d.ts`, which does not exist until Core is built)
 - `npm run build` — extended to include `packages/core` (compiling
   `packages/core/src/**/*.ts` to `packages/core/dist/`, mirroring BR1's
-  `packages/cli` build pipeline)
+  `packages/cli` build pipeline), and ordered before `packages/cli`'s
+  build for the same reason
 
 `npm run lint` remains `NOT CONFIGURED` unless separately authorized —
 BR2 does not introduce lint tooling.
@@ -2494,6 +2693,29 @@ BR2 implementation must **extend** the real root-level scripts BR1
 established (currently `npm run build --workspace=@buildrail/cli`, etc.)
 to also invoke `@buildrail/core`'s equivalent scripts — not replace them,
 and not reintroduce a placeholder-echo state for either package.
+
+**Required clean-checkout evidence (§20.5, §28):** BR2 implementation
+completion evidence must include the results of, run against a genuinely
+clean tree (`rm -rf node_modules packages/core/dist packages/cli/dist`
+immediately beforehand):
+
+```
+npm ci
+npm run typecheck
+```
+
+passing without relying on any stale `dist/` output, and separately:
+
+```
+npm ci
+npm run typecheck
+npm run build
+npm test
+```
+
+passing in full from the same clean starting state. Evidence of `npm run
+typecheck` only ever having been run after a prior `npm run build` left
+`dist/` populated does not satisfy this requirement.
 
 ## 25. Runtime Compatibility
 
@@ -2608,26 +2830,41 @@ existing shape exactly.
 - **X.** `completeAndFreezePhase` (§15) is the exclusive path from
   `PRODUCTION_VERIFIED → FROZEN` — a bare `applyTransition` call for that
   pair fails with `LIFECYCLE_DEDICATED_OPERATION_REQUIRED`, never a
-  silent lifecycle-only update — and atomically sets
-  `current.lifecycle_state`, `authorization.status: "completed"`,
-  `completed_phases`, and a new `baselines` entry (keyed by the closing
-  phase, `status: "frozen"`, `approved_sha` taken from
-  `request.approvedSha`) together, rejecting a malformed SHA with the new
-  `BASELINE_SHA_INVALID` code — proven by the dedicated test matrix in
-  §22.
-- **Y.** `loadConfig`/`loadState` catch a `createRegistry()` setup
-  failure and surface it as the distinct `SCHEMA_SETUP_FAILED` code —
-  never an unhandled exception, and never conflated with
-  `SCHEMA_REFERENCE_UNRESOLVED` or the `*_SCHEMA_INVALID` codes — proven
-  by the schema-setup-boundary test category in §22.
+  silent lifecycle-only update — requires an active, phase-matching
+  authorization and requires the closing phase to be absent from both
+  `completed_phases` and `baselines` (never overwriting an existing
+  baseline, never treating an already-closed phase as idempotently
+  re-closable), and on success atomically sets `current.lifecycle_state`,
+  `authorization.status: "completed"`, `completed_phases`, a new
+  `baselines` entry (keyed by the closing phase, `status: "frozen"`,
+  `approved_sha` taken from `request.approvedSha`), and clears all three
+  `candidate.*` fields to `null` — producing exactly the closure shape
+  `activatePhase`'s own precondition requires — rejecting a malformed SHA
+  with the new `BASELINE_SHA_INVALID` code — proven by the dedicated test
+  matrix in §22, including the end-to-end
+  `completeAndFreezePhase` → `activatePhase` compatibility test.
+- **Y.** `loadConfig`/`loadState` correctly implement the complete
+  three-outcome schema error taxonomy (§10): an unregistered schema id
+  passed to a healthy `validate()` call returns `{ registered: false }`
+  (never an exception, never `SCHEMA_REFERENCE_UNRESOLVED`); a general
+  registry-construction failure (missing/unreadable/malformed schema
+  file) surfaces as `SCHEMA_SETUP_FAILED`; an unresolved internal `$ref`
+  among otherwise-valid schema files surfaces as
+  `SCHEMA_REFERENCE_UNRESOLVED` — the three are never conflated with each
+  other, with an unhandled exception, or with the `*_SCHEMA_INVALID`
+  codes — proven by the schema-error-taxonomy test category in §22.
 - **Z.** `packages/core/package.json`'s final shape matches §20.4's
   target contract exactly (`"main": "dist/index.js"`, `"types":
   "dist/index.d.ts"`, `engines.node: ">=22"`, runtime `dependencies`
   limited to `yaml` and `ajv`, `typescript`/`@types/node` as
-  `devDependencies`), and a clean `npm ci` followed by root `npm run
-  build` builds `@buildrail/core` before `@buildrail/cli` consumes its
-  compiled output (§20.5) — proven by the package-and-build-integration
-  test category in §22.
+  `devDependencies`), and — from a genuinely clean tree (`rm -rf
+  node_modules packages/core/dist packages/cli/dist`) — both `npm ci &&
+  npm run typecheck` alone and the full `npm ci && npm run typecheck &&
+  npm run build && npm test` sequence pass, with root `typecheck` itself
+  building `@buildrail/core` before type-checking `@buildrail/cli` so
+  neither command depends on stale `dist/` output left over from an
+  earlier build (§20.5) — proven by the package-and-build-integration
+  test category in §22, including its clean-typecheck test specifically.
 - **AA.** `buildrail status` resolves governance files using exactly
   `process.cwd()` as `projectRoot` (§17.0) — no parent-directory walking,
   no Git-root discovery — proven by the CLI project-root test in §22.
@@ -2647,7 +2884,9 @@ existing shape exactly.
   `init`-related tests unmodified and passing against the BR2 candidate.
 - **P.** `npm test`, `npm run typecheck`, `npm run build` all pass at the
   repository root, covering both `packages/cli` (BR1, unmodified) and
-  `packages/core` (BR2, new).
+  `packages/core` (BR2, new) — including from a genuinely clean tree
+  (§20.5, §24's "Required clean-checkout evidence"), not merely on a
+  developer machine with pre-existing `dist/` output.
 - **Q.** No Git inspection (branch, SHA, diff, deletion/rename detection)
   was implemented anywhere in `packages/core` or `packages/cli`.
 - **R.** No quality-gate *execution engine* (`buildrail verify` or
@@ -2799,7 +3038,7 @@ The independent reviewer must specifically examine, for BR2:
 - Whether `validate()`'s unknown-schema behavior (§10) matches the typed
   `{ registered: false }` contract exactly — never throwing, never
   falsely reporting `{ valid: true }`, and never reusing
-  `SCHEMA_REFERENCE_UNRESOLVED` for this case
+  `SCHEMA_REFERENCE_UNRESOLVED` or `SCHEMA_SETUP_FAILED` for this case
 - **Whether the resume-authorization-bypass fix (§15) actually closes the
   gap** — specifically, attempt `CORRECTION_REQUIRED → IMPLEMENTING` and
   at least one `BLOCKED → X` return against a fixture with a revoked
@@ -2825,22 +3064,39 @@ The independent reviewer must specifically examine, for BR2:
   24 legal edges
 - Whether `completeAndFreezePhase` (§15) atomically performs every part
   of phase closure (`lifecycle_state`, `authorization.status`,
-  `completed_phases`, the new `baselines` entry) together, rejects a
-  malformed SHA with `BASELINE_SHA_INVALID`, and is the only path that
-  reaches `FROZEN` from `PRODUCTION_VERIFIED`
+  `completed_phases`, the new `baselines` entry, clearing all three
+  `candidate.*` fields) together, requires an active phase-matching
+  authorization, genuinely rejects (never overwrites, never idempotently
+  no-ops) closing a phase already present in `completed_phases` or
+  `baselines`, rejects a malformed SHA with `BASELINE_SHA_INVALID`, is
+  the only path that reaches `FROZEN` from `PRODUCTION_VERIFIED`, and
+  produces output that satisfies `activatePhase`'s own closure-invariant
+  precondition directly
 - Whether `requiredActor` returns the fully deterministic three-way
   contract (`Actor` value / `null` / `undefined`) specified in §15's API
   section, never throwing for an illegal pair — the corrected replacement
   for a prior draft's retracted "undefined behavior (throws)" language
-- Whether `SCHEMA_SETUP_FAILED` is correctly distinguished from
-  `SCHEMA_REFERENCE_UNRESOLVED` (§10) — a `createRegistry()` setup
-  failure surfaces as the former, never the latter, and never an
-  unhandled exception escaping `loadConfig`/`loadState`
+- Whether the complete three-outcome schema error taxonomy (§10) is
+  correctly implemented and never conflated: `validate()`'s
+  `{ registered: false }` for an unregistered id against a healthy
+  registry; `SCHEMA_SETUP_FAILED` for a general registry-construction
+  failure (missing/unreadable/malformed schema file); and
+  `SCHEMA_REFERENCE_UNRESOLVED` specifically for an unresolved internal
+  `$ref` among otherwise-valid schema files — with `createRegistry()`
+  throwing distinctly-typed exceptions per kind that `loadConfig`/
+  `loadState` translate by type, never an unhandled exception escaping
+  either loader
 - Whether `packages/core/package.json`'s final shape matches §20.4's
   target contract exactly, and whether a clean `npm ci` + root `npm run
   build` genuinely builds `@buildrail/core` before `@buildrail/cli`
   consumes its compiled `dist/` output, with no direct
   `packages/core/src/**` import from CLI code (§20.5)
+- **Whether root `npm run typecheck` genuinely works from a clean tree
+  without a prior `npm run build`** — run `rm -rf node_modules
+  packages/core/dist packages/cli/dist && npm ci && npm run typecheck`
+  directly (§20.5, §24) and confirm it passes; this is a real,
+  independently-executed check, not a re-reading of the specification's
+  claim that Core is built before CLI is type-checked
 - Whether `buildrail status` resolves governance files using exactly
   `process.cwd()` (§17.0), with no parent-directory walking and no
   Git-root discovery — confirmed by the CLI project-root test, not merely

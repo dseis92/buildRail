@@ -55,11 +55,20 @@ lifecycle-state fields such as `current.lifecycle_state` and
 `current.development_phase`). `authorization` is a **schema-optional**
 property of `state.schema.json`: it is a declared property, but it is not
 listed in the schema's top-level `required` array, so a state document
-with no `authorization` key at all is schema-valid. This matters at
-project bootstrap and immediately after a phase is closed and frozen,
-before the next phase's authorization has been granted — at both points
-there is legitimately no active authorization, and that absence is not a
-schema violation.
+with no `authorization` key at all is schema-valid — and that absence is
+not a schema violation when it does occur (e.g. at project bootstrap, or
+in an intentionally constructed test/fixture state).
+
+**This schema-optional absence is not, however, what normal phase closure
+produces.** After a phase is closed in the ordinary governed way (BR2's
+`completeAndFreezePhase` operation, once BR2 exists — and, historically,
+BR0's and BR1's own real hand-performed closure commits), `state.authorization`
+remains **present** — its `status` is set to `completed`, not removed —
+so there is no *active* authorization at that point, but the key itself
+is not absent. Do not conflate "no active authorization" with "no
+`authorization` key": the normal, expected shape immediately after
+closure is a present `authorization` object with `status: completed` (see
+the next paragraph for the full detail on this).
 
 At most one authorization record is present at a time. When it is
 present, its `status` determines whether it is active (see "Active vs.
