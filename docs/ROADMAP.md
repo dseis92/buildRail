@@ -6,7 +6,7 @@ authorized, regardless of how "obviously next" it may seem.
 
 | Phase | Name | Summary | Status |
 |-------|------|---------|--------|
-| BR0 | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. | **AUTHORIZED** (in progress) |
+| BR0 | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. | **COMPLETE + INDEPENDENTLY APPROVED + FROZEN** (baseline `04c93767510c51916fcc51f60b85b674c7d6f1cc`) |
 | BR1 | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` | PLANNED |
 | BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions | PLANNED |
 | BR3 | Git Inspection | Branch detection, HEAD/remote SHA, working tree, diff inspection, protected-path/deletion/rename detection | PLANNED |
@@ -45,5 +45,7 @@ already established by earlier phases:
 
 ## Current status
 
-As of this writing, BR0 is authorized and in progress. It is not complete,
-reviewed, or approved. No phase after BR0 is authorized.
+As of this writing, BR0 is complete, independently reviewed, approved, and
+frozen at the baseline SHA recorded in `.buildrail/state.yml`
+(`baselines.BR0`). Current implementation authorization: **none**. No
+phase after BR0 is implementation-authorized — BR1–BR8 remain planned.

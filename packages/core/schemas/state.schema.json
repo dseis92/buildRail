@@ -47,6 +47,11 @@
       "type": "array",
       "items": { "type": "string" }
     },
+    "baselines": {
+      "type": "object",
+      "description": "Immutable approved checkpoints for completed/frozen development phases, keyed by phase id. Distinct from `candidate`, which tracks the exact in-progress candidate still moving through implementation/review.",
+      "additionalProperties": { "$ref": "#/$defs/baseline" }
+    },
     "protected_systems": {
       "type": "array",
       "items": { "type": "object" }
@@ -82,6 +87,22 @@
         "BLOCKED",
         "CORRECTION_REQUIRED"
       ]
+    },
+    "baseline": {
+      "type": "object",
+      "required": ["approved_sha", "status"],
+      "properties": {
+        "approved_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "The exact 40-character Git commit SHA approved as this phase's baseline."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["frozen"]
+        }
+      },
+      "additionalProperties": true
     }
   }
 }

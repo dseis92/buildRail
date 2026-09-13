@@ -9,14 +9,14 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: AUTHORIZED
+  lifecycle_state: FROZEN
   development_phase: BR0
 
 authorization:
   id: BR0
   type: foundation
   title: BuildRail Constitution
-  status: authorized
+  status: completed
   specification: .buildrail/specs/BR0-CONSTITUTION.md
   granted_by: human
 
@@ -25,9 +25,19 @@ candidate:
   base_sha: null
   candidate_sha: null
 
-# BR0 is authorized and in progress. It is not yet complete, reviewed, or
-# approved — do not add it here until an independent review has approved it.
-completed_phases: []
+# Immutable approved checkpoints for completed/frozen phases. Distinct from
+# `candidate` above, which tracks the exact in-progress candidate still
+# moving through implementation/review — not a completed phase's record.
+baselines:
+  BR0:
+    approved_sha: 04c93767510c51916fcc51f60b85b674c7d6f1cc
+    status: frozen
+
+# BR0 has been independently reviewed, approved, and frozen at the SHA
+# recorded under `baselines.BR0`. No implementation authorization is
+# currently active.
+completed_phases:
+  - BR0
 
 planned_phases:
   - BR1

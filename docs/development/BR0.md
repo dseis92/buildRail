@@ -1,6 +1,7 @@
 # BR0 — Constitution
 
-**Status: AUTHORIZED** (in progress; not yet reviewed, approved, or frozen)
+**Status: COMPLETE + INDEPENDENTLY APPROVED + FROZEN**
+**Approved baseline SHA:** 04c93767510c51916fcc51f60b85b674c7d6f1cc
 
 ## Goal
 
@@ -56,6 +57,11 @@ constitution before product implementation begins.
 - Independent review has evaluated the BR0 scaffold
 - Human owner explicitly approves BR0 (this document does not self-approve
   BR0's completion)
+
+All exit conditions above have been met. BR0 is frozen at the approved
+baseline SHA recorded above and in `.buildrail/state.yml`
+(`baselines.BR0`). Current implementation authorization: **none**. BR1–BR8
+remain planned, not implementation-authorized.
 
 ## Dependencies
 

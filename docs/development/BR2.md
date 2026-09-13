@@ -44,3 +44,12 @@ and enforcing legal lifecycle transitions.
 ## Dependencies
 
 - BR1 (CLI surface to expose this through)
+
+## Deferred from BR0 review
+
+The independent BR0 review flagged that
+`packages/core/schemas/state.schema.json`'s `authorization` property uses
+`"$ref": "authorization.schema.json"` — a bare relative reference that
+requires a schema loader to register both files under a shared base
+URI/registry to resolve correctly. This should be clarified or resolved as
+part of implementing schema validation in this phase.

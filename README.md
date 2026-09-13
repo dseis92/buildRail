@@ -6,12 +6,14 @@
 
 ## Status
 
-**Experimental — BR0 Constitution.**
+**Experimental — BR0 Constitution complete, independently approved, and frozen.**
 
-BuildRail is currently in its foundational phase. There is no functional CLI,
+BuildRail's foundational phase (BR0) is complete and frozen at baseline
+`04c93767510c51916fcc51f60b85b674c7d6f1cc`. There is no functional CLI,
 governance engine, or agent adapter yet. This repository currently contains
 the project's specification, governance model, architecture, schemas, and
-scaffolding — not a working product. See [Development Phases](#development-phases)
+scaffolding — not a working product. No implementation phase is currently
+authorized; BR1–BR8 remain planned. See [Development Phases](#development-phases)
 below for what that means concretely.
 
 ## What is BuildRail?
@@ -134,7 +136,7 @@ discipline it asks of projects that adopt it.
 
 | Phase | Name | Scope |
 |-------|------|-------|
-| **BR0** | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. |
+| **BR0** | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. — **COMPLETE + FROZEN** |
 | BR1 | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` |
 | BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions |
 | BR3 | Git Inspection | Branch/SHA detection, working tree, diffs, protected-path and deletion/rename detection |
@@ -144,7 +146,8 @@ discipline it asks of projects that adopt it.
 | BR7 | Codex Adapter | Codex integration |
 | BR8 | End-to-End Dogfood | Govern BuildRail's own development using BuildRail; reference demo app; full lifecycle test |
 
-**Only BR0 is currently authorized.** BR1–BR8 are planned but not
+**BR0 is complete, independently approved, and frozen.** No implementation
+phase is currently authorized — BR1–BR8 are planned but not
 implementation-authorized. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/development/`](docs/development/) for phase-by-phase detail.
 

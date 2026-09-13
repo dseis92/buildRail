@@ -29,8 +29,11 @@ the governance model itself.
 
 ## Current phase
 
-**BR0 (Constitution) is the only currently authorized phase.** BR1–BR8 are
-planning only — do not begin implementation on them. See
-`docs/ROADMAP.md` and `docs/development/` for what each phase covers.
+**BR0 (Constitution) is complete, independently approved, and frozen** at
+baseline `04c93767510c51916fcc51f60b85b674c7d6f1cc` (see
+`.buildrail/state.yml`). **No implementation phase is currently
+authorized.** BR1–BR8 are planning only — do not begin implementation on
+them. See `docs/ROADMAP.md` and `docs/development/` for what each phase
+covers.
 
 For the full governance model, see `docs/GOVERNANCE.md`.

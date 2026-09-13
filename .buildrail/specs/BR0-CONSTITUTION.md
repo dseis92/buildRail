@@ -1,8 +1,9 @@
 # BR0 — BuildRail Constitution
 
-**Status:** authorized
+**Status:** complete — independently approved — frozen
 **Type:** foundation
 **Granted by:** human
+**Approved baseline SHA:** 04c93767510c51916fcc51f60b85b674c7d6f1cc
 
 ## Goal
 
@@ -54,3 +55,8 @@ This specification governs only the creation of BuildRail's own foundation.
 It does not authorize implementation of any BR1–BR8 capability. Completion
 of BR0 requires independent review before it can be marked approved or
 frozen — an implementation agent cannot self-approve this phase.
+
+BR0 has passed independent review and is frozen at the approved baseline
+SHA above (see `.buildrail/state.yml` under `baselines.BR0`). No
+implementation authorization is currently active. BR1–BR8 remain planned,
+not implementation-authorized.
