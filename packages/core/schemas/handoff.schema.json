@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildrail.dev/schemas/handoff.schema.json",
+  "title": "BuildRail Handoff",
+  "description": "Draft schema for a structured handoff artifact. Established in BR0; generation not implemented until BR4/BR5.",
+  "type": "object",
+  "required": [
+    "authorization_id",
+    "lifecycle_state",
+    "branch",
+    "candidate_sha",
+    "completed_work",
+    "remaining_work",
+    "blockers",
+    "next_authorized_action"
+  ],
+  "properties": {
+    "authorization_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lifecycle_state": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_sha": {
+      "type": ["string", "null"]
+    },
+    "completed_work": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "remaining_work": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "next_authorized_action": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What is already authorized and next in sequence, not simply what seems logical."
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,55 @@
+# BuildRail project configuration.
+#
+# This file defines policy: what is allowed, what is required, and what
+# quality gates apply. It does not describe current progress — see
+# state.yml for that.
+
+schema_version: 1
+
+project:
+  name: BuildRail
+  default_branch: main
+
+git:
+  force_push: forbidden
+  destructive_reset: forbidden
+  direct_default_branch_push: forbidden
+
+change_control:
+  additive_by_default: true
+  unexpected_deletion: stop
+  unexpected_rename: stop
+
+review:
+  require_independent_review: true
+  require_exact_candidate_sha: true
+  self_approval: forbidden
+
+human_qa:
+  enabled: true
+
+quality_gates:
+  tests:
+    command: npm test
+    required: false
+    note: "Required beginning when executable product code exists."
+
+  typecheck:
+    command: npm run typecheck
+    required: false
+    note: "Required beginning when TypeScript implementation starts."
+
+  lint:
+    command: npm run lint
+    required: false
+    note: "Required beginning when lint configuration exists."
+
+  build:
+    command: npm run build
+    required: false
+    note: "Required beginning when executable build exists."
+
+# No protected paths are defined yet. BuildRail's own source tree has no
+# functional implementation during BR0, so there is nothing to protect
+# beyond normal Git history.
+protected_systems: []

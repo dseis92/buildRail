@@ -1,0 +1,59 @@
+# <PROJECT_NAME> BuildRail configuration.
+#
+# This file defines policy: what is allowed, what is required, and what
+# quality gates apply. It does not describe current progress — see
+# state.yml for that.
+
+schema_version: 1
+
+project:
+  name: <PROJECT_NAME>
+  default_branch: <DEFAULT_BRANCH>
+
+git:
+  force_push: forbidden
+  destructive_reset: forbidden
+  direct_default_branch_push: forbidden
+
+change_control:
+  additive_by_default: true
+  unexpected_deletion: stop
+  unexpected_rename: stop
+
+review:
+  require_independent_review: true
+  require_exact_candidate_sha: true
+  self_approval: forbidden
+
+human_qa:
+  enabled: true
+
+quality_gates:
+  tests:
+    command: npm test
+    required: false
+    note: "Set required: true once a real test suite exists."
+
+  typecheck:
+    command: npm run typecheck
+    required: false
+    note: "Set required: true once TypeScript (or an equivalent) is in use."
+
+  lint:
+    command: npm run lint
+    required: false
+    note: "Set required: true once lint configuration exists."
+
+  build:
+    command: npm run build
+    required: false
+    note: "Set required: true once there is a real build target."
+
+# Declare protected systems as they're identified. Example:
+#
+# protected_systems:
+#   - name: authentication
+#     status: frozen
+#     paths:
+#       - src/auth/**
+protected_systems: []

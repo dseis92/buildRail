@@ -1,0 +1,7 @@
+{
+  "name": "@buildrail/skills",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Canonical BuildRail agent skill definitions. Design drafts only (BR0); not yet backed by the BuildRail CLI.",
+  "license": "Apache-2.0"
+}

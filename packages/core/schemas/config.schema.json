@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildrail.dev/schemas/config.schema.json",
+  "title": "BuildRail Config",
+  "description": "Draft schema for .buildrail/config.yml. Established in BR0; not yet enforced by tooling (planned BR2).",
+  "type": "object",
+  "required": ["schema_version", "project", "git", "change_control", "review", "human_qa", "quality_gates"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "project": {
+      "type": "object",
+      "required": ["name", "default_branch"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "default_branch": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "force_push": { "$ref": "#/$defs/policyValue" },
+        "destructive_reset": { "$ref": "#/$defs/policyValue" },
+        "direct_default_branch_push": { "$ref": "#/$defs/policyValue" }
+      },
+      "additionalProperties": true
+    },
+    "change_control": {
+      "type": "object",
+      "properties": {
+        "additive_by_default": { "type": "boolean" },
+        "unexpected_deletion": { "$ref": "#/$defs/changeAction" },
+        "unexpected_rename": { "$ref": "#/$defs/changeAction" }
+      },
+      "additionalProperties": true
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "require_independent_review": { "type": "boolean" },
+        "require_exact_candidate_sha": { "type": "boolean" },
+        "self_approval": { "$ref": "#/$defs/policyValue" }
+      },
+      "additionalProperties": true
+    },
+    "human_qa": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "quality_gates": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/qualityGate" }
+    },
+    "protected_systems": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/protectedSystem" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "policyValue": {
+      "type": "string",
+      "enum": ["allowed", "forbidden"]
+    },
+    "changeAction": {
+      "type": "string",
+      "enum": ["allow", "stop", "warn"]
+    },
+    "qualityGate": {
+      "type": "object",
+      "required": ["command", "required"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "required": { "type": "boolean" },
+        "note": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "protectedSystem": {
+      "type": "object",
+      "required": ["name", "status", "paths"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "status": {
+          "type": "string",
+          "enum": ["open", "guarded", "frozen", "locked"]
+        },
+        "paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

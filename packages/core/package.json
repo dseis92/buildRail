@@ -1,0 +1,9 @@
+{
+  "name": "@buildrail/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BuildRail provider-neutral governance engine. No functional implementation yet (BR0).",
+  "type": "module",
+  "main": "src/index.ts",
+  "license": "Apache-2.0"
+}

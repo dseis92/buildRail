@@ -1,0 +1,49 @@
+# Roadmap
+
+BuildRail is developed in explicit, sequential phases. Each phase has its
+own authorization; a later phase does not begin until it is explicitly
+authorized, regardless of how "obviously next" it may seem.
+
+| Phase | Name | Summary | Status |
+|-------|------|---------|--------|
+| BR0 | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. | **AUTHORIZED** (in progress) |
+| BR1 | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` | PLANNED |
+| BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions | PLANNED |
+| BR3 | Git Inspection | Branch detection, HEAD/remote SHA, working tree, diff inspection, protected-path/deletion/rename detection | PLANNED |
+| BR4 | Verification | Quality gate commands, candidate-bound verification, `buildrail verify`, evidence reports | PLANNED |
+| BR5 | Agent Skills | Planning, preflight, implementation, verification, review, completion, handoff skills | PLANNED |
+| BR6 | Claude Code Adapter | Claude Code integration | PLANNED |
+| BR7 | Codex Adapter | Codex integration | PLANNED |
+| BR8 | End-to-End Dogfood | Govern BuildRail's own development using BuildRail; reference demo app; full lifecycle test | PLANNED |
+
+"PLANNED" means designed at a high level in this repository's documentation
+but **not implementation-authorized**. No work should begin on a PLANNED
+phase until its own authorization record is created and granted by the
+human owner, mirroring the exact governance model BuildRail itself
+enforces.
+
+See `docs/development/BR0.md` through `BR8.md` for phase-level goal, scope,
+out-of-scope boundary, expected deliverables, entry/exit conditions, and
+dependencies.
+
+## Sequencing rationale
+
+The phases are ordered so that each depends only on facts and structures
+already established by earlier phases:
+
+- BR1 (CLI Skeleton) needs BR0's package/workspace structure to exist.
+- BR2 (Governance Engine) needs BR1's CLI shell to expose commands through.
+- BR3 (Git Inspection) needs BR2's config/state loading to know what to
+  check facts against.
+- BR4 (Verification) needs BR3's Git inspection to bind evidence to a real
+  candidate SHA.
+- BR5 (Agent Skills) needs BR2–BR4 so skills can describe real, checkable
+  behavior instead of aspirational workflow.
+- BR6/BR7 (Adapters) need BR5's canonical skills to adapt.
+- BR8 (Dogfood) needs the full stack (BR1–BR7) to actually govern
+  BuildRail's own development end to end.
+
+## Current status
+
+As of this writing, BR0 is authorized and in progress. It is not complete,
+reviewed, or approved. No phase after BR0 is authorized.

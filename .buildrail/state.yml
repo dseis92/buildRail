@@ -1,0 +1,46 @@
+# BuildRail project state.
+#
+# This file reflects current, factual progress. It is not policy (see
+# config.yml) and it is not aspirational — it must always describe reality.
+
+schema_version: 1
+
+project:
+  name: BuildRail
+
+current:
+  lifecycle_state: AUTHORIZED
+  development_phase: BR0
+
+authorization:
+  id: BR0
+  type: foundation
+  title: BuildRail Constitution
+  status: authorized
+  specification: .buildrail/specs/BR0-CONSTITUTION.md
+  granted_by: human
+
+candidate:
+  branch: null
+  base_sha: null
+  candidate_sha: null
+
+# BR0 is authorized and in progress. It is not yet complete, reviewed, or
+# approved — do not add it here until an independent review has approved it.
+completed_phases: []
+
+planned_phases:
+  - BR1
+  - BR2
+  - BR3
+  - BR4
+  - BR5
+  - BR6
+  - BR7
+  - BR8
+
+protected_systems: []
+
+review:
+  independent_review: required
+  self_approval: forbidden

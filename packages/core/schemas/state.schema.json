@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildrail.dev/schemas/state.schema.json",
+  "title": "BuildRail State",
+  "description": "Draft schema for .buildrail/state.yml. Established in BR0; not yet enforced by tooling (planned BR2).",
+  "type": "object",
+  "required": ["schema_version", "project", "current", "completed_phases", "planned_phases", "review"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "project": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "current": {
+      "type": "object",
+      "required": ["lifecycle_state", "development_phase"],
+      "properties": {
+        "lifecycle_state": { "$ref": "#/$defs/lifecycleState" },
+        "development_phase": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "authorization": {
+      "$ref": "authorization.schema.json"
+    },
+    "candidate": {
+      "type": "object",
+      "properties": {
+        "branch": { "type": ["string", "null"] },
+        "base_sha": { "type": ["string", "null"] },
+        "candidate_sha": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "completed_phases": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "planned_phases": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "protected_systems": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "independent_review": { "type": "string", "enum": ["required", "not_required"] },
+        "self_approval": { "type": "string", "enum": ["forbidden", "allowed"] }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "lifecycleState": {
+      "type": "string",
+      "enum": [
+        "IDEA",
+        "SPECIFIED",
+        "AUTHORIZED",
+        "PREFLIGHT",
+        "IMPLEMENTING",
+        "IMPLEMENTED",
+        "VERIFYING",
+        "PENDING_REVIEW",
+        "REVIEW_APPROVED",
+        "HUMAN_QA",
+        "MERGE_AUTHORIZED",
+        "MERGED",
+        "PRODUCTION_VERIFIED",
+        "FROZEN",
+        "BLOCKED",
+        "CORRECTION_REQUIRED"
+      ]
+    }
+  }
+}

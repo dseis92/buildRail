@@ -1,0 +1,36 @@
+# <PROJECT_NAME> BuildRail state.
+#
+# This file reflects current, factual progress. It is not policy (see
+# config.yml) and it is not aspirational — it must always describe reality.
+
+schema_version: 1
+
+project:
+  name: <PROJECT_NAME>
+
+current:
+  lifecycle_state: IDEA
+  development_phase: null
+
+authorization:
+  id: <AUTHORIZATION_ID>
+  type: feature
+  title: null
+  status: draft
+  specification: null
+  granted_by: null
+
+candidate:
+  branch: null
+  base_sha: null
+  candidate_sha: null
+
+completed_phases: []
+
+planned_phases: []
+
+protected_systems: []
+
+review:
+  independent_review: required
+  self_approval: forbidden

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildrail.dev/schemas/authorization.schema.json",
+  "title": "BuildRail Authorization",
+  "description": "Draft schema for an authorization record. Established in BR0; not yet enforced by tooling (planned BR2).",
+  "type": "object",
+  "required": ["id", "type", "title", "status", "specification", "granted_by"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "enum": ["foundation", "feature", "bugfix", "maintenance"]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "authorized", "in_progress", "completed", "revoked"]
+    },
+    "specification": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to the specification document defining goal, scope, out-of-scope boundary, and acceptance criteria."
+    },
+    "granted_by": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Who granted this authorization. Must be the human owner, not an agent."
+    }
+  },
+  "additionalProperties": true
+}

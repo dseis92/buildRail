@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildrail.dev/schemas/verification-report.schema.json",
+  "title": "BuildRail Verification Report",
+  "description": "Draft schema for a candidate-SHA-bound verification/evidence report. Established in BR0; generation not implemented until BR4.",
+  "type": "object",
+  "required": ["candidate_sha", "branch", "timestamp", "quality_gates", "result"],
+  "properties": {
+    "candidate_sha": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The exact commit SHA this report is bound to."
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "quality_gates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/qualityGateResult" }
+    },
+    "protected_path_changes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths touched by this candidate that match a declared protected system."
+    },
+    "unexpected_deletions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "unexpected_renames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from", "to"],
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "result": {
+      "type": "string",
+      "enum": ["pass", "fail", "blocked", "stale"]
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "qualityGateResult": {
+      "type": "object",
+      "required": ["name", "category", "command", "status"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "category": {
+          "type": "string",
+          "enum": [
+            "AUTOMATED_TEST",
+            "TYPECHECK",
+            "LINT",
+            "BUILD",
+            "MANUAL_INSPECTION",
+            "HUMAN_QA",
+            "NOT_CHECKED"
+          ]
+        },
+        "command": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "fail", "error", "not_checked"]
+        },
+        "output": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
+  }
+}
