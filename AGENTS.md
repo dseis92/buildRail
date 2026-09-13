@@ -37,3 +37,32 @@ them. See `docs/ROADMAP.md` and `docs/development/` for what each phase
 covers.
 
 For the full governance model, see `docs/GOVERNANCE.md`.
+
+## Current BuildRail development roles
+
+This section records who currently occupies BuildRail's generic governance
+roles (`docs/GOVERNANCE.md`) while BuildRail itself is being developed. It
+is project-specific to this repository's current development process, not
+a BuildRail Core or template concept — see `docs/ADAPTER_MODEL.md` for why
+BuildRail Core and canonical skills must stay provider-neutral regardless
+of who currently fills these roles.
+
+- **Human Owner:** repository owner / Dylan
+- **Implementation Agent:** Claude Code
+- **Independent Reviewer:** ChatGPT
+
+Rules that follow from this assignment:
+
+- Claude Code implements work within active authorization but does not
+  independently approve its own work. Claude's completion or correction
+  reports are evidence for review, not approval.
+- ChatGPT performs independent review against the actual GitHub
+  branch/exact candidate SHA — not against a description of changes, and
+  not against Claude's own self-report.
+- The human owner is the final authority: they grant implementation
+  authorization, accept or reject independent review findings, authorize
+  merges, and authorize movement into the next development phase.
+- Claude must not claim ChatGPT approved something unless the human owner
+  provides the actual ChatGPT review verdict.
+- A different role assignment may be made only by explicit human-owner
+  instruction, and should be recorded here when it changes.
