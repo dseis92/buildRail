@@ -243,6 +243,29 @@ must **not** include any of the following:
   call, arbitrary shell/subprocess execution beyond the specific,
   argv-array Git subcommands this document enumerates
 
+**Concurrency/TOCTOU scope boundary — new, explicit, mandatory, Round 10
+review finding #3.** BR3's external-content-filter-execution guarantee
+(§18's `check-attr`-then-`status` mechanism, §17's
+`EXTERNAL_GIT_FILTER_UNSUPPORTED`) assumes the repository/index/
+working-tree configuration relevant to one `inspectWorkingTree` call is
+not concurrently, adversarially mutated *during* that one call's own
+internal sequence of Git subprocesses. **BR3 does not claim, and cannot
+mechanically enforce, an atomic filesystem snapshot across the multiple,
+genuinely separate Git processes one BR3 function call spawns** — the
+`check-attr` scan and the subsequent `status` invocation are two
+distinct OS processes, not one atomic operation, and a repository
+mutated by a concurrent, adversarial actor in the narrow window between
+them is out of scope for BR3 v0.1's guarantee. Under a repository that is
+genuinely stable for the duration of one call — the ordinary case this
+specification's guarantees are scoped to — the guarantee holds exactly
+as stated elsewhere in this document. Closing the narrower,
+adversarial-concurrent-mutation case would require an atomic/sandboxed
+inspection mechanism (a filesystem snapshot, a lock held across multiple
+subprocesses) explicitly deferred to a future phase (§26), should a
+concrete threat model ever require it — this specification does not
+pretend the current detect-then-run sequence is race-free against a
+deliberately hostile, concurrently-mutating actor.
+
 ## 7. Proposed Module Structure
 
 ```
@@ -291,14 +314,30 @@ test-only seam are never re-exported, following BR2's established
 ```ts
 // ---- repository.ts ----
 
+// Every repository-controlled textual field below (RepositoryInfo.root/
+// gitDir/gitCommonDir, HeadInfo.branch, UpstreamInfo.remote/ref/branch,
+// and every other JS-string field derived from a Git plumbing call
+// whose *content* is repository/config-controlled, not fixed by Git's
+// own machine-token grammar) is decoded via the strict
+// `TextDecoder("utf-8", { fatal: true })` pipeline §13's byte-semantics
+// subsection defines (Category 2 — corrected, Round 10 review finding
+// #1: these are not "guaranteed ASCII"; Git genuinely permits
+// non-UTF-8 ref-name bytes). A value that fails strict decoding
+// produces `MALFORMED_GIT_OUTPUT` for the containing operation, never a
+// silently-substituted replacement character.
+
 interface RepositoryInfo {
-  root: string;           // absolute, resolved path — the confirmed repository root
+  root: string;           // absolute, resolved path — the confirmed repository root;
+                            // strict-UTF-8-decoded (§13 Category 2) — a filesystem
+                            // path is not guaranteed ASCII either
   gitDir: string;          // absolute, resolved --git-dir (per-checkout Git directory;
-                            // resolved target of a .git *file* for worktrees/submodules)
+                            // resolved target of a .git *file* for worktrees/submodules);
+                            // strict-UTF-8-decoded (§13 Category 2)
   gitCommonDir: string;     // absolute, resolved --git-common-dir (the shared/common Git
                             // directory — identical to gitDir except for a linked
                             // worktree, where it points at the primary checkout's own
-                            // .git; see §8's isWorktree derivation)
+                            // .git; see §8's isWorktree derivation); strict-UTF-8-decoded
+                            // (§13 Category 2)
   isWorktree: boolean;      // gitDir !== gitCommonDir — true only for a linked worktree,
                             // never true for an ordinary repository or a submodule
                             // checkout (both have gitDir === gitCommonDir) — see §8
@@ -310,7 +349,11 @@ function resolveRepository(projectRoot: string): Promise<GitResult<RepositoryInf
 
 interface HeadInfo {
   // Exactly one of these two is populated, per §9's branch/detached model:
-  branch: string | null;         // current branch name, or null if detached
+  branch: string | null;         // current branch name, or null if detached;
+                                   // strict-UTF-8-decoded (§13 Category 2) —
+                                   // Git permits non-UTF-8 bytes in a branch
+                                   // name; such a branch produces
+                                   // MALFORMED_GIT_OUTPUT, never a lossy decode
   detached: boolean;
   unborn: boolean;                 // true if HEAD points to a branch with no commits yet
   headSha: string | null;          // 40-hex-char commit SHA, or null if unborn
@@ -320,7 +363,8 @@ interface HeadInfo {
 interface UpstreamInfo {
   remote: string;   // e.g. "origin", or "." for a local-branch upstream (§9/§10),
                     // populated directly from branch.<b>.remote config —
-                    // independent of whether the upstream actually resolves
+                    // independent of whether the upstream actually resolves;
+                    // strict-UTF-8-decoded (§13 Category 2)
   ref: string | null; // the symbolic full name @{upstream} itself resolves to,
                       // e.g. "refs/remotes/origin/main" (an ordinary
                       // remote-tracking upstream), "refs/custom-ns/origin/main"
@@ -338,7 +382,8 @@ interface UpstreamInfo {
                       // resolve locally (§9's "configured but unresolvable"
                       // case) — a truthful "the upstream is configured but
                       // BR3 cannot tell you where its data lives" state, never
-                      // a guess presented as fact.
+                      // a guess presented as fact. When non-null,
+                      // strict-UTF-8-decoded (§13 Category 2).
   branch: string;   // e.g. "main" (the remote-side branch name, from
                     // branch.<b>.merge — read via --get-all, since this
                     // key may be multi-valued; branch is derived from
@@ -346,6 +391,7 @@ interface UpstreamInfo {
                     // @{upstream} itself uses — see §9/§10, Round 9
                     // review finding #2), populated directly from
                     // config — independent of whether the upstream
+                    // resolves; strict-UTF-8-decoded (§13 Category 2)
                     // actually resolves
   sha: string | null; // resolved via @{upstream} — see §9/§10. null exactly
                       // when ref is null: whenever @{upstream} itself fails
@@ -2479,14 +2525,62 @@ gone. A strict `TextDecoder` call downstream of a default-`encoding`
 exists to catch.
 
 **The fix: request raw bytes from `execFile`, never pre-decoded strings,
-for every BR3 invocation that returns path data.** §18's shared exec
-helper must call `execFile` with `encoding: "buffer"` (equivalently,
-`encoding: null`) for `resolveRepository`'s plumbing calls that only ever
-return non-path data (SHAs, `true`/`false`, ref names — all guaranteed
-ASCII, so decoding them via a plain `Buffer.prototype.toString("utf-8")`
-afterward is always exact and lossless) *and*, critically, for every
-`inspectWorkingTree`/`inspectDiff` invocation, whose stdout contains
-actual repository paths. The resulting pipeline is:
+for every BR3 invocation.** §18's shared exec helper must call
+`execFile` with `encoding: "buffer"` (equivalently, `encoding: null`)
+for **every** BR3 Git invocation, without exception — including every
+`resolveRepository` plumbing call, not merely `inspectWorkingTree`/
+`inspectDiff`. **Two output categories, decoded differently — corrected,
+mandatory, Round 10 review finding #1 (an earlier draft of this section
+incorrectly claimed ref names are "guaranteed ASCII," which is false):**
+- **Category 1 — fixed machine tokens:** a closed, small set of outputs
+  whose *entire grammar* is fixed by Git's own plumbing contract, never
+  by repository content — a 40-hex-character SHA-1 object ID, the
+  literal string `true`/`false` (`--is-bare-repository`), the literal
+  string `sha1`/`sha256` (`--show-object-format`), a status-letter
+  character (`A`/`M`/`D`/`R`/`T`/`C`), a similarity score's digits, the
+  fixed, BR3-supplied `check-attr` attribute-name field (always the
+  literal `filter`, since that is the only attribute BR3 ever requests).
+  These are validated against their exact, fixed ASCII grammar (e.g. a
+  regex anchoring the full string, `/^[0-9a-f]{40}$/` for a SHA) — a
+  value outside that grammar is `MALFORMED_GIT_OUTPUT`, never a
+  plain-ASCII decode assumption. A `Buffer.prototype.toString("utf-8")`
+  (or equivalently, a plain ASCII/hex-digit check on the raw bytes
+  directly, without any decode step at all) is exact and lossless for
+  these specific outputs precisely *because* their value is
+  independently, exactly grammar-validated — not because Git guarantees
+  every plumbing output is ASCII in general, which it does not.
+- **Category 2 — repository-controlled text:** any output whose actual
+  *content* is determined by the repository (or its configuration), not
+  by a fixed Git-plumbing grammar — a symbolic ref name (`symbolic-ref`),
+  a branch name, `@{upstream}`'s resolved symbolic full name, `git
+  config --get`/`--get-all` values for `branch.<b>.remote`/`.merge`,
+  `--show-toplevel`/`--git-dir`/`--git-common-dir` output (a filesystem
+  path, which — like the working-tree paths §13 already treats
+  strictly — is not guaranteed ASCII either), and any other
+  repository/config-controlled textual identifier BR3's public API
+  exposes as a JS string. **Git genuinely permits non-UTF-8 bytes in a
+  ref name** — verified directly against Git 2.47.3: a ref name
+  containing the raw byte `0xFF` is accepted by `git check-ref-format`,
+  successfully created via `git update-ref`, successfully pointed to by
+  `HEAD` via `git symbolic-ref`, and both `git symbolic-ref -q HEAD` and
+  `git rev-parse --verify -q HEAD^{commit}` succeed against it — this is
+  not a malformed-command-output edge case; it is ordinary,
+  Git-supported ref-name behavior BR3's own supported floor exhibits.
+  Category 2 outputs are decoded with the **identical** strict decoder
+  §13 already establishes for working-tree/diff paths —
+  `new TextDecoder("utf-8", { fatal: true })` — applied to the raw byte
+  range Git actually returned, never a lossy default decode. Valid
+  UTF-8, including non-ASCII Unicode (e.g. a branch literally named
+  `café`), is supported exactly, round-tripping losslessly; invalid
+  UTF-8 produces `MALFORMED_GIT_OUTPUT` for the containing operation,
+  never a silent U+FFFD substitution. **This generalizes, rather than
+  duplicates, the path-byte discipline §13 already establishes** — it is
+  the identical strict-decode mechanism applied to every
+  repository-controlled textual output, not a second, separate lossy
+  policy invented for non-path values.
+
+The resulting pipeline for the path-bearing (`inspectWorkingTree`/
+`inspectDiff`) case specifically is:
 
 1. `execFile(..., { encoding: "buffer" })` returns `stdout` as a raw
    Node `Buffer` — no decoding has happened yet at all.
@@ -3090,12 +3184,12 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 | `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 2) | Expected |
 | `UNSUPPORTED_OBJECT_FORMAT` | **New — Round 6 review finding #4.** `git rev-parse --show-object-format` (§8 step 5a) reports anything other than `sha1` for `projectRoot` (e.g. `sha256`, for a repository created via `git init --object-format=sha256`) | Expected — BR3 v0.1 supports SHA-1 repositories only, a deliberate scope decision (§8); `details` names the actual reported object format; `resolveRepository` fails before any SHA-producing BR3 function can be reached for that repository |
 | `UNSUPPORTED_REF_FORMAT` | **New — Round 7 review finding #1, made fail-closed Round 8 review finding #5.** `git config --get extensions.refStorage` (§8 step 5b) successfully reports any value other than `files` for `projectRoot` (a healthy repository using a ref-storage backend BR3 does not support) — this includes `reftable` **and any other, including future/unrecognized, backend value** the key might report; BR3 v0.1's contract is an allowlist of exactly one supported value (`files`, or the key's ordinary absence), not a denylist of `reftable` specifically | Expected — BR3 v0.1 supports the traditional `files` ref-storage backend only, a deliberate scope decision (§8); `details` contains the actual reported value verbatim; `resolveRepository` fails before any later step is reached for that repository. Distinct from a **malformed** repository (either ref backend), which is `GIT_COMMAND_FAILED` via the post-Git-failure secondary classifier (§8) — this code is reserved for a positively-recognized, *healthy* repository reporting an unsupported format; also distinct from the `extensions.refStorage` query itself failing for a reason other than ordinary key-absence, which is likewise `GIT_COMMAND_FAILED`, never inferred as `files`-backend support (§8) |
-| `EXTERNAL_GIT_FILTER_UNSUPPORTED` | **New — Round 6 review finding #1, detection mechanism corrected Round 7 review finding #4, scope narrowed to `inspectWorkingTree` only Round 9 review finding #5.** BR3's repository-effective-attribute scan (`git check-attr --stdin -z filter` over every relevant tracked path, superproject and every initialized submodule recursively — §18) finds at least one path with an active `filter` attribute, run *before* `inspectWorkingTree`'s `status` invocation, which could trigger the corresponding driver — regardless of whether that driver's command definition is repository-local, global/user-level (and therefore otherwise hidden by BR3's own `GIT_CONFIG_GLOBAL`-neutralized inspection environment), or currently undefined. BR3 refuses to proceed rather than execute the external filter or suppress it and risk returning a false working-tree fact (§18). **`inspectDiff` never triggers this scan or this code** (§13, Round 9 review finding #5) — a commit-vs-commit `diff` compares already-stored Git objects and performs no working-tree content canonicalization, so it has no dependency on current working-tree/index/`.gitattributes` state | Expected — a real, anticipated repository-configuration condition; `details` names the affected path(s)/attribute value(s); the `status` invocation that could trigger the filter is never run |
+| `EXTERNAL_GIT_FILTER_UNSUPPORTED` | **New — Round 6 review finding #1, detection mechanism corrected Round 7 review finding #4, scope narrowed to `inspectWorkingTree` only Round 9 review finding #5, ownership made exclusive and caching removed Round 10 review finding #3.** BR3's repository-effective-attribute scan (`git check-attr --stdin -z filter` over every relevant tracked path, superproject and every initialized submodule recursively — §18) finds at least one path with an active `filter` attribute, run fresh, unconditionally, on **every** `inspectWorkingTree` call — never cached or reused across separate calls — *before* that call's own `status` invocation, which could trigger the corresponding driver — regardless of whether that driver's command definition is repository-local, global/user-level (and therefore otherwise hidden by BR3's own `GIT_CONFIG_GLOBAL`-neutralized inspection environment), or currently undefined. BR3 refuses to proceed rather than execute the external filter or suppress it and risk returning a false working-tree fact (§18). **This code is returned by `inspectWorkingTree` exclusively** — `resolveRepository` never performs this scan and never returns this code merely because a repository's working tree contains an active filter attribute; `inspectHead` never performs it; `inspectDiff` never triggers this scan or returns this code at all (§13, Round 9 review finding #5) — a commit-vs-commit `diff` compares already-stored Git objects and performs no working-tree content canonicalization, so it has no dependency on current working-tree/index/`.gitattributes` state. This guarantee assumes the repository's relevant configuration is not concurrently, adversarially mutated during the brief window between the `check-attr` scan and the subsequent `status` invocation within one call (§18's stated concurrency boundary) | Expected — a real, anticipated repository-configuration condition; `details` names the affected path(s)/attribute value(s); the `status` invocation that could trigger the filter is never run |
 | `UNSAFE_SUBMODULE_PATH` | **New — Round 7 review finding #5, extended to cover repository-metadata identity and the parent→child relationship, Round 8 review finding #3, tightened to exclude linked-worktree metadata and the `.git`-entry-itself symlink case, Round 9 review finding #4.** A gitlink working-tree path (mode `160000` in `git ls-files --stage -z`, §18) discovered during initialized-submodule enumeration is itself a symbolic link (detected via `lstat`, never a symlink-following `stat`); **or** its own `.git` *entry* (one level inside an already-accepted, non-symlinked working-tree directory) is itself a symbolic link; **or** its canonical working-tree root **or** its canonical `(gitDir, gitCommonDir)` metadata identity has already been visited earlier in the same recursive enumeration (a cycle/alias, reachable even when the working-tree roots are themselves canonically distinct — §18 step 4a); **or** its resolved `.git` pointer names a location outside the three explicitly-recognized legitimate parent→child submodule shapes (§18 step 4a) — in particular, a pointer resolving to the parent's own `--git-dir`/`--git-common-dir`, to a location outside the parent's own `--git-common-dir` tree entirely, or to a location beneath the parent's `--git-common-dir` that is nonetheless a linked-worktree metadata directory rather than genuine, self-contained submodule metadata (`gitDir !== gitCommonDir` for the child) | Expected — a real, anticipated adversarial-or-corrupted-repository condition; BR3 fails safely rather than recursing into a symlink-redirected, cyclic, aliased, externally-pointed, or linked-worktree-redirected submodule path, and never recursively inspects the aliased/external/worktree repository before the refusal is produced; `details` names the offending gitlink path |
 | `HEAD_UNAVAILABLE` | **Complete, final trigger condition (revised — corrects Round 4 review finding #5, which extended this beyond Round 1's `symbolic-ref`-exit-code-only definition): EITHER (a)** `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal/unborn/corrupt-but-symbolic) or 1 (detached) — verified as exit 128 for genuine `.git/HEAD` corruption — **OR (b)** `git symbolic-ref -q HEAD` succeeds (exit 0) but `git rev-parse --verify -q HEAD^{commit}` fails AND the resolved branch ref name itself (`git rev-parse --verify -q <resolved-ref-name>`, no `^{commit}`) exits 0 — i.e. HEAD is genuinely symbolic and points at a branch ref that exists, but that ref's stored value does not name a real commit object (§9's "corrupt HEAD" case; distinguished from the unborn case, where the same ref-name check exits 1) — **OR (c)** HEAD is direct/detached (`symbolic-ref -q HEAD` exits 1) but `git rev-parse --verify -q HEAD^{commit}` also fails (a detached HEAD pointing at a non-existent object). These three conditions are the exact, complete trigger set §9 defines; there is no fourth, undocumented path to this code | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
 | `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify --end-of-options <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
 | `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis |
-| `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line, or a path that is not valid UTF-8 — §13) | Exceptional — this should be unreachable against a conforming Git version and well-formed repository content; exists so a genuinely unexpected format change (or a non-UTF-8 path, §13) fails loudly and specifically rather than silently misparsing |
+| `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line, a path that is not valid UTF-8, or — corrected, Round 10 review finding #1 — any Category 2 repository-controlled textual value (a ref/branch name, `config --get`/`--get-all` value, `--show-toplevel`/`--git-dir`/`--git-common-dir` output) that is not valid UTF-8 — §13) | Exceptional — this should be unreachable against a conforming Git version and well-formed repository content; exists so a genuinely unexpected format change, a non-UTF-8 path, or a non-UTF-8 ref/branch/config-derived textual value (§13) fails loudly and specifically rather than silently misparsing or substituting U+FFFD |
 
 **`matchProtectedPaths`'s own error-shaped handling (§7a is the single
 authoritative signature; restated here only for the rationale, not a
@@ -3186,16 +3280,26 @@ in-process mechanism this helper itself performs.
   §13's path-byte-semantics contract forbids, and it happens one layer
   below where any downstream strict-decode check (`TextDecoder({fatal:
   true})`) could ever detect or reject it. Every BR3 `execFile` call
-  therefore requests raw `Buffer` output unconditionally — including
-  calls whose output is guaranteed ASCII (SHAs, `true`/`false`,
-  `--is-bare-repository`'s output, etc.), where decoding the resulting
-  buffer via a plain, non-strict `Buffer.prototype.toString("utf-8")`
-  afterward is always exact and lossless (ASCII is a strict subset of
-  UTF-8) — for uniformity of the shared helper's contract, not because
-  those specific calls are at risk. Only the path-bearing calls
-  (`inspectWorkingTree`, `inspectDiff`) actually exercise the
-  strict-decode failure path (§13); see §13 for the full byte-first
-  parsing pipeline this option exists to enable.
+  therefore requests raw `Buffer` output unconditionally — **corrected,
+  Round 10 review finding #1: this is not merely "for uniformity" while
+  only path-bearing calls are actually at risk** — an earlier draft of
+  this bullet claimed ref names, `--show-toplevel`/`--git-dir` output,
+  and similar plumbing values are "guaranteed ASCII," which is false:
+  Git genuinely permits non-UTF-8 bytes in a ref name (verified directly
+  against Git 2.47.3 — a ref name containing raw byte `0xFF` is accepted
+  by `check-ref-format`, created via `update-ref`, and successfully
+  resolved via `symbolic-ref`/`rev-parse`). §13's byte-semantics
+  subsection now defines the complete two-category contract (fixed
+  machine tokens — SHAs, `true`/`false`, `sha1`, status letters — vs.
+  repository-controlled text — ref names, branch names, `config
+  --get`/`--get-all` values, `--show-toplevel`/`--git-dir`/
+  `--git-common-dir` output, and every other repository/config-controlled
+  textual identifier BR3's API exposes) — Category 2 outputs require the
+  identical strict `TextDecoder({fatal: true})` decode §13 already
+  applies to working-tree/diff paths, never a plain
+  `Buffer.prototype.toString("utf-8")` assumption. See §13 for the
+  complete byte-first parsing pipeline and the full category
+  definitions.
 - **No command-string construction, ever, anywhere in `packages/core/src/git/`.**
   Every Git invocation is `execFile(<resolvedAbsoluteGitPath>,
   [<literal subcommand>, <literal flags>, ...<validated arguments>],
@@ -3289,8 +3393,10 @@ in-process mechanism this helper itself performs.
     suppressed this via unconditional `-c filter.<name>.clean=`/`-c
     filter.<name>.process=` overrides — **that design is withdrawn in
     this round, because it is not, in general, semantics-preserving, and
-    BR3 must never report a working-tree/diff fact it cannot stand
-    behind as true:**
+    BR3 must never report a working-tree fact it cannot stand behind as
+    true (this hazard is specific to `inspectWorkingTree`'s `status`
+    invocation — `inspectDiff` is unaffected, per §13's independence
+    correction, Round 9 review finding #5):**
     1. **A clean filter can define a path's canonical committed
        representation.** Git's `clean` filter transforms working-tree
        content into the form that gets compared against (and, on commit,
@@ -3323,11 +3429,15 @@ in-process mechanism this helper itself performs.
        drivers specifically) — are unacceptable for a tool whose entire
        purpose (§2) is *trustworthy* fact-gathering. BR3 cannot claim
        simultaneously that it (a) never executes an arbitrary external
-       filter helper and (b) always returns faithful working-tree/diff
-       facts — for a repository with a real, active clean/process filter,
-       these two guarantees are in direct tension, and §6's "never
-       executes arbitrary external code" guarantee wins: BR3 refuses
-       rather than fabricates.
+       filter helper and (b) always returns faithful working-tree facts
+       — for a repository with a real, active clean/process filter,
+       these two guarantees are in direct tension for `status`
+       specifically (never for `diff` — §13's independence correction,
+       Round 9 review finding #5, establishes `inspectDiff`'s
+       commit-vs-commit invocation performs no working-tree content
+       canonicalization and has no such tension to resolve), and §6's
+       "never executes arbitrary external code" guarantee wins: BR3
+       refuses `inspectWorkingTree` rather than fabricates.
     - **Round 6's config-enumeration discovery has its own blind spot —
       corrected, Round 7 review finding #4.** Round 6 of this
       specification discovered configured filter drivers via `git config
@@ -3561,14 +3671,78 @@ in-process mechanism this helper itself performs.
       non-executing attribute-resolution query, by Git's own design)
       ever triggers the filter itself — a content filter is only ever
       reachable through an actual content-comparison operation
-      (`status`/`diff`/`checkout`), none of which run before the refusal
-      is decided.
-    - **Caching:** implementation may perform this discovery once per
-      `resolveRepository`-validated `projectRoot` (tracked-path/attribute
-      configuration is not expected to change mid-call) rather than once
-      per `status`/`diff` call — this is an internal implementation
-      choice, not a caller-visible contract, exactly mirroring Round 5's
-      identical caching note for the (withdrawn) suppression mechanism.
+      (`status` — never `diff`/`checkout`, per §13's independence
+      correction, Round 9 review finding #5), which does not run before
+      the refusal is decided.
+    - **No cross-call caching — corrected, mandatory, Round 10 review
+      finding #3 (a real safety defect in the previous "cache once per
+      `resolveRepository`-validated `projectRoot`" framing, not merely
+      an internal-implementation nicety).** An earlier draft of this
+      bullet permitted the effective-filter-attribute scan's result to
+      be cached once per `resolveRepository`-validated `projectRoot` and
+      reused across separate, later `inspectWorkingTree` calls against
+      that same `projectRoot`, describing this as "an internal
+      implementation choice, not a caller-visible contract." **This is
+      unsafe and is withdrawn entirely — it is not a permissible
+      implementation choice.** Consider: `inspectWorkingTree` call 1
+      runs the scan, finds no active `filter` attribute, and (under the
+      withdrawn caching permission) records this as a cached "safe"
+      result; between call 1 and a later call 2 against the identical
+      `projectRoot`, `.gitattributes` is legitimately edited (by the
+      user, by another process, by a prior BR3 caller's own unrelated
+      work) to declare an active filter attribute; call 2, if it trusted
+      the stale cached result instead of scanning fresh, would proceed
+      directly to `status` **without** ever re-running `check-attr` —
+      running `status` against a repository state BR3's own scan was
+      never actually run against, precisely the "BR3 executes an
+      external content filter it specifically promised never to
+      execute" outcome this entire mechanism exists to prevent. **The
+      corrected, mandatory contract: `inspectWorkingTree` performs a
+      fresh, complete recursive effective-filter-attribute scan on
+      *every* top-level `inspectWorkingTree` call, unconditionally, with
+      no result ever reused across two separate top-level calls** —
+      implementation may share/memoize data *within* the scope of one
+      single `inspectWorkingTree` call (e.g. reusing the same submodule
+      enumeration pass for both filter discovery and `SubmoduleState`
+      reasoning within that one call, §18's existing "single, shared
+      primitive" principle), but must never persist or reuse a
+      filter-scan verdict from one call into a subsequent, separate
+      call, regardless of how little wall-clock time has elapsed between
+      them.
+    - **Concurrency/TOCTOU boundary — new, explicit, mandatory, Round 10
+      review finding #3 (this specification does not claim a stronger
+      guarantee than the mechanism can actually provide).** Even within
+      one single `inspectWorkingTree` call, there is an unavoidable
+      check-then-run boundary between the `check-attr` scan (one Git
+      subprocess) and the subsequent `status` invocation (a second,
+      separate Git subprocess) — two genuinely distinct OS processes,
+      not one atomic operation. **BR3 inspection assumes the repository/
+      index/working-tree configuration relevant to one inspection call
+      is not concurrently mutated during that call** — an explicit,
+      stated scope boundary, not an unstated assumption: BR3 does not
+      claim, and cannot mechanically enforce, an atomic filesystem
+      snapshot across the two separate Git processes one
+      `inspectWorkingTree` call spawns. Under a repository that is
+      genuinely stable for the duration of one call (the ordinary case,
+      and the only case this specification's guarantees are scoped to),
+      the `check-attr` scan's "no active filter" finding remains valid
+      by the time `status` itself runs, immediately afterward, within
+      the same call. A repository whose relevant configuration is
+      deliberately or adversarially mutated **during** the brief window
+      between those two specific subprocesses — a genuinely narrow race,
+      not the ordinary cross-call staleness case the caching correction
+      above already closes — is **out of scope for BR3 v0.1's
+      guarantee**; closing that narrower race would require an
+      atomic/sandboxed inspection mechanism (e.g. a filesystem snapshot,
+      a lock held across both subprocesses) that is explicitly deferred
+      to a future phase, should a concrete, adversarial-concurrent-mutation
+      threat model ever require it (§26). This is a deliberately honest,
+      narrower claim than "BR3 never executes an arbitrary content
+      filter, under any circumstance whatsoever" — the claim this
+      specification actually makes and can actually stand behind is "BR3
+      never executes an arbitrary content filter against a repository
+      that is not being concurrently, adversarially mutated during the
+      single inspection call in question."
 - **Initialized-submodule enumeration — corrected mechanism, Round 6
   review finding #2: `git submodule status --recursive` is withdrawn.**
   Round 5 of this specification enumerated initialized submodules
@@ -4000,72 +4174,104 @@ includes, unconditionally:
      prefix strip has no such maintenance burden and no such gap, on
      either platform.
   2a. **Normalize the effective `PATH` key to exactly one, deterministic
-     entry, via one exact, documented selection rule — corrected,
-     mandatory, Round 9 review finding #3C (an earlier draft left the
-     selection among multiple case variants as "implementation's
-     choice," which is not an implementation-grade deterministic
-     contract — two conforming implementations could each pick a
-     different variant and therefore resolve a different Git executable
-     from the identical parent environment).** Node documents special
-     handling when a supplied `env` object contains multiple case
-     variants of the same logical variable (e.g. both `PATH` and
-     `Path`) — only one case-insensitive match is actually passed
-     through to the subprocess, selected according to Node's own
-     internal key-handling behavior, which BR3 does not control and must
-     not rely on implicitly. Since §8's in-process executable-resolution
-     mechanism (the "Git Capability Floor" subsection, Round 8 review
-     finding #2) depends on walking the effective `PATH` value BR3
-     itself will hand to `execFile`, an ambiguous, multi-cased `PATH`
-     input would make resolution and actual subprocess execution
-     potentially disagree about which `PATH` value is in effect. **The
-     exact, deterministic selection rule:**
-     - **Collect every key in `process.env` whose uppercase form equals
-       `PATH`** (i.e. `k.toUpperCase() === "PATH"` — this correctly
-       matches `PATH`, `Path`, `path`, or any other casing, on every
-       platform; on POSIX, where environment variable names are
-       case-sensitive, this is a no-op in the overwhelmingly common case
-       where only `PATH` itself is present, and remains correct/harmless
-       in the rare case a POSIX environment happens to define a
-       differently-cased variable that is not, semantically, the same
-       thing Windows treats it as).
-     - **If zero such keys exist:** no `PATH` value is present at all;
-       BR3's constructed environment likewise has none (executable
-       resolution against an empty/absent `PATH` fails deterministically
-       — see below).
-     - **If exactly one such key exists:** its value is the selected
-       `PATH` value — no ambiguity to resolve.
-     - **If multiple such keys exist** (the ambiguous case this
-       correction addresses): **sort the matching key names ordinally
+     entry, via one exact, documented, PLATFORM-SPECIFIC selection rule
+     — corrected again, mandatory, Round 10 review finding #2 (Round 9's
+     rule, `k.toUpperCase() === "PATH"` applied uniformly on every
+     platform, is itself wrong on POSIX — a genuine regression this
+     round removes, not merely an incomplete edge case).** Round 9
+     correctly identified that leaving PATH-key selection as
+     "implementation's choice" was non-deterministic, but its fix
+     introduced a **new, different** bug: on POSIX, environment variable
+     names are **case-sensitive** — `PATH`, `Path`, and `path` are three
+     genuinely **distinct** environment variables, not case variants of
+     one logical variable, and a `k.toUpperCase() === "PATH"` match
+     would incorrectly treat a POSIX process's own, deliberately
+     distinct `Path` variable (which has no special meaning to the OS's
+     executable-search behavior at all) as if it were `PATH` itself.
+     **Verified directly**, Node 22.16.0 on Linux, with `PATH` absent
+     from the environment and `Path=/tmp/fake` present (where
+     `/tmp/fake/git` is a fake, distinguishable executable): a real
+     `execFile("git", ..., { env })` call does **not** execute
+     `/tmp/fake/git` — Node/the OS's own ordinary POSIX executable-search
+     behavior against this `env` object finds the real system `git`
+     instead, `Path` having no bearing on the search at all. **Round 9's
+     rule would have instead promoted `Path=/tmp/fake` into a
+     constructed, canonical `PATH=/tmp/fake` and resolved a genuinely
+     different Git executable than the one Node/the OS itself would
+     actually invoke** — directly violating this specification's own
+     stated guarantee that in-process resolution uses the identical
+     effective executable-search semantics the child process itself
+     uses (§8). **The corrected, platform-specific contract:**
+     - **On POSIX** (`os.platform()` not `"win32"`): **only the exact
+       key `"PATH"` (uppercase, no case-folding at all) is the process
+       search path.** `Path`, `path`, `PaTh`, or any other differently-cased
+       key present in `process.env` is treated as an ordinary,
+       unrelated environment variable — **never** promoted into, merged
+       with, or treated as an alternate spelling of `PATH`. If `PATH`
+       (that exact key) is present, its value is used, verbatim, as the
+       effective search path. **If `PATH` is absent entirely** (the
+       `/tmp/fake` reproduction's actual precondition), BR3's resolution
+       mirrors Node/POSIX's own documented behavior for an `env` object
+       lacking `PATH` — **an absent `PATH` is not silently treated as
+       equivalent to an empty search path BR3 invents its own default
+       for**; resolution fails to find any candidate (since there is
+       nothing to search) and produces `GIT_EXECUTABLE_UNAVAILABLE`,
+       exactly mirroring what the real `execFile` call itself would
+       encounter under the identical, `PATH`-absent environment — BR3
+       does not attempt to invent a different, more permissive search
+       behavior than the child process it is about to spawn would
+       itself exhibit. No other key is ever considered "the" `PATH` on
+       POSIX, regardless of case.
+     - **On Windows** (`os.platform() === "win32"`): environment
+       variable names are genuinely case-insensitive at the OS level —
+       `PATH`/`Path`/`path` **are** the identical logical variable, and
+       Windows/Node's own env-object handling can pass through an
+       ambiguous, arbitrary case-insensitive match when multiple
+       differently-cased keys are present in a supplied `env` object
+       (Node's own documented behavior). Here, and **only** here,
+       collapse every key whose uppercase form equals `PATH` to one,
+       deterministic value: **sort the matching key names ordinally
        (plain `<`/`>` JS string comparison, never locale-aware — the
        identical determinism discipline §7a's canonical-sort mechanism
        already establishes elsewhere in this specification) and select
-       the value belonging to the ordinally-**first** key name.** This
-       is an arbitrary-but-fixed, fully deterministic tiebreak — its
-       specific choice (first-ordinal rather than last, or any other
-       fixed rule) is far less important than that it is **exactly one,
-       documented rule every conforming implementation applies
-       identically**, so two conforming implementations facing the
-       identical multi-cased parent environment always select the
-       identical `PATH` value and therefore always resolve the identical
-       Git executable.
-     - **The selected value is written into BR3's constructed
-       environment under exactly one canonical key, `PATH` (uppercase,
-       matching Node's own convention on every platform), and every
-       other case variant is removed from the constructed environment
-       object entirely** — so the object BR3 builds contains exactly one
-       `PATH`-family key, never two ambiguous ones, and this identical,
-       single, canonical value is what both §8's in-process
-       executable-resolution mechanism reads and what is passed to
-       `execFile` — the two are read from the same constructed object
-       and can never diverge.
-     - **POSIX semantics are preserved exactly, not accidentally
-       altered:** this rule never promotes a distinct, deliberately
-       differently-cased POSIX variable into `PATH` unless that variable
-       already satisfied `k.toUpperCase() === "PATH"` (which, for an
-       ordinary POSIX environment defining only `PATH` itself, is simply
-       `PATH` matching itself) — this is a disambiguation rule for a
-       genuinely ambiguous multi-key input, not a POSIX-to-Windows
-       behavior change.
+       the value belonging to the ordinally-first key name** — an
+       arbitrary-but-fixed, fully deterministic tiebreak; its specific
+       choice matters less than that it is one documented rule every
+       conforming implementation applies identically, so two conforming
+       implementations facing the identical multi-cased Windows
+       environment always resolve the identical Git executable.
+     - **In both cases, the selected value (or its absence, on POSIX) is
+       written into BR3's constructed environment under exactly one
+       canonical key, `PATH`** (matching Node's own convention), **and,
+       on Windows only, every other case variant is removed from the
+       constructed environment object** (on POSIX, a differently-cased
+       key like `Path` is never touched or removed at all — it is an
+       unrelated variable, left exactly as `process.env` supplied it,
+       since stripping it would itself be an unwarranted, undocumented
+       behavior change to a variable BR3 has no reason to treat
+       specially). This identical, single, canonical `PATH` value (or
+       its absence) is what both §8's in-process executable-resolution
+       mechanism reads and what is passed to `execFile` — the two are
+       read from the same constructed object and can never diverge.
+     - **`GIT_*`-prefix stripping remains case-insensitive on every
+       platform, unaffected by this correction — clarified, Round 10
+       review finding #2 (do not read this bullet's POSIX-`PATH`-exactness
+       rule as implying environment variable names are case-insensitive
+       generally, or that the `GIT_*` strip should therefore be
+       narrowed).** The `GIT_*` case-insensitive strip (step 2, above)
+       is a **deliberate, conservative safety choice**, chosen because
+       stripping a POSIX variable that merely *happens* to be named
+       `git_dir` has no downside (BR3 never needs to read or preserve an
+       inherited `GIT_*`-shaped variable under any casing, so
+       over-stripping costs nothing) — it is not evidence that POSIX
+       environment variable names are case-insensitive, and it does not
+       imply the `PATH`-key selection rule above should also fold case
+       on POSIX. The two rules are independently justified: the `GIT_*`
+       strip errs toward stripping more (safe, since nothing of value is
+       lost), while `PATH` selection on POSIX must be **exact**, because
+       treating an unrelated `Path` variable as `PATH` would select a
+       genuinely different, potentially attacker-controlled executable
+       search path — the opposite of conservative.
   3. **Explicitly re-add only the specific `GIT_*` variables BR3 itself
      sets and controls**, listed individually below — never restoring any
      of the stripped, inherited values, and **added in exactly one
@@ -4439,17 +4645,24 @@ includes, unconditionally:
   local configuration).
 - **`git status`'s exact flag set is `--porcelain=v2 -z --find-renames=50%
   --untracked-files=all --ignore-submodules=none`, always together, never
-  a subset, always preceded by the mandatory `-c core.fsmonitor=`
-  override (§11, §18, Round 4 review finding #3) — and only ever run at
-  all once BR3's effective-filter-attribute scan (`git check-attr --stdin
-  -z filter` over every relevant tracked path, superproject and every
-  initialized submodule recursively — §18, Round 6 review finding #1,
-  detection mechanism corrected Round 7 review finding #4) has confirmed
-  no path in scope has an active `filter` attribute; a discovered active
-  attribute produces `EXTERNAL_GIT_FILTER_UNSUPPORTED` instead, before
-  this invocation ever runs (§17, §18)** (§11 — restated here so this
-  section, §11, §20, and §27 all name the identical command with no drift
-  between them).
+  a subset, always preceded by the mandatory `-c core.fsmonitor=` **and**
+  `-c status.renameLimit=0` overrides (§11, §18, Round 4 review finding
+  #3; `-c status.renameLimit=0` added, Round 9 review finding #1 —
+  **corrected here, Round 10 review finding #4: an earlier draft of this
+  exact bullet restated only `-c core.fsmonitor=` and silently omitted
+  `-c status.renameLimit=0`, contradicting §11's own, already-corrected
+  exact command**) — and only ever run at all once BR3's
+  effective-filter-attribute scan (`git check-attr --stdin -z filter`
+  over every relevant tracked path, superproject and every initialized
+  submodule recursively — §18, Round 6 review finding #1, detection
+  mechanism corrected Round 7 review finding #4) has confirmed no path in
+  scope has an active `filter` attribute; a discovered active attribute
+  produces `EXTERNAL_GIT_FILTER_UNSUPPORTED` instead, before this
+  invocation ever runs (§17, §18)** (§11 — restated here so this
+  section, §11, §20, and §27 all name the identical command, `git -c
+  core.fsmonitor= -c status.renameLimit=0 status --porcelain=v2 -z
+  --find-renames=50% --untracked-files=all --ignore-submodules=none`,
+  with no drift between them).
 - **No reliance on Git aliases:** every BR3 Git invocation uses a
   first-argument literal plumbing/porcelain subcommand name
   (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`, `ls-files`,
@@ -4715,24 +4928,57 @@ current validation algorithm)**
       proving the `.cmd`/`.bat`-rejection path is a deliberate case of
       the same "no usable Git executable" contract, not an
       undifferentiated crash or a silently-different error shape.
-  - **PATH key selection is exact and deterministic — new, mandatory,
-    Round 9 review finding #3C:** a test-constructed `process.env`-shaped
-    object containing three case variants of the same logical `PATH` key
-    (e.g. `PATH`, `Path`, `path`, each with a genuinely different value)
-    → asserts BR3's constructed environment contains exactly the value
-    belonging to the ordinally-first key name among the matching keys
-    (per §19's documented selection rule), under exactly one canonical
-    `PATH` key, with every other case variant entirely absent from the
-    constructed object — proving the selection is a fixed, documented
-    rule, not an unspecified "whichever Node happens to pick."
+  - **PATH key selection is exact, deterministic, AND platform-specific
+    — corrected, mandatory, Round 10 review finding #2 (Round 9's
+    uniform-on-every-platform rule was itself wrong on POSIX):**
+    - **(A) POSIX: `PATH` and a differently-cased `Path` are genuinely
+      distinct variables — the resolver uses `PATH` only** (a
+      test-constructed `process.env`-shaped object with `PATH=<dir A>`
+      and, separately, `Path=<dir B>`, both genuinely present, on a
+      simulated/actual POSIX platform) → asserts BR3's constructed
+      environment and in-process resolution both use `<dir A>`'s value
+      exclusively — `Path`'s value never consulted, never merged in,
+      never promoted into the canonical `PATH` key — proving `Path` is
+      treated as an ordinary, unrelated environment variable on POSIX,
+      not a case variant.
+    - **(B) POSIX: an absent `PATH` is not filled in from a differently-cased
+      variable** (`PATH` genuinely absent from `process.env`;
+      `Path=<a fake Git directory>` present) → asserts BR3's resolution
+      does **not** promote `Path`'s value into `PATH` and does **not**
+      resolve the fake executable at that fake directory — first
+      confirmed, in the test's own setup (mirroring the reviewer's own
+      verified reproduction), that a real `execFile("git", ..., { env
+      })` call under this exact `env` object does not execute the fake
+      `/tmp/fake/git` either, establishing BR3's resolution must match
+      that real, observed behavior, not invent a more permissive one.
+    - **(C) Windows: `PATH`/`Path`/`path` variants collapse per the
+      exact documented rule** (a test-constructed `process.env`-shaped
+      object with three case variants, each a genuinely different
+      value, on a simulated/actual Windows platform) → asserts the
+      selected value is exactly the one belonging to the
+      ordinally-first key name among the matching keys, under exactly
+      one canonical `PATH` key, with every other case variant entirely
+      absent from the constructed object — proving Windows collapsing
+      remains a fixed, documented rule, not an unspecified "whichever
+      Node happens to pick," while confirming this collapsing behavior
+      is genuinely gated on the Windows branch only (case (A)/(B) above
+      prove it does *not* fire on POSIX).
+    - **(D) The resolved executable used for `--version` and every
+      later command remains identical within one top-level operation**
+      — re-asserting, under this corrected platform-specific PATH
+      selection, the same single-resolution-reused-everywhere guarantee
+      §8/§18 already establish (Round 8/9's executable-identity
+      binding) — proving the PATH-selection correction composes
+      correctly with, and does not regress, that existing guarantee.
   - **Windows environment-key casing during resolution, where testable**
     (on a Windows test runner, or via a focused unit test against the
     resolution function's own Windows-specific branch, independent of
     the actual test-runner OS) — confirms resolution reads whichever
     `PATH`/`Path`/`path` casing is actually present in the sanitized
-    child environment (per §19's Windows-casing correction, and per
-    §19's now-exact `PATH`-key-selection rule above, since resolution
-    must read the identical, already-normalized single `PATH` value
+    child environment, **on Windows only** (per §19's Windows-casing
+    correction, and per §19's now-platform-specific `PATH`-key-selection
+    rule above, since resolution must read the identical, already-normalized
+    single `PATH` value
     §19's environment construction produces, never re-derive its own,
     separate answer to "which case variant wins").
 
@@ -4942,6 +5188,48 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   that the identical revision expression **without** `--end-of-options`
   fails against this exact fixture (establishing the hazard is real, not
   hypothetical), then that `inspectHead` itself succeeds
+- **Unicode branch name round-trips exactly — mandatory, new, Round 10
+  review finding #1** (a real fixture repository with `HEAD` pointing at
+  a branch literally named `café`, constructed via a plumbing/manual
+  mechanism, e.g. `git symbolic-ref HEAD 'refs/heads/café'` plus a
+  corresponding commit) → `inspectHead` succeeds, `branch` reports the
+  exact string `"café"`, losslessly round-tripped through the strict
+  UTF-8 decode (§13 Category 2) — proving non-ASCII, valid-UTF-8 branch
+  names are fully supported, not merely tolerated.
+- **Invalid-UTF-8 branch/ref name → `MALFORMED_GIT_OUTPUT` — mandatory,
+  new, Round 10 review finding #1** (the verified reproduction: a ref
+  name containing the raw byte `0xFF`, constructed via Node's
+  `Buffer`-based `fs`/direct ref-file-writing APIs bypassing the shell —
+  practical on the Linux/macOS filesystems this test suite targets —
+  confirmed, in the test's own setup, that Git itself genuinely accepts
+  and resolves this ref: `git check-ref-format` accepts it, `git
+  update-ref` creates it, `git symbolic-ref` points `HEAD` at it, and
+  both `git symbolic-ref -q HEAD` and `git rev-parse --verify -q
+  HEAD^{commit}` succeed against it) → `inspectHead` returns
+  `MALFORMED_GIT_OUTPUT`, never a JS string containing a U+FFFD
+  replacement character presented as if it were the real branch name,
+  and never a raw/uncaught decoding exception — proving BR3 does not
+  silently corrupt or misreport a non-UTF-8 ref name Git itself
+  genuinely resolves.
+- **Strict decoding for repository-controlled upstream/config
+  identifiers — mandatory, new, Round 10 review finding #1** (a fixture
+  with a genuinely non-UTF-8 `branch.<branch>.remote` or
+  `branch.<branch>.merge` config value, constructed by writing
+  `.git/config` directly with raw bytes rather than through `git
+  config`'s own value-quoting, if constructible; otherwise a focused
+  unit test against the Category 2 decode step directly, using a
+  synthetic non-UTF-8 byte buffer standing in for a `config --get`/
+  `--get-all` result) → `MALFORMED_GIT_OUTPUT`, proving `UpstreamInfo.remote`/
+  `.branch` are genuinely strict-decoded, not merely documented as such.
+- **Fixed ASCII machine tokens remain validated separately from Category
+  2 text — mandatory, new, Round 10 review finding #1** (a focused unit
+  test asserting `--is-bare-repository`'s `true`/`false` output,
+  `--show-object-format`'s `sha1`/`sha256` output, and a resolved commit
+  SHA are each validated against their own fixed, exact grammar — e.g. a
+  SHA failing `/^[0-9a-f]{40}$/` produces `MALFORMED_GIT_OUTPUT` — rather
+  than passing through the Category 2 strict-UTF-8-decode path at all)
+  → proving Category 1 and Category 2 are genuinely two distinct
+  validation mechanisms, not the same mechanism applied inconsistently.
 - No network operation occurs during any BR3 test (asserted structurally,
   e.g. by running in an environment with no network access, or by
   confirming no test ever configures a real, reachable remote URL)
@@ -5251,20 +5539,29 @@ signature, corrects Round 1 review finding #4**
   pure optimization hook that cannot alter clean/modified semantics.
 - **External content-filter refusal — corrected mechanism, mandatory,
   Round 6 review finding #1, detection mechanism corrected Round 7 review
-  finding #4 (supersedes Round 4/5's suppression-based tests for
-  `filter.<driver>.clean`/`.process`; withdrawn suppression behavior must
-  not reappear; supersedes reliance on config-enumeration alone, proven
-  insufficient by case D below):**
-  - **(A) Ordinary external clean filter → typed refusal, marker never
-    executed:** configure a fixture repository with a `.gitattributes`
-    rule assigning a `filter=<name>` attribute to a path, and
-    `filter.<name>.clean` pointing at a real, marker-writing script (no
-    `required` key set). Call `resolveRepository`/`inspectWorkingTree`
-    against that fixture and assert: (i) the result is
+  finding #4, ownership scoped to `inspectWorkingTree` exclusively Round
+  10 review finding #3 (supersedes Round 4/5's suppression-based tests
+  for `filter.<driver>.clean`/`.process`; withdrawn suppression behavior
+  must not reappear; supersedes reliance on config-enumeration alone,
+  proven insufficient by case D below):**
+  - **(A) Ordinary external clean filter → `resolveRepository` succeeds,
+    `inspectWorkingTree` refuses, marker never executed — ownership
+    corrected, Round 10 review finding #3:** configure a fixture
+    repository with a `.gitattributes` rule assigning a `filter=<name>`
+    attribute to a path, and `filter.<name>.clean` pointing at a real,
+    marker-writing script (no `required` key set). Assert: (i)
+    `resolveRepository(projectRoot)` **succeeds** — a filter attribute
+    is not a repository-validity concern, and `resolveRepository` never
+    performs the effective-filter-attribute scan at all; (ii) calling
+    `inspectWorkingTree(projectRoot)` against the same fixture produces
     `EXTERNAL_GIT_FILTER_UNSUPPORTED` (§17), naming the affected path(s)
-    in `details`; (ii) the marker file was **not** created — proving BR3
-    never ran `git status`/`git diff` at all for this repository, not
-    merely that it ran them with the filter suppressed.
+    in `details`; (iii) the marker file was **not** created — proving
+    BR3 never ran `git status` at all for this repository, not merely
+    that it ran it with the filter suppressed. This is the corrected,
+    two-step assertion pattern every case below follows: `resolveRepository`
+    succeeds, `inspectWorkingTree` alone refuses — never a joint
+    `resolveRepository`/`inspectWorkingTree` claim implying both
+    functions own the refusal.
   - **(B) `filter.<driver>.required = true` → identical deterministic
     refusal, never a raw/undifferentiated Git failure:** identical setup
     to (A), plus `filter.<name>.required = true`. Assert the result is
@@ -5296,22 +5593,23 @@ signature, corrects Round 1 review finding #4**
     sanitized (`GIT_CONFIG_GLOBAL=<null device>`) environment genuinely
     finds **zero** matches for this fixture (establishing that
     config-enumeration alone would incorrectly conclude "no filter,
-    proceed" — the exact gap this round closes). Then call
-    `resolveRepository`/`inspectWorkingTree` and assert:
-    `EXTERNAL_GIT_FILTER_UNSUPPORTED` is still produced, and the marker
-    script is **not** executed — proving the `check-attr`-based
-    effective-attribute scan catches this case where config-enumeration
-    alone would not.
+    proceed" — the exact gap this round closes). Then assert
+    `resolveRepository(projectRoot)` succeeds, and calling
+    `inspectWorkingTree(projectRoot)`: `EXTERNAL_GIT_FILTER_UNSUPPORTED`
+    is produced, and the marker script is **not** executed — proving the
+    `check-attr`-based effective-attribute scan catches this case where
+    config-enumeration alone would not.
   - **(E) Marker proves the filter never executes, including via the
     check-attr scan itself:** across every fixture above, assert the
-    marker file is never created at any point during the entire
-    `resolveRepository`/`inspectWorkingTree` call sequence (the only two
-    functions the effective-filter-attribute scan gates — Round 9 review
-    finding #5) — including confirming `check-attr --stdin -z filter`
-    itself, run directly against a filter-attributed path in isolation,
-    does not trigger the marker (proving `check-attr` is genuinely
-    non-executing, not merely "didn't happen to trigger it in these
-    particular fixtures").
+    marker file is never created at any point during
+    `resolveRepository`'s validation or `inspectWorkingTree`'s inspection
+    (`inspectWorkingTree` being the **only** function the
+    effective-filter-attribute scan gates — Round 9 review finding #5,
+    ownership made exclusive Round 10 review finding #3) — including
+    confirming `check-attr --stdin -z filter` itself, run directly
+    against a filter-attributed path in isolation, does not trigger the
+    marker (proving `check-attr` is genuinely non-executing, not merely
+    "didn't happen to trigger it in these particular fixtures").
   - **(F) First-level submodule attribute → refusal:** a superproject
     with one initialized submodule; the submodule's **own**
     `.gitattributes` (verified set inside the submodule's own checkout,
@@ -5335,9 +5633,12 @@ signature, corrects Round 1 review finding #4**
     fixture with zero `filter`-attributed tracked paths anywhere
     (superproject and any initialized submodules) →
     `resolveRepository`/`inspectWorkingTree`/`inspectDiff` all succeed
-    normally, proving the discovery-and-refuse mechanism does not
-    introduce a false-positive refusal for the ordinary, filter-free case
-    that constitutes the overwhelming majority of real repositories.
+    normally (each independently — `resolveRepository` because a filter
+    attribute is never a repository-validity concern; `inspectWorkingTree`
+    because its own scan finds nothing active; `inspectDiff` because it
+    never scans at all), proving the discovery-and-refuse mechanism does
+    not introduce a false-positive refusal for the ordinary, filter-free
+    case that constitutes the overwhelming majority of real repositories.
   - **(I) `inspectDiff` is genuinely independent of current working-tree/
     index/`.gitattributes` state — mandatory, new, Round 9 review finding
     #5:** a fixture with two real, existing commits `A`/`B`, and a
@@ -5356,6 +5657,32 @@ signature, corrects Round 1 review finding #4**
     -l0` invocation → the marker is **never** created, confirming
     `--no-ext-diff`/`--name-status` genuinely prevent this specific
     invocation from invoking a configured `textconv` helper.
+  - **(J) Per-function ownership, explicit cross-check on one shared
+    filter-configured fixture — mandatory, new, Round 10 review finding
+    #3:** against **one single fixture** (a repository with a real,
+    active `filter=<name>` attribute and a real, marker-writing clean
+    driver, plus two real, existing commits `A`/`B` unaffected by that
+    attribute's presence) — `resolveRepository(projectRoot)` →
+    **succeeds** (the repository is otherwise structurally valid;
+    `resolveRepository` never inspects filter attributes at all);
+    `inspectWorkingTree(projectRoot)` → `EXTERNAL_GIT_FILTER_UNSUPPORTED`;
+    `inspectDiff(projectRoot, A, B)` → **succeeds**, with the correct
+    committed diff and the marker never created — proving, on the
+    identical fixture in one test, that exactly one of the three
+    functions owns the refusal, never a pair or all three.
+  - **(K) No cross-call filter-scan caching — mandatory, new, Round 10
+    review finding #3:** call `inspectWorkingTree(projectRoot)` against a
+    fixture with **no** active filter attribute (succeeds normally);
+    then, between that call and a second one, add a `.gitattributes` rule
+    declaring a real, active, marker-writing filter attribute; then call
+    `inspectWorkingTree(projectRoot)` again against the same `projectRoot`
+    → the **second** call produces `EXTERNAL_GIT_FILTER_UNSUPPORTED`,
+    proving the scan is genuinely re-run fresh on every top-level call
+    and that no prior "safe" verdict is cached or reused across the two,
+    separate calls — first confirmed, in the test's own setup, that this
+    sequencing genuinely changes the repository's effective filter
+    configuration between the two calls (not merely two identical calls
+    in a row).
   - **`check-attr` mandatory, never skipped, for `inspectWorkingTree` —
     mandatory, new, Round 8 review finding #6B, scope narrowed Round 9
     review finding #5:** a call-count/invocation assertion on the shared
@@ -5828,17 +6155,25 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   `GIT_NO_LAZY_FETCH` — the last new in Round 5), always added in one
   canonical uppercase form with no case-variant duplicate ever present,
   re-added, `XDG_CONFIG_HOME` overridden to a fresh empty directory (new
-  in Round 4, §19), the effective `PATH` key normalized to exactly one
-  deterministic value even when `process.env` itself contains multiple
-  case variants (new, Round 8 review finding #4), and global
-  (non-repository-local) Git config is neutralized via `GIT_CONFIG_GLOBAL`
-  pointed at a null device — proven by the environment-sanitization
-  regression tests (§20, Round 3 review finding #2: inherited `GIT_DIR`,
-  inherited `GIT_INDEX_FILE`, `GIT_CONFIG_COUNT`-style injection,
-  fabricated global `core.excludesFile`; Round 8 review finding #4:
-  inherited lowercase `git_dir`, inherited mixed-case
-  `Git_Index_File`, and duplicate-cased `PATH`/`Path` normalization —
-  none of which may alter BR3's result or produce an ambiguous effective
+  in Round 4, §19), the effective `PATH` key normalized via one
+  exact, **platform-specific** rule — on POSIX, exactly the key `PATH`,
+  never a differently-cased `Path`/`path` variable, which remains an
+  untouched, unrelated variable; only on Windows are multiple case
+  variants collapsed to one deterministic value (corrected, Round 8
+  review finding #4, made platform-correct Round 10 review finding #2 —
+  Round 8's uniform-case-insensitive rule was itself wrong on POSIX,
+  where it could incorrectly promote an unrelated `Path` variable into
+  the executable search path) — and global (non-repository-local) Git
+  config is neutralized via `GIT_CONFIG_GLOBAL` pointed at a null
+  device — proven by the environment-sanitization regression tests (§20,
+  Round 3 review finding #2: inherited `GIT_DIR`, inherited
+  `GIT_INDEX_FILE`, `GIT_CONFIG_COUNT`-style injection, fabricated
+  global `core.excludesFile`; Round 8 review finding #4: inherited
+  lowercase `git_dir`, inherited mixed-case `Git_Index_File`; Round 10
+  review finding #2: POSIX `PATH`-vs-`Path` exactness, POSIX
+  absent-`PATH`-not-filled-from-`Path`, and Windows
+  duplicate-cased-`PATH` collapsing — none of which may alter BR3's
+  result or produce an ambiguous effective
   `PATH`); **and** an inherited `XDG_CONFIG_HOME`/`$HOME`-fallback-based
   global ignore file and global attributes file are likewise neutralized
   (Round 4 review finding #2), with repository-local `.gitignore`/
@@ -6040,6 +6375,62 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   the marker is never created, and confirming, structurally, that
   `check-attr` is never invoked at all as part of `inspectDiff` (not
   merely that its result happens not to matter) (§13, §18, §20).
+- **Y.** — new, Round 10 review finding #1. Every repository-controlled
+  textual output BR3's public API exposes as a JS string (ref/branch
+  names, `UpstreamInfo.remote`/`.ref`/`.branch`, `RepositoryInfo.root`/
+  `.gitDir`/`.gitCommonDir`, and every other Category 2 value, §13) is
+  decoded via the identical strict `TextDecoder({ fatal: true })`
+  pipeline already established for working-tree/diff paths — never
+  assumed to be "guaranteed ASCII." A valid-UTF-8, non-ASCII value (e.g.
+  a branch named `café`) round-trips exactly; a genuinely non-UTF-8 ref/
+  branch/config value (verified reachable — Git permits raw non-UTF-8
+  bytes in a ref name) produces `MALFORMED_GIT_OUTPUT`, never a silent
+  U+FFFD substitution. Fixed machine tokens (SHAs, `true`/`false`,
+  `sha1`/`sha256`, status letters) remain validated against their own
+  exact, fixed ASCII grammar, a genuinely distinct mechanism from the
+  Category 2 strict decode (§13, §20).
+- **Z.** — new, Round 10 review finding #2. The `PATH`-key-normalization
+  algorithm (§19) is genuinely platform-specific: on POSIX, only the
+  exact key `PATH` is the process search path — a differently-cased
+  `Path`/`path` key is an unrelated, untouched variable, never promoted
+  into `PATH`, and an absent `PATH` is never filled in from one; only on
+  Windows are multiple case-insensitive `PATH`-family keys collapsed to
+  one deterministic value via one exact, documented rule. This corrects
+  Round 9's own, itself-incorrect uniform-case-insensitive-on-every-platform
+  rule, verified to silently promote an unrelated POSIX `Path` variable
+  into the executable search path, contradicting a real `execFile`
+  call's own observed behavior under the identical environment (§8, §19,
+  §20).
+- **AA.** — new, Round 10 review finding #3. The effective-filter-attribute
+  scan is owned by `inspectWorkingTree` exclusively — `resolveRepository`
+  and `inspectHead` never perform it and never return
+  `EXTERNAL_GIT_FILTER_UNSUPPORTED`; `inspectDiff` never performs it and
+  never returns this code for any input. The scan runs fresh,
+  unconditionally, on every top-level `inspectWorkingTree` call, with no
+  result ever cached or reused across two separate calls — proven by a
+  dedicated fixture where an active filter attribute is legitimately
+  added to `.gitattributes` between two `inspectWorkingTree` calls
+  against the identical `projectRoot`, with the second call correctly
+  refusing. This specification explicitly states its concurrency/TOCTOU
+  scope boundary (§6): BR3 assumes the repository's relevant
+  configuration is not concurrently, adversarially mutated during one
+  `inspectWorkingTree` call's own internal `check-attr`-then-`status`
+  subprocess sequence, and does not claim an atomic filesystem snapshot
+  across those two separate Git processes (§6, §18, §20).
+- **AB.** — new, Round 10 review finding #4. Exactly one canonical
+  `status` invocation (`git -c core.fsmonitor= -c status.renameLimit=0
+  status --porcelain=v2 -z --find-renames=50% --untracked-files=all
+  --ignore-submodules=none`) and exactly one canonical `diff` invocation
+  (`git diff --no-color --no-ext-diff -z --name-status
+  --find-renames=<threshold> -l0 <fromSha> <toSha>`) are stated
+  identically everywhere this document names "the exact command" — §11,
+  §13, §19, §20, and §27 no longer contain a stale restatement omitting
+  `-c status.renameLimit=0` or `-l0`; and the command allowlist
+  (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`
+  (`--get`/`--get-all`/`--get-regexp`), `ls-files`, `check-attr`) is
+  stated identically everywhere it appears, with no remaining reference
+  to `config` supporting only `--get`/`--get-regexp` (§11, §13, §19,
+  §20, §27).
 
 ## 20b. Implementation Plan
 
@@ -6261,6 +6652,18 @@ BR3 does not introduce lint tooling.
    real `reftable`-backend fixtures and then remove or relax step 5b's
    rejection — that verification work, not the decision of whether to
    defer it, is what remains deferred here.
+8. **Adversarial-concurrent-mutation-safe content-filter detection.**
+   BR3 v0.1's `EXTERNAL_GIT_FILTER_UNSUPPORTED` guarantee (§6, §18) is
+   explicitly scoped to a repository that is not concurrently,
+   adversarially mutated during one `inspectWorkingTree` call's own
+   internal `check-attr`-then-`status` subprocess sequence — BR3 does not
+   claim an atomic filesystem snapshot across those two separate Git
+   processes. A future phase requiring a guarantee that holds even
+   against a deliberately, concurrently hostile mutator during that
+   narrow window would need an atomic/sandboxed inspection mechanism
+   (e.g. a filesystem snapshot, or a lock held across both subprocesses)
+   this specification does not define — this is a resolved, explicitly
+   stated v0.1 scope boundary, not an unstated gap.
 
 ## 27. Independent Review Requirements
 
@@ -6323,34 +6726,45 @@ The independent reviewer must specifically examine, for BR3:
   operation (`GIT_COMMAND_FAILED`) rather than silently performing an
   on-demand promisor fetch, proven by the dedicated regression test §20
   adds for this round, not merely documented as disabled
-- Whether every BR3 `git status`/`git diff --name-status` invocation
-  genuinely includes the mandatory `-c core.fsmonitor=` override (still a
-  suppression, never a refusal trigger — §18, Round 6 review finding #1
-  explicitly retains this), proven by the dedicated real marker-script
-  regression test §20 adds — not merely documented as suppressed
-- **Withdrawn-mechanism regression check — new, Round 6 review finding
-  #1:** whether `-c filter.<name>.clean=`/`-c filter.<name>.process=`
-  suppressing overrides (Round 4/5's design) are genuinely **absent**
-  from the implementation entirely — confirmed by literally searching the
-  implementation for these exact flag strings, which must not appear
-  anywhere `status`/`diff` argv is constructed — and whether, in their
-  place, effective-filter-attribute detection causes a genuine,
-  deterministic `EXTERNAL_GIT_FILTER_UNSUPPORTED` refusal **before** the
-  corresponding `status`/`diff` invocation ever runs — proven by the
-  dedicated real marker-script regression tests §20 adds (cases A–H),
-  including: an ordinary clean filter (marker never executed, typed
-  refusal returned); a `filter.<driver>.required=true` driver producing
-  the identical typed refusal rather than an undifferentiated
-  `GIT_COMMAND_FAILED`; a `process`-protocol driver; a filter-free
-  repository remaining fully, normally inspectable (no false-positive
-  refusal); and whether an attribute configured solely inside a
-  first-level or nested **initialized** submodule's own `.gitattributes`
-  is discovered and also produces the refusal on the single top-level
-  `status`/`diff` invocation — not merely by the superproject-only case
-  continuing to pass unmodified — and whether an uninitialized submodule
-  is correctly excluded from this enumeration (checked via plain
-  filesystem inspection of the submodule's own `.git` entry, never by
-  initializing it)
+- Whether every BR3 `git status` invocation genuinely includes both the
+  mandatory `-c core.fsmonitor=` override (still a suppression, never a
+  refusal trigger — §18, Round 6 review finding #1 explicitly retains
+  this) and the mandatory `-c status.renameLimit=0` override (§11, Round
+  9 review finding #1, reconciled with §19's own restated exact command
+  Round 10 review finding #4), proven by the dedicated real
+  marker-script and rename-limit regression tests §20 adds — not merely
+  documented
+- **Withdrawn-mechanism regression check, ownership corrected — new,
+  Round 6 review finding #1, ownership made exclusive to
+  `inspectWorkingTree` Round 10 review finding #3:** whether `-c
+  filter.<name>.clean=`/`-c filter.<name>.process=` suppressing overrides
+  (Round 4/5's design) are genuinely **absent** from the implementation
+  entirely — confirmed by literally searching the implementation for
+  these exact flag strings, which must not appear anywhere `status`
+  argv is constructed — and whether, in their place, effective-filter-attribute
+  detection causes a genuine, deterministic `EXTERNAL_GIT_FILTER_UNSUPPORTED`
+  refusal **before** `inspectWorkingTree`'s own `status` invocation ever
+  runs — **never before an `inspectDiff` invocation, which never scans
+  and never returns this code at all** — proven by the dedicated real
+  marker-script regression tests §20 adds (cases A–K), including: an
+  ordinary clean filter (marker never executed, typed refusal returned,
+  with `resolveRepository` on the identical fixture succeeding — case
+  A); a `filter.<driver>.required=true` driver producing the identical
+  typed refusal rather than an undifferentiated `GIT_COMMAND_FAILED`; a
+  `process`-protocol driver; a filter-free repository remaining fully,
+  normally inspectable (no false-positive refusal); whether an attribute
+  configured solely inside a first-level or nested **initialized**
+  submodule's own `.gitattributes` is discovered and also produces the
+  refusal on the single top-level `status` invocation — not merely by
+  the superproject-only case continuing to pass unmodified; whether an
+  uninitialized submodule is correctly excluded from this enumeration
+  (checked via plain filesystem inspection of the submodule's own `.git`
+  entry, never by initializing it); whether `resolveRepository`,
+  `inspectWorkingTree`, and `inspectDiff` each independently produce the
+  correct, function-specific result against one shared filter-configured
+  fixture (case J); and whether the scan is genuinely re-run fresh on
+  every top-level `inspectWorkingTree` call, with no cross-call caching
+  of a prior "safe" verdict (case K)
 - **Global content-filter blind-spot fix — new, mandatory, Round 7 review
   finding #4:** whether BR3's filter-detection mechanism genuinely
   determines repository-*effective* filter-attribute usage — via `git
@@ -6372,9 +6786,10 @@ The independent reviewer must specifically examine, for BR3:
   filter (proven by the marker-writing fixtures showing the marker is
   never created merely from running the attribute check); and that
   `GIT_CONFIG_GLOBAL=<null device>` remains fully in force, unmodified,
-  for the actual `status`/`diff` inspection commands — this correction
-  does not re-enable arbitrary global Git config to make filter
-  discovery possible, it changes what question discovery asks
+  for `inspectWorkingTree`'s actual `status` invocation (and every other
+  BR3 Git invocation) — this correction does not re-enable arbitrary
+  global Git config to make filter discovery possible, it changes what
+  question discovery asks
 - **Filter-discovery contract completeness — new, mandatory, Round 8
   review finding #6:** whether §18's description of `check-attr`'s
   attribute-source behavior is now accurate — stating that `check-attr`
@@ -6390,14 +6805,43 @@ The independent reviewer must specifically examine, for BR3:
   path to skip `check-attr`" language has been fully removed (it was
   circular — "zero active filter attributes" is exactly what `check-attr`
   itself establishes) — proven by the dedicated call-count/invocation
-  test confirming `check-attr` runs unconditionally on every
-  `status`/`diff`-preceding check, including the zero-filter-attribute
-  case; **and** whether the exact NUL-delimited `check-attr --stdin -z
+  test confirming `check-attr` runs unconditionally before every
+  `inspectWorkingTree` call's own `status` invocation, including the
+  zero-filter-attribute case, and genuinely never runs at all for
+  `inspectDiff`; **and** whether the exact NUL-delimited `check-attr --stdin -z
   filter` output shape (`<path>\0filter\0<value>\0` triples per queried
   path, never a flat one-field-per-NUL assumption) is explicitly defined
   and correctly parsed, with the exact inactive-value taxonomy
   (`unspecified`/`unset` = inactive; `set`/any named value = active)
   tested directly, not merely asserted
+- **Filter-scan ownership, caching, and concurrency boundary — new,
+  mandatory, Round 10 review finding #3:** whether the
+  effective-filter-attribute scan is genuinely owned by
+  `inspectWorkingTree` **exclusively** — `resolveRepository` never
+  performs it and never returns `EXTERNAL_GIT_FILTER_UNSUPPORTED` solely
+  because a repository's working tree contains an active filter
+  attribute; `inspectHead` never performs it; `inspectDiff` never
+  performs it and never returns this code for any input — proven by the
+  dedicated cross-function fixture (§20, case J) asserting all three
+  functions' independent, correct results against one shared
+  filter-configured repository; **and** whether the previous, withdrawn
+  "cache the scan result once per `resolveRepository`-validated
+  `projectRoot`" permission has been fully removed — a fresh,
+  unconditional scan runs on **every** top-level `inspectWorkingTree`
+  call, with no result ever reused across two separate calls — proven by
+  the dedicated cross-call fixture (§20, case K), where `.gitattributes`
+  is legitimately changed to add an active filter attribute between two
+  `inspectWorkingTree` calls against the identical `projectRoot`, and the
+  second call correctly refuses rather than trusting a stale, cached
+  "safe" verdict from the first; **and** whether this specification
+  explicitly, honestly states its concurrency/TOCTOU boundary — that BR3
+  assumes the repository/index/working-tree configuration relevant to
+  one `inspectWorkingTree` call is not concurrently, adversarially
+  mutated *during* that one call's own internal
+  `check-attr`-then-`status` subprocess sequence, and does not claim an
+  atomic filesystem snapshot across those two separate Git processes —
+  rather than silently implying a stronger, mechanically unenforceable
+  guarantee
 - **Submodule-enumeration mechanism — new, Round 6 review finding #2:**
   whether initialized-submodule discovery (for filter-driver discovery
   and any other BR3 need) genuinely uses the NUL-safe `git ls-files
@@ -6471,12 +6915,16 @@ The independent reviewer must specifically examine, for BR3:
   `stat` on it would report a plausible shape
 - Whether the command allowlist actually enforced and tested matches this
   document's own stated allowlist exactly — `status`, `diff`,
-  `rev-parse`, `symbolic-ref`, `config` (`--get`/`--get-regexp` only),
-  `ls-files` (`--stage -z` only), `check-attr` (`--stdin -z filter`
-  only) — corrected, Round 8 review finding #6D — and no others (§5,
-  §6, §18, §27, Round 6 review finding #2, Round 7 review finding #4) —
+  `rev-parse`, `symbolic-ref`, `config` (`--get`/`--get-all`/`--get-regexp`
+  only — `--get-all` corrected in here, Round 10 review finding #4B, an
+  earlier draft of this exact bullet omitted it despite Round 9 already
+  requiring it for `branch.<branch>.merge`), `ls-files` (`--stage -z`
+  only), `check-attr` (`--stdin -z filter` only) — corrected, Round 8
+  review finding #6D — and no others (§5, §6, §18, §27, Round 6 review
+  finding #2, Round 7 review finding #4, Round 9 review finding #2) —
   with no stale reference anywhere in the specification still asserting
-  only the original five, or the six omitting `check-attr`
+  only the original five, the six omitting `check-attr`, or the seven
+  omitting `--get-all`
 - Whether `resolveRepository`'s `NOT_A_GIT_REPOSITORY`/`GIT_COMMAND_FAILED`
   classification (§8, Round 4 review finding #4, extended by Round 5
   review finding #4 and made ref-backend-aware by Round 6 review finding
@@ -6580,13 +7028,25 @@ The independent reviewer must specifically examine, for BR3:
     silently invoking a shell-like execution path; and confirmed by
     static inspection that no `shell: true`/`cmd.exe`-shaped invocation
     exists anywhere in the implementation as a fallback.
-  - **(3C) Exact, deterministic `PATH`-key selection:** whether §19's
-    `PATH`-key-normalization algorithm is genuinely one exact, documented
-    rule (collect every key whose uppercase form is `PATH`, sort
-    ordinally, select the first) rather than "implementation's choice" —
-    proven by the dedicated fixture with three differently-cased `PATH`
-    keys, asserting the selected value is deterministic and reproducible
-    across independent implementations of the identical documented rule.
+  - **(3C) Exact, deterministic, PLATFORM-SPECIFIC `PATH`-key selection
+    — corrected again, Round 10 review finding #2:** whether §19's
+    `PATH`-key-normalization algorithm is genuinely **platform-specific**
+    — on POSIX, only the exact key `PATH` (no case-folding at all;
+    `Path`/`path` are unrelated, untouched variables, never promoted
+    into `PATH`, with an absent `PATH` never filled in from a
+    differently-cased variable) — and only on Windows does it collapse
+    every key whose uppercase form is `PATH` via one exact, documented
+    rule (sort ordinally, select the first) — rather than either
+    "implementation's choice" (Round 9's original gap) or a single,
+    uniform case-insensitive rule applied identically on every platform
+    (Round 9's own, itself-incorrect fix, since POSIX environment
+    variable names are case-sensitive and `Path`/`path` are genuinely
+    distinct variables there) — proven by the dedicated POSIX fixtures
+    (a present, distinct `Path` alongside `PATH`; an absent `PATH` with
+    only `Path` present, cross-checked against a real `execFile` call's
+    own observed behavior under the identical `env`) and the dedicated
+    Windows fixture (three differently-cased `PATH` keys collapsing to
+    the documented ordinally-first winner).
 - **Object format / SHA width — new, Round 6 review finding #4:**
   whether `resolveRepository` genuinely checks `git rev-parse
   --show-object-format` and rejects anything other than `sha1` as
@@ -6823,11 +7283,16 @@ The independent reviewer must specifically examine, for BR3:
   network call — proven by running the full BR3 test suite with network
   access disabled (or an equivalent structural check) and confirming
   every upstream-SHA test still passes using only already-local refs
-- Whether `git status --porcelain=v2 -z --find-renames=50%
-  --untracked-files=all --ignore-submodules=none` (§11, §19) and
-  `git diff --name-status -z` (with the exact flags §13/§19 specify) are
-  the actual commands invoked — not `--porcelain` (v1), not a partial
-  flag set, and not a patch-format diff requiring hunk-parsing
+- Whether `git -c core.fsmonitor= -c status.renameLimit=0 status
+  --porcelain=v2 -z --find-renames=50% --untracked-files=all
+  --ignore-submodules=none` (§11, §19, Round 9 review finding #1's
+  `-c status.renameLimit=0` included — corrected here, Round 10 review
+  finding #4, since an earlier draft of this exact bullet omitted it) and
+  `git diff --no-color --no-ext-diff -z --name-status
+  --find-renames=<threshold> -l0` (with the exact flags §13/§19 specify,
+  including `-l0`) are the actual commands invoked — not `--porcelain`
+  (v1), not a partial flag set, and not a patch-format diff requiring
+  hunk-parsing
 - Whether BR3 adds no new CLI command and does not modify
   `packages/cli/src/commands/status.ts` or any other existing CLI
   command's behavior (§21)
