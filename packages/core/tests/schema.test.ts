@@ -5,21 +5,31 @@ import { dirname, join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRegistry, loadConfig, CONFIG_SCHEMA_ID, STATE_SCHEMA_ID, AUTHORIZATION_SCHEMA_ID } from "@buildrail/core";
-// Internal-only seams, reached by a direct relative import into the
-// compiled source tree rather than through the public dist/index.js
-// barrel (which does not, and must not, re-export them). This lets these
-// tests exercise the exact production registry-construction and
-// loader-translation code paths against fixture schema directories,
-// without a second public parameter on createRegistry/loadConfig/loadState
-// and without duplicating that logic in a test helper.
-// Resolved via the @buildrail/core workspace symlink in node_modules
-// (package.json declares no "exports" map, so this subpath resolves)
-// rather than a source-relative path — this keeps the import correct
-// regardless of the test file's own location, and avoids depending on
-// dist-tests' emitted directory depth matching tests/'s source depth.
-import { createRegistryFromDir } from "@buildrail/core/dist/schema/registry.js";
-import { buildConfigRegistry } from "@buildrail/core/dist/config/index.js";
-import { buildStateRegistry } from "@buildrail/core/dist/state/index.js";
+// Internal-only seams, reached via Node's package-private "imports" field
+// (packages/core/package.json's "imports": {"#internal/..."}), never the
+// public "@buildrail/core" package name. This is structurally, not just
+// conventionally, unreachable from outside the package: Node reserves the
+// "#" specifier prefix for a package's own internal self-references and
+// refuses to resolve it for any importer other than code inside this same
+// package (see Node's "Subpath imports" docs) — an external consumer of
+// the published package, or any code elsewhere in this monorepo, cannot
+// import "#internal/..." regardless of package.json's "exports" map.
+// (An earlier attempt at this used either a public package-subpath import
+// — which Node's "exports" map now blocks, but which existed as a real
+// external-reachability hole before that map was added — or a bare
+// relative path into dist/, which broke because packages/core/tests/*.ts
+// and its compiled packages/core/dist-tests/tests/*.js output sit at
+// different relative depths from packages/core/dist/; the "#internal/*"
+// specifier is resolved by Node's package.json "imports" map identically
+// regardless of the importing file's own location, so it has no such
+// depth-mismatch problem either.) This lets these tests exercise the
+// exact production registry-construction and loader-translation code
+// paths against fixture schema directories, without a second public
+// parameter on createRegistry/loadConfig/loadState and without
+// duplicating that logic in a test helper.
+import { createRegistryFromDir } from "#internal/schema/registry.js";
+import { buildConfigRegistry } from "#internal/config/index.js";
+import { buildStateRegistry } from "#internal/state/index.js";
 
 const execFileAsync = promisify(execFile);
 const moduleDir = dirname(fileURLToPath(import.meta.url));
