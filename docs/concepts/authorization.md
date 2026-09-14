@@ -12,13 +12,30 @@ An authorization record identifies:
 - `type` — the kind of work (e.g. `foundation`, `feature`, `bugfix`,
   `maintenance`)
 - `title` — a human-readable name
-- `status` — e.g. `authorized`
+- `status` — one of `draft`, `authorized`, `in_progress`, `completed`, or
+  `revoked` — see "Active vs. inactive status" below
 - `specification` — a path to the spec document defining goal, scope,
   out-of-scope boundary, and acceptance criteria
 - `granted_by` — who granted it (the human owner)
 
 See `packages/core/schemas/authorization.schema.json` for the draft data
 contract.
+
+### Active vs. inactive status
+
+| Status | Active? | Meaning |
+|--------|---------|---------|
+| `draft` | No | Recorded but not yet granted; work may not begin. |
+| `authorized` | Yes | Granted by the human owner; implementation may begin or continue. |
+| `in_progress` | Yes | Granted and implementation is actively underway. |
+| `completed` | No | The authorized work finished and closed out normally. |
+| `revoked` | No | The human owner withdrew the authorization before completion. |
+
+Only `authorized` and `in_progress` are **active** — they are the only
+statuses under which `checkImplementationAllowed`-style policy checks may
+permit implementation to proceed. `draft`, `completed`, and `revoked` are
+all **inactive**, for different reasons (not yet granted, already done,
+or withdrawn), and none of them permit implementation.
 
 ## Why it matters
 
@@ -31,11 +48,50 @@ work fall within its specification's stated scope?
 
 ## Relationship to state
 
-The currently active authorization is referenced from
-`.buildrail/state.yml` under `current.authorization`. Only one
-authorization is normally active at a time per work item; BuildRail's own
-development currently has BR0 authorized and BR1–BR8 explicitly marked
-`planned`, not `authorized` (see `.buildrail/state.yml`).
+The authorization record lives at the **top level** of
+`.buildrail/state.yml`, as `state.authorization` — never nested under
+`current` (`current.authorization` is not a real field; `current` holds
+lifecycle-state fields such as `current.lifecycle_state` and
+`current.development_phase`). `authorization` is a **schema-optional**
+property of `state.schema.json`: it is a declared property, but it is not
+listed in the schema's top-level `required` array, so a state document
+with no `authorization` key at all is schema-valid — and that absence is
+not a schema violation when it does occur (e.g. at project bootstrap, or
+in an intentionally constructed test/fixture state).
+
+**This schema-optional absence is not, however, what normal phase closure
+produces.** After a phase is closed in the ordinary governed way (BR2's
+`completeAndFreezePhase` operation, once BR2 exists — and, historically,
+BR0's and BR1's own real hand-performed closure commits), `state.authorization`
+remains **present** — its `status` is set to `completed`, not removed —
+so there is no *active* authorization at that point, but the key itself
+is not absent. Do not conflate "no active authorization" with "no
+`authorization` key": the normal, expected shape immediately after
+closure is a present `authorization` object with `status: completed` (see
+the next paragraph for the full detail on this).
+
+At most one authorization record is present at a time. When it is
+present, its `status` determines whether it is active (see "Active vs.
+inactive status" above). When an authorized or in-progress unit of work
+finishes normally, its record's `status` is updated to `completed` in
+place — the record is not deleted. So `state.authorization` being present
+with `status: completed` does not mean work is currently authorized; it
+means the most recent authorization record finished, and no active
+authorization currently exists until a new one is granted.
+
+**History** of prior authorizations is not kept as a growing list under
+`authorization` itself. It is reconstructed from `state.completed_phases`
+(which phase IDs have closed) together with `state.baselines` (which SHA
+was frozen for each), cross-referenced against the specification each
+authorization pointed to. `state.authorization` itself only ever holds
+the single most recent record, active or not.
+
+As of this writing, BuildRail's own development has BR0 and BR1 recorded
+as completed phases with frozen baselines, and no BR2 implementation
+authorization currently exists — BR2 has a specification but has not been
+granted an authorization record, and will not have one until a separate,
+explicit Human Owner action creates it (see `.buildrail/state.yml` and
+`.buildrail/specs/BR2-GOVERNANCE-ENGINE.md`).
 
 ## Scope boundaries are part of the authorization
 
