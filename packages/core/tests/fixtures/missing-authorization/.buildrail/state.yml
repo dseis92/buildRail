@@ -1,0 +1,12 @@
+schema_version: 1
+project:
+  name: FixtureProject
+current:
+  lifecycle_state: SPECIFIED
+  development_phase: BR9
+completed_phases: []
+planned_phases:
+  - BR9
+review:
+  independent_review: required
+  self_approval: forbidden
