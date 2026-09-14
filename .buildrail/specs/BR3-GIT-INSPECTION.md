@@ -637,21 +637,31 @@ specific error codes this algorithm exists to produce. The corrected
 algorithm below removes this precheck entirely and asks Git itself,
 first, using only machine-readable facts:
 
-0. **Git capability floor check — new, Round 6 review finding #3, runs
-   before every other step, including the `fs.stat` in step 1:** confirm
-   the installed `git` binary satisfies BR3's minimum supported version
-   before relying on any version-dependent behavior this specification
-   assumes (`GIT_NO_LAZY_FETCH`/`--no-lazy-fetch`, in particular — §19).
-   See the dedicated "Git Capability Floor" subsection immediately below
-   for the exact mechanism, verified evidence, and the complete list of
-   BR3 features reviewed against the chosen minimum version. On failure:
+0. **Git capability floor check — new, Round 6 review finding #3, binding
+   corrected Round 7 review finding #3, runs before every other step,
+   including the `fs.stat` in step 1:** confirm the installed `git`
+   binary satisfies BR3's minimum supported version before relying on any
+   version-dependent behavior this specification assumes
+   (`GIT_NO_LAZY_FETCH`/`--no-lazy-fetch`, in particular — §19). See the
+   dedicated "Git Capability Floor" subsection immediately below for the
+   exact mechanism, verified evidence, and the complete list of BR3
+   features reviewed against the chosen minimum version. On failure:
    `GIT_VERSION_UNSUPPORTED` (§17) — distinct from
    `GIT_EXECUTABLE_UNAVAILABLE` (a `git` binary that cannot be found/
    spawned at all vs. one that is found, spawns, and reports a version
    BR3 does not support) and distinct from every other `resolveRepository`
    outcome (this check does not depend on `projectRoot` being a
    repository, or even existing, at all — it is a property of the `git`
-   binary itself, checked once, not per-repository).
+   binary itself). **This check, and every subsequent Git invocation in
+   the same `resolveRepository` call (and every I/O-performing BR3
+   function that call's success unlocks), is bound to the identical
+   resolved executable identity** — the capability result is never
+   trusted for a later call whose own resolved `git` executable path
+   differs from the one actually validated (see the "Git Capability
+   Floor" subsection's binding-mechanism correction below); this is what
+   makes it structurally impossible for `resolveRepository` to validate
+   one Git binary and have a later step silently execute a different,
+   unvalidated one.
 1. Confirm `projectRoot` exists and is a directory (`fs.stat` — no Git
    invocation needed yet). If not: `PROJECT_ROOT_NOT_FOUND`.
 2. **Bare-repository check FIRST, before any other Git call, and before
@@ -779,29 +789,23 @@ first, using only machine-readable facts:
          technique, substituting `--ref-format=reftable` at `git init
          --bare` time and checking for `reftable/tables.list` instead of
          a populated `refs/` tree.
-         - **If BR3 deliberately does not support `reftable` repositories
-           for inspection beyond this classifier (a scope decision this
-           round does not itself make either way — the working-tree/HEAD/
-           diff inspection mechanisms elsewhere in this specification are
-           not re-verified against a `reftable`-backend repository in
-           this correction round): a *healthy* `reftable`-backend
-           repository must still be explicitly, positively recognized and
-           rejected with a typed, dedicated unsupported-ref-format result
-           — never silently misclassified as `NOT_A_GIT_REPOSITORY`, and
-           never silently treated as an ordinary, fully-supported
-           repository either.** This bare-shape classifier's job (the
-           post-Git-failure secondary check) is narrower and different:
-           it exists only to correctly attribute an *already-failed*
-           `--is-bare-repository` call to "real but malformed repository"
-           rather than "no repository at all" — it does not itself decide
-           whether a *healthy* `reftable` repository is fully supported.
-           That is a **future, separate scope decision**, not resolved by
-           this correction round (this round's mandate is the
-           post-Git-failure malformed-bare classification specifically —
-           see the Round 6 correction request's own framing); a future
-           round that adds full `reftable` support (or an explicit,
-           positive `reftable`-rejection typed result for a *healthy*
-           repository) may extend this section without contradicting it.
+         - **Healthy `reftable` repositories: BR3 v0.1 does not support
+           them, decided now, not deferred — Round 7 review finding #1.**
+           This bare-shape classifier's own job (the post-Git-failure
+           secondary check) remains narrow and unchanged by this
+           decision: it exists only to correctly attribute an
+           *already-failed* `--is-bare-repository` call to "real but
+           malformed repository" rather than "no repository at all,"
+           and it already, correctly, recognizes a malformed `reftable`
+           repository via the `reftable/tables.list` alternative above.
+           A **healthy** `reftable` repository — one where
+           `--is-bare-repository`/`--show-toplevel`/etc. all succeed
+           normally — is a **separate** case this classifier never even
+           reaches (it only ever runs after a Git command has already
+           failed); that case is handled by a new, dedicated,
+           positive ref-storage-format check added to `resolveRepository`'s
+           main algorithm itself — see step 5b below, immediately after
+           the object-format check (step 5a).
      - If **neither** the non-bare shape **nor** the bare shape is
        present: this is a genuine plain non-Git directory →
        `NOT_A_GIT_REPOSITORY` (unchanged from before).
@@ -991,8 +995,74 @@ first, using only machine-readable facts:
       per-repository check, not a per-operation one (implementation may
       cache it alongside the other `resolveRepository`-derived facts for
       that `projectRoot`).
+5b. **Ref storage format validation — new, Round 7 review finding #1,
+    resolving Round 6's deferred question now.** BR3's chosen minimum
+    Git version (≥2.45.0, §8's "Git Capability Floor" subsection) is at
+    or above the Git release that integrated the `reftable` ref-storage
+    backend as a selectable, healthy repository format
+    (`git init --ref-format=reftable`), which stores ref data in
+    `reftable/` table files instead of the traditional per-ref loose
+    files under `refs/heads/`/`refs/tags/`/etc. **BR3 v0.1's final
+    decision: healthy `reftable`-backend repositories are explicitly,
+    positively rejected, not silently misclassified and not silently
+    treated as ordinary, fully-supported repositories.** This is a
+    deliberate v0.1 scope decision, chosen for the same reason as the
+    SHA-1-only decision above (step 5a): BR3's working-tree/HEAD/diff
+    inspection mechanisms throughout this specification (porcelain v2
+    parsing, `@{upstream}` resolution, `symbolic-ref`, etc.) have not
+    been independently re-verified against a `reftable`-backend
+    repository, and this correction round does not have the scope to
+    perform that verification — narrowing to a known-supported ref
+    backend (the traditional `files` backend, universally what every
+    existing verified example, fixture, and reproduction in this entire
+    specification already uses) is the honest, conservative choice,
+    exactly mirroring the SHA-1-only rationale.
+    - **Detection mechanism:** run `git config --get
+      extensions.refStorage` (same `cwd`, genuinely read-only — a bare
+      `--get`, already the identical config-query primitive §9/§10/§18
+      use elsewhere in this specification) — Git records a repository's
+      selected ref-storage backend in this repository-local config key;
+      its absence (exit 1, no stdout — the ordinary case for the
+      traditional backend, which does not need to declare itself) means
+      `files`, and a value of `reftable` means the `reftable` backend is
+      active. This is a genuinely machine-readable, single-value config
+      fact — not a porcelain/human-oriented Git output — read via the
+      same `config --get` mechanism and read-only discipline this
+      specification already applies throughout (§9, §10, §18).
+    - **If absent, or explicitly `files`:** continue — this is the
+      traditional backend, fully supported, and `resolveRepository`
+      proceeds exactly as this specification otherwise documents.
+    - **If `reftable`:** fail with the new, dedicated
+      `UNSUPPORTED_REF_FORMAT` error code (§17), with `details` naming
+      the actual reported ref-storage format. `resolveRepository` never
+      proceeds past this point for such a repository — no later step
+      (`inspectHead`, `inspectWorkingTree`, `inspectDiff`) is ever
+      reached against a `reftable`-backend repository.
+    - **Malformed repository where Git cannot read its config at all
+      (the post-Git-failure case):** unaffected by this step — this
+      check only runs once Git has already positively recognized
+      `projectRoot` as a real, non-bare repository (i.e., after step 2
+      has already succeeded), so a repository whose config is too
+      damaged for Git to answer this query at all is instead classified
+      by the existing, already-ref-backend-aware post-Git-failure
+      secondary classifier (step 2's own failure branch, above), which
+      continues to recognize both the `files`-backend
+      (`<projectRoot>/.git`-based) and `reftable`-backend
+      (`reftable/tables.list`-based) malformed-bare shapes and reports
+      `GIT_COMMAND_FAILED`, never `NOT_A_GIT_REPOSITORY` — this step
+      never overrides or races against that earlier, distinct
+      classification path, since this step is unreached whenever that
+      earlier path has already determined the outcome.
+    - This check runs once per `resolveRepository`-validated
+      `projectRoot`, immediately after step 5a's object-format check
+      (the two share the same "positively-recognized, healthy repository,
+      narrow-v0.1-scope-decision" character and are naturally sequenced
+      together) and before `resolveRepository` returns success — a
+      repository's ref-storage format is a fixed, per-repository property,
+      so this is a per-repository check, not a per-operation one
+      (implementation may cache it alongside step 5a's result).
 6. If the Git executable itself cannot be located/spawned at any point
-   in steps 2–5a (`ENOENT` from the underlying `child_process` call, or
+   in steps 2–5b (`ENOENT` from the underlying `child_process` call, or
    equivalent): `GIT_EXECUTABLE_UNAVAILABLE`. This is checked structurally
    by the shared exec helper (§18) and surfaces identically from every
    BR3 entry point, not just `resolveRepository`.
@@ -1007,30 +1077,37 @@ itself, via machine-readable facts, at every step — no step depends on
 BR3's own filesystem-shape assumptions about what a repository "should"
 look like.
 
-**Git Capability Floor — new, Round 6 review finding #3.** BR3's own
-security/correctness guarantees increasingly depend on specific Git
-*features*, not merely "some Git is installed" — most acutely,
-`GIT_NO_LAZY_FETCH`/`--no-lazy-fetch` (§19, Round 5 review finding #1),
-which Git documents as available starting in the Git 2.46 release cycle
-(the underlying partial-clone lazy-fetch-suppression capability itself
-was introduced across the Git 2.45/2.46 development window). **Setting
-`GIT_NO_LAZY_FETCH=1` in the environment of an older `git` binary that
-does not understand it is not a safe no-op to rely on implicitly** — an
-unrecognized environment variable is simply ignored by an older Git,
-meaning the lazy-fetch network-suppression guarantee this specification
-makes (§6, §19) would silently not hold against such a binary, with no
-error, no signal, and no way for a caller to know. BR3 must not merely
-set the variable and assume the installed Git understands and enforces
-it; it must **positively confirm** the installed Git is new enough
-before relying on that guarantee (or any other version-dependent
-behavior) at all.
+**Git Capability Floor — new, Round 6 review finding #3, binding
+mechanism and version wording corrected, Round 7 review finding #3.**
+BR3's own security/correctness guarantees increasingly depend on
+specific Git *features*, not merely "some Git is installed" — most
+acutely, `GIT_NO_LAZY_FETCH`/`--no-lazy-fetch` (§19, Round 5 review
+finding #1), which is available starting in the Git 2.45 release —
+**not** a later 2.46-only feature; the previous draft of this section
+incorrectly described it as first appearing in "the Git 2.46 release
+cycle" while simultaneously choosing 2.45.0 as the floor, an internally
+inconsistent statement this round corrects. `--no-lazy-fetch`/
+`GIT_NO_LAZY_FETCH` genuinely exists at 2.45.0 itself, so the chosen
+floor is exact, not merely a nearby approximation with an unexplained
+margin. **Setting `GIT_NO_LAZY_FETCH=1` in the environment of an older
+`git` binary that does not understand it is not a safe no-op to rely on
+implicitly** — an unrecognized environment variable is simply ignored by
+an older Git, meaning the lazy-fetch network-suppression guarantee this
+specification makes (§6, §19) would silently not hold against such a
+binary, with no error, no signal, and no way for a caller to know. BR3
+must not merely set the variable and assume the installed Git
+understands and enforces it; it must **positively confirm** the
+installed Git is new enough before relying on that guarantee (or any
+other version-dependent behavior) at all — and, per this round's
+correction below, confirm it against the *exact same* `git` binary every
+subsequent command in that operation actually invokes, not merely
+*some* `git` that once resolved via `PATH`.
 
 - **Chosen floor: Git ≥ 2.45.0.** This is BR3 v0.1's supported Git
-  floor, chosen as the simplest, single-version-number contract that
-  covers every version-dependent feature this specification currently
-  relies on (enumerated in the reviewed-features list below) with a
-  small, deliberate safety margin ahead of the exact release that
-  introduced the last (and most version-sensitive) of them.
+  floor — exact, not approximate — chosen as the precise version at
+  which every version-dependent feature this specification currently
+  relies on (enumerated in the reviewed-features list below) is already
+  available, with no feature requiring a later version.
 - **Detection mechanism: deterministic version parsing of `git
   --version`'s machine-readable-enough numeric output — not a feature
   probe.** `git --version` prints a single line whose format is stable
@@ -1049,14 +1126,13 @@ behavior) at all.
   version-string line is parsed, and only to extract a dotted numeric
   version for a `>=` comparison, never to branch on arbitrary diagnostic
   text content.
-  - **Parsing algorithm:** run `git --version` (no `cwd` requirement — this
-    is a property of the binary, not of any repository), extract the
-    numeric `X.Y.Z` (or `X.Y.Z.W`) sequence following the literal prefix
-    `git version `, and compare `(X, Y, Z)` against `(2, 45, 0)`
-    component-wise (major, then minor, then patch — `Z`/`W` beyond the
-    third component is ignored for comparison purposes, since BR3's
-    floor is expressed to the patch level only). A version at or above
-    `2.45.0` passes; anything below fails.
+  - **Parsing algorithm:** extract the numeric `X.Y.Z` (or `X.Y.Z.W`)
+    sequence following the literal prefix `git version `, and compare
+    `(X, Y, Z)` against `(2, 45, 0)` component-wise (major, then minor,
+    then patch — `Z`/`W` beyond the third component is ignored for
+    comparison purposes, since BR3's floor is expressed to the patch
+    level only). A version at or above `2.45.0` passes; anything below
+    fails.
   - **Malformed/unexpected version output:** if `git --version`'s stdout
     does not match the expected `git version <digits>.<digits>.<digits>`
     prefix shape at all (an unrecognized/non-standard build string,
@@ -1074,35 +1150,93 @@ behavior) at all.
     invocation (§17) — never conflated with `GIT_VERSION_UNSUPPORTED`,
     which requires the binary to have actually run and reported *some*
     version output.
-  - **No repository mutation, and no repository dependency, during this
-    check:** `git --version` reads no repository state at all (it can be
-    run with `cwd` anywhere, including outside any repository), so this
-    check has no interaction with `.git/index`/`GIT_OPTIONAL_LOCKS`/any
-    other read-only guarantee this specification makes elsewhere — it is
-    orthogonal to, not a special case of, repository inspection.
-  - **Run once, cached for the process lifetime, not once per
-    `resolveRepository` call** — implementation's choice of caching
-    granularity, not a caller-visible contract (mirroring the existing
-    caching notes for filter-driver/submodule discovery, §18); the
-    installed Git binary is not expected to change version mid-process.
+  - **No repository mutation during this check:** `git --version` reads
+    no repository state at all, so this check has no interaction with
+    `.git/index`/`GIT_OPTIONAL_LOCKS`/any other read-only guarantee this
+    specification makes elsewhere.
+  - **`cwd` — an explicit, narrow exception in the shared exec primitive,
+    corrected, Round 7 review finding #3 (the previous draft's "no `cwd`
+    requirement" claim directly contradicted §18's own "every `execFile`
+    call uses `cwd: projectRoot`" contract, which the capability check —
+    running *before* `projectRoot` is even confirmed to exist, per step
+    0 below — cannot possibly satisfy):** the shared `internal/exec.ts`
+    helper (§18) treats the capability-check invocation as one explicit,
+    narrowly-scoped exception to its otherwise-universal `cwd:
+    projectRoot` contract, using `cwd: process.cwd()` (or any fixed,
+    caller-independent directory) instead, since `git --version` reads no
+    repository state and genuinely has no dependency on any particular
+    working directory. This is documented as a single, named exception
+    in the exec primitive's own contract (§18) — not a silent,
+    unstated inconsistency between §8 and §18 — precisely because this
+    is the *only* BR3 Git invocation that runs before a `projectRoot` is
+    available to serve as `cwd` at all.
+  - **Binding to the exact executable identity actually invoked —
+    corrected, mandatory, Round 7 review finding #3 (supersedes the
+    previous "cached for the process lifetime... the installed Git
+    binary is not expected to change" framing, which is not a safety
+    guarantee `process.env.PATH` being mutable in a long-running Node
+    process can actually support):** `execFile("git", [...])` resolves
+    `git` through the current `PATH` **at the moment each call is
+    made** — a capability result validated once, early in a process's
+    lifetime, against whatever `git` happened to resolve at that moment,
+    provides **no guarantee whatsoever** about which `git` binary a
+    later `execFile("git", [...])` call resolves to if `PATH` (or
+    anything else affecting executable resolution) has changed in the
+    interim; a long-running host process (an MCP server, a daemon, a
+    test runner reusing a process across cases) could validate a
+    genuinely new-enough `git` A, cache that result, have its `PATH`
+    changed by unrelated code, and then silently execute an older `git`
+    B under the previously-accepted capability result — exactly the gap
+    this round's finding identifies. **The corrected contract:** the
+    shared exec primitive (§18) resolves `git`'s exact executable path
+    once per invocation (Node's own `child_process` executable-resolution
+    behavior already does this internally for every `execFile("git",
+    ...)` call — this adds no new resolution step, only observes and
+    records its outcome) and treats the **resolved executable path**,
+    not the literal string `"git"`, as the cache key for the capability
+    result: a capability result is trusted for a subsequent call only
+    when that call's own resolved executable path is identical to the
+    one the capability check itself was validated against; a different
+    resolved path (because `PATH` or another resolution input changed)
+    invalidates the cached result and requires the capability check to
+    be re-run against the newly-resolved executable before that call's
+    own underlying operation proceeds. This makes it structurally
+    impossible to validate one Git binary and silently execute a
+    different one under the same accepted capability result — the cache
+    key *is* the executable identity, not merely a lifetime-scoped
+    boolean. Implementation may still cache favorably (the common case —
+    a stable `PATH` within one process — pays the version-check cost
+    once, exactly as before); the correction is that the cache is keyed
+    correctly, not that caching itself is removed.
 - **BR3 features reviewed against the chosen 2.45.0 floor** (every
   version-dependent mechanism this specification relies on, confirmed
-  available at or before this floor, or explicitly the reason the floor
-  is set where it is):
+  available at or before this floor):
   - `GIT_NO_LAZY_FETCH`/`--no-lazy-fetch` (§19) — the floor-setting
-    feature; available from the Git 2.45/2.46 development window, hence
-    the 2.45.0 floor with its deliberate small margin.
-  - `--end-of-options` (`rev-parse --verify --end-of-options`, §13, §18)
-    — a long-stable Git feature, available well before this floor;
+    feature; available from Git 2.45.0 itself (corrected, Round 7 review
+    finding #3 — not a later 2.46-only feature).
+  - `--end-of-options` (`rev-parse --verify --end-of-options`, §9, §13,
+    §18) — a long-stable Git feature, available well before this floor;
     already independently verified working in this specification's own
-    correction history (§18).
+    correction history (§18), and, as of this round, also applied to
+    repository-derived upstream resolution (§9, §10, Round 7 review
+    finding #6).
   - Porcelain v2 (`git status --porcelain=v2`, §11) — introduced in Git
     2.11 (2016), far below this floor.
   - `--show-object-format` (`git rev-parse --show-object-format`, §8 step
     5a, Round 6 review finding #4) — available from Git 2.29 (2020), below
     this floor.
+  - `extensions.refStorage` config key (§8 step 5b, Round 7 review
+    finding #1) — a repository-local config key, readable via the
+    already-established `config --get` mechanism at any Git version
+    within this floor; no separate version dependency of its own beyond
+    the floor already required for `reftable` itself to exist as a
+    selectable backend.
   - `git ls-files --stage -z` (§18, Round 6 review finding #2) — a
     long-stable plumbing primitive, available well before this floor.
+  - `git check-attr --stdin -z` (§18, Round 7 review finding #4) — a
+    long-stable plumbing primitive (NUL-delimited `check-attr` support
+    predates this floor by many releases), available well before this
+    floor.
   - No ref-backend inspection mechanism beyond ordinary, already-covered
     `--git-dir`/`--git-common-dir`/`--is-bare-repository` machinery is
     introduced by this round (§8's ref-backend-awareness correction,
@@ -1389,10 +1523,40 @@ data is actually present.
    local-upstream subcase below, whose SHA comes from a plain local
    branch ref under `refs/heads/`, never from anything under
    `refs/remotes/`):**
-   `git rev-parse --verify -q <branch>@{upstream}` for the SHA, and
-   `git rev-parse --verify -q --symbolic-full-name <branch>@{upstream}`
-   for the resolved ref name (both genuinely read-only; both added to
-   §27's read-only command allowlist).
+   `git rev-parse --verify -q --end-of-options <branch>@{upstream}` for
+   the SHA, and `git rev-parse --verify -q --symbolic-full-name
+   --end-of-options <branch>@{upstream}` for the resolved ref name (both
+   genuinely read-only; both added to §27's read-only command allowlist)
+   — **`--end-of-options` included, corrected, Round 7 review finding #6:
+   `<branch>` is repository-controlled input (the current branch name,
+   from `symbolic-ref`/`HEAD`), not BR3-authored, and a valid Git branch
+   name can itself be flag-shaped** (e.g. `-foo`, legal via `git branch
+   -foo` or a manually-written ref file), producing a revision expression
+   like `-foo@{upstream}` that Git's argument parser can otherwise
+   misinterpret as an option rather than a positional revision — the
+   identical hazard class §13 already defends against for
+   caller-supplied `DiffRequest.fromRef`/`.toRef`, now recognized as
+   equally applicable here since the branch name is not
+   BR3-authored either. **Verified directly:** a fixture repository with
+   `HEAD` pointing at a branch literally named `-foo`,
+   `branch.-foo.remote` set to `"."`, and `branch.-foo.merge` set to
+   `refs/heads/main` — `git rev-parse --verify -q
+   '-foo@{upstream}'`/`--symbolic-full-name '-foo@{upstream}'`
+   (without `--end-of-options`) **fail**, while the identical revision
+   expressions **succeed** once `--end-of-options` is inserted
+   immediately before the revision argument, confirming
+   `--end-of-options`' option ordering (`rev-parse --verify -q
+   [--symbolic-full-name] --end-of-options <expr>`) is correct against
+   BR3's supported Git floor (§8, ≥2.45.0). This is not a hypothetical
+   concern specific to this construction — it is the general rule that
+   *every* repository-derived revision expression BR3 constructs and
+   passes to `rev-parse`/`diff` must receive the same argument-safety
+   treatment as a caller-derived one, since BR3 does not control what a
+   real repository's branch names, ref names, or other identifiers are.
+   No other BR3-constructed revision expression currently exists besides
+   this one and the already-protected `DiffRequest`-derived ones (§13);
+   a future correction round introducing a new one must apply
+   `--end-of-options` there too.
    - If both succeed (exit 0): `sha` is populated with the printed SHA,
      and `ref` is populated with the printed symbolic full name — always
      exactly what Git itself reports, never a BR3 guess. Two subcases,
@@ -1551,18 +1715,22 @@ git -c core.fsmonitor= status --porcelain=v2 -z --find-renames=50% --untracked-f
 ```
 
 run with `cwd` at `projectRoot`, **and only ever run at all once §18's
-filter/process-driver discovery (superproject and every initialized
-submodule, recursively) has confirmed zero `clean`/`process`/`smudge`
-drivers are configured anywhere in scope** — a discovered driver produces
+effective-filter-attribute scan (`check-attr --stdin -z filter` over
+every relevant tracked path, superproject and every initialized
+submodule recursively) has confirmed no path in scope carries an active
+`filter` attribute** — a discovered active attribute produces
 `EXTERNAL_GIT_FILTER_UNSUPPORTED` (§17) instead, before this invocation
-ever runs (§18, Round 6 review finding #1; this replaces Round 4/5's
-now-withdrawn `-c filter.<name>.clean=`/`-c filter.<name>.process=`
-suppression overrides, which must not appear in this command). The `-c
-core.fsmonitor=` override is always present, unconditionally, for both
-the superproject and every initialized submodule Git itself inspects
-internally during this call. This exact invocation — verified to accept
-all five `status`-level flags together without error — is what §18
-(process execution safety), §19 (determinism), §20 (test plan), and §27
+ever runs (§18, Round 6 review finding #1, detection mechanism corrected
+Round 7 review finding #4; this replaces Round 4/5's now-withdrawn `-c
+filter.<name>.clean=`/`-c filter.<name>.process=` suppression overrides,
+which must not appear in this command, and supersedes relying on
+config-enumeration alone, which Round 7 proved insufficient against a
+globally-defined driver). The `-c core.fsmonitor=` override is always
+present, unconditionally, for both the superproject and every
+initialized submodule Git itself inspects internally during this call.
+This exact invocation — verified to accept all five `status`-level flags
+together without error — is what §18 (process execution safety), §19
+(determinism), §20 (test plan), and §27
 (independent review) all reference; no section states a different or
 partial form of this command. Each `status`-level flag is individually
 required, not incidental:
@@ -1617,7 +1785,7 @@ required, not incidental:
 | `1 .D ...` | `unstaged_delete` |
 | `1 .T ...` | `unstaged_type_change` |
 | `2 R. ... <score> <path>\0<origPath>\0` (staged rename) | `staged_rename` (with `oldPath`, `similarity` from `<score>`) |
-| `2 .R ... <score> <path>\0<origPath>\0` (unstaged rename) | `unstaged_rename` (with `oldPath`, `similarity` from `<score>`) — **corrected, Round 6 review finding #6: no longer under-classified.** An earlier draft of this specification represented this record as a plain `unstaged_modify` on the new path, deliberately discarding the `oldPath`/`similarity` data this exact porcelain v2 record type already carries in the identical positions as the staged-rename record above — BR3's own documented `status` invocation (§11's exact, fixed `--find-renames=50%`-inclusive command) is what causes Git to emit `2 .R` at all for an unstaged rename it detects at or above the 50% threshold, so this record is not a hypothetical Git behavior BR3 might one day encounter — it is a direct, fully-populated output of BR3's own exact invocation, on the identical Git floor (§8) this specification otherwise requires, and this specification does not knowingly discard a fact Git itself already handed it. `unstaged_rename` is therefore a first-class `WorkingTreeEntryKind` (§7a), populated identically to `staged_rename`. |
+| `2 .R ... <score> <path>\0<origPath>\0` (unstaged rename) | `unstaged_rename` (with `oldPath`, `similarity` from `<score>`) — **corrected, Round 6 review finding #6: no longer under-classified; reachability corrected, Round 7 review finding #2.** An earlier draft of this specification represented this record as a plain `unstaged_modify` on the new path, deliberately discarding the `oldPath`/`similarity` data this exact porcelain v2 record type already carries in the identical positions as the staged-rename record above. `unstaged_rename` remains a first-class `WorkingTreeEntryKind` (§7a), populated identically to `staged_rename`, whenever BR3's own documented `status` invocation (§11) actually emits this record. **A plain, ordinary filesystem rename with no accompanying index operation does *not*, by itself, reliably produce `2 .R`** — this earlier draft's implied reachability claim ("a plain filesystem rename... causes Git to emit `2 .R`") is corrected: **verified directly**, starting from a committed, tracked `old.txt` with no other changes, a plain `mv old.txt new.txt` with zero index operations, under BR3's exact `status` invocation, instead produces two independent records — `1 .D ... old.txt` (`unstaged_delete`) and `? new.txt` (`untracked`) — **never** `2 .R`. Porcelain v2's unstaged-rename detection requires the new path to already be represented in the index in some form for Git's rename-pairing heuristic to have anything to pair the deletion against; a genuinely untracked new path gives Git no such pairing signal. **A real, reachable `2 .R` state was independently verified** via `mv old.txt new.txt` followed by `git add -N new.txt` (an intent-to-add index entry — no content staged, the change remains fully unstaged) — BR3's exact `status` invocation against that state emits `2 .R ... R100 new.txt\0old.txt\0`, confirming `unstaged_rename` is genuinely reachable, just not via the naive "plain rename" construction an earlier draft implied. §11/§14/§20/§27 are corrected accordingly: BR3 reports whatever Git actually emits for a given repository state and never synthesizes a rename relationship Git itself did not provide — a plain, unstaged, non-intent-to-added filesystem rename is correctly, truthfully reported as `unstaged_delete`(old) + `untracked`(new), two independent facts, not a rename. |
 | `u <xy> ... <path>` (unmerged) | `conflicted` |
 | `? <path>` | `untracked` |
 | `1 ..` with a `S...` submodule marker in the XY field | (combined with the base kind above) `submodule` populated per §11's submodule handling |
@@ -1648,8 +1816,31 @@ both record types) — see §14 for the shared rename-representation
 contract with `inspectDiff`. BR3 never discards the `oldPath`/`similarity`
 data a `2 .R` record already supplies merely because the rename is
 unstaged; an earlier draft of this specification did exactly that (under-
-classifying `2 .R` as a plain `unstaged_modify`), which this round
-corrects.
+classifying `2 .R` as a plain `unstaged_modify`), which Round 6 corrects.
+
+**Reachability of `2 .R` — corrected, Round 7 review finding #2:** a
+plain, ordinary filesystem rename (`mv old.txt new.txt`) with no
+accompanying index operation does **not**, by itself, produce `2 .R`
+under BR3's exact `status` invocation — verified directly, it instead
+produces `unstaged_delete` on the old path plus `untracked` on the new
+path, two independent facts with no rename relationship between them,
+because porcelain v2's unstaged-rename pairing heuristic needs the new
+path already represented in the index in some form to have anything to
+pair the deletion against. `2 .R` **is** genuinely reachable — verified
+directly via `mv old.txt new.txt` followed by `git add -N new.txt`
+(intent-to-add: an index entry with no staged content, so the change
+remains entirely unstaged) — but this specific construction is
+meaningfully different from an ordinary, untouched-index rename. BR3
+itself never performs this or any other index operation; the
+intent-to-add step is exclusively test/fixture setup code demonstrating
+a real, reachable repository state, never something BR3's own
+`inspectWorkingTree` implementation does. **BR3 reports exactly what Git
+emits for whatever state a repository is actually in, and never
+synthesizes a rename relationship Git itself did not provide:** a plain,
+non-intent-to-added unstaged rename is correctly, truthfully reported as
+`unstaged_delete`(old) + `untracked`(new) — this is not a gap or a
+missed classification, it is the accurate reflection of what Git itself
+considers knowable about that specific repository state.
 
 **Submodule state:** porcelain v2's submodule marker (`S<c><m><u>` in the
 XY-adjacent field) is decoded into `SubmoduleState { commitChanged,
@@ -2015,11 +2206,12 @@ string-first one) — see each section for its own restatement.
    consult it):**
    `git diff --no-color --no-ext-diff -z --name-status
    --find-renames=<threshold> <fromSha> <toSha>` (threshold per §14),
-   **run only once §18's filter/process-driver discovery (superproject
-   and every initialized submodule, recursively) has confirmed zero
-   `clean`/`process`/`smudge` drivers are configured anywhere in scope**
-   — a discovered driver produces `EXTERNAL_GIT_FILTER_UNSUPPORTED` (§17)
-   instead, before this invocation ever runs. `--name-status` (not the
+   **run only once §18's effective-filter-attribute scan (`check-attr
+   --stdin -z filter`, superproject and every initialized submodule
+   recursively) has confirmed no path in scope carries an active
+   `filter` attribute** — a discovered active attribute produces
+   `EXTERNAL_GIT_FILTER_UNSUPPORTED` (§17) instead, before this invocation
+   ever runs. `--name-status` (not the
    default patch format) gives exactly a status-letter-plus-path(s)
    record per changed file, `-z` NUL-delimits records and (for renames)
    the two-path pairs within a record.
@@ -2094,6 +2286,17 @@ and `similarity` (0–100 integer, Git's own percentage score) on
 `DiffChange` (kind: `"renamed"`) and on `WorkingTreeEntry` for **both**
 `kind: "staged_rename"` **and** `kind: "unstaged_rename"` (the latter
 added — Round 6 review finding #6) — see §7a's type definitions.
+
+**`unstaged_rename` reachability — corrected, Round 7 review finding #2:**
+Git's porcelain v2 unstaged-rename pairing (`2 .R`) requires the new path
+to already be represented in the index in some form (e.g. via `git add
+-N`/intent-to-add) for Git's heuristic to have a basis to pair it against
+the old path's deletion — a plain, ordinary filesystem rename with no
+accompanying index operation is instead reported as an independent
+`unstaged_delete` + `untracked` pair, never `2 .R`. This is not a BR3
+limitation; it is Git's own porcelain v2 behavior, faithfully reported.
+See §11's "Reachability of `2 .R`" subsection for the full verified
+reproduction.
 
 **Below-threshold pairs remain delete+add — never forced into a
 low-confidence rename.** If Git's own similarity index computes less
@@ -2387,7 +2590,9 @@ type GitErrorCode =
   | "PROJECT_ROOT_MISMATCH"
   | "BARE_REPOSITORY_UNSUPPORTED"
   | "UNSUPPORTED_OBJECT_FORMAT"
+  | "UNSUPPORTED_REF_FORMAT"
   | "EXTERNAL_GIT_FILTER_UNSUPPORTED"
+  | "UNSAFE_SUBMODULE_PATH"
   | "HEAD_UNAVAILABLE"
   | "REF_NOT_FOUND"
   | "GIT_COMMAND_FAILED"
@@ -2426,7 +2631,9 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 | `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) | Expected — `details` names the actual resolved toplevel |
 | `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 2) | Expected |
 | `UNSUPPORTED_OBJECT_FORMAT` | **New — Round 6 review finding #4.** `git rev-parse --show-object-format` (§8 step 5a) reports anything other than `sha1` for `projectRoot` (e.g. `sha256`, for a repository created via `git init --object-format=sha256`) | Expected — BR3 v0.1 supports SHA-1 repositories only, a deliberate scope decision (§8); `details` names the actual reported object format; `resolveRepository` fails before any SHA-producing BR3 function can be reached for that repository |
-| `EXTERNAL_GIT_FILTER_UNSUPPORTED` | **New — Round 6 review finding #1.** Repository-local (or initialized-submodule-local, recursively) configuration declares one or more `filter.<name>.clean`/`.process`/`.smudge` content-filter drivers, discovered via read-only config enumeration (§18) before any `status`/`diff` invocation that could trigger one — BR3 refuses to proceed rather than execute the external filter or suppress it and risk returning a false working-tree/diff fact (§18) | Expected — a real, anticipated repository-configuration condition; `details` names the discovered driver(s); the `status`/`diff` invocation that could trigger the filter is never run |
+| `UNSUPPORTED_REF_FORMAT` | **New — Round 7 review finding #1.** `git config --get extensions.refStorage` (§8 step 5b) reports `reftable` for `projectRoot` (a healthy repository using Git's `reftable` ref-storage backend) | Expected — BR3 v0.1 supports the traditional `files` ref-storage backend only, a deliberate scope decision (§8); `details` names the actual reported ref-storage format; `resolveRepository` fails before any later step is reached for that repository. Distinct from a **malformed** `reftable`-backend repository, which is `GIT_COMMAND_FAILED` via the post-Git-failure secondary classifier (§8) — this code is reserved for a positively-recognized, *healthy* `reftable` repository |
+| `EXTERNAL_GIT_FILTER_UNSUPPORTED` | **New — Round 6 review finding #1, detection mechanism corrected Round 7 review finding #4.** BR3's repository-effective-attribute scan (`git check-attr --stdin -z filter` over every relevant tracked path, superproject and every initialized submodule recursively — §18) finds at least one path with an active `filter` attribute, run *before* any `status`/`diff` invocation that could trigger the corresponding driver — regardless of whether that driver's command definition is repository-local, global/user-level (and therefore otherwise hidden by BR3's own `GIT_CONFIG_GLOBAL`-neutralized inspection environment), or currently undefined. BR3 refuses to proceed rather than execute the external filter or suppress it and risk returning a false working-tree/diff fact (§18) | Expected — a real, anticipated repository-configuration condition; `details` names the affected path(s)/attribute value(s); the `status`/`diff` invocation that could trigger the filter is never run |
+| `UNSAFE_SUBMODULE_PATH` | **New — Round 7 review finding #5.** A gitlink working-tree path (mode `160000` in `git ls-files --stage -z`, §18) discovered during initialized-submodule enumeration is itself a symbolic link (detected via `lstat`, never a symlink-following `stat`), or the canonical (fully resolved) root of a would-be child repository has already been visited earlier in the same recursive enumeration (a cycle) | Expected — a real, anticipated adversarial-or-corrupted-repository condition; BR3 fails safely rather than recursing into a symlink-redirected or cyclic submodule path; `details` names the offending gitlink path |
 | `HEAD_UNAVAILABLE` | **Complete, final trigger condition (revised — corrects Round 4 review finding #5, which extended this beyond Round 1's `symbolic-ref`-exit-code-only definition): EITHER (a)** `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal/unborn/corrupt-but-symbolic) or 1 (detached) — verified as exit 128 for genuine `.git/HEAD` corruption — **OR (b)** `git symbolic-ref -q HEAD` succeeds (exit 0) but `git rev-parse --verify -q HEAD^{commit}` fails AND the resolved branch ref name itself (`git rev-parse --verify -q <resolved-ref-name>`, no `^{commit}`) exits 0 — i.e. HEAD is genuinely symbolic and points at a branch ref that exists, but that ref's stored value does not name a real commit object (§9's "corrupt HEAD" case; distinguished from the unborn case, where the same ref-name check exits 1) — **OR (c)** HEAD is direct/detached (`symbolic-ref -q HEAD` exits 1) but `git rev-parse --verify -q HEAD^{commit}` also fails (a detached HEAD pointing at a non-existent object). These three conditions are the exact, complete trigger set §9 defines; there is no fourth, undocumented path to this code | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
 | `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify --end-of-options <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
 | `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis |
@@ -2478,7 +2685,19 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
   directory from §8) — never a shell `cd` prefix, never a relative path
   resolved against the Node process's own `process.cwd()`. This is the
   "project root supplied through cwd / equivalent safe mechanism"
-  requirement, satisfied directly by `execFile`'s own `cwd` option.
+  requirement, satisfied directly by `execFile`'s own `cwd` option. **The
+  one, explicit, narrowly-scoped exception: the Git capability-floor
+  check (`git --version`, §8 step 0), which runs before any
+  `projectRoot` is confirmed to exist and therefore cannot use it as
+  `cwd`** — corrected, Round 7 review finding #3 (an earlier draft of
+  this specification stated both "every `execFile` call uses `cwd:
+  projectRoot`" here and "`git --version` has no `cwd` requirement" in
+  §8's Capability Floor subsection, an unreconciled contradiction). This
+  one invocation instead uses `cwd: process.cwd()` (or any fixed,
+  caller-independent directory) since it reads no repository state and
+  has no dependency on any particular working directory; this is the
+  shared exec primitive's own, single named exception, not a silent gap
+  in the `cwd: projectRoot` contract.
 - **`encoding: "buffer"` (equivalently, `encoding: null`), explicitly set
   on every `execFile` call — added per Round 2 review finding #3.**
   `execFile`'s default (`encoding: "utf8"`, i.e. omitting the option)
@@ -2624,50 +2843,132 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
        these two guarantees are in direct tension, and §6's "never
        executes arbitrary external code" guarantee wins: BR3 refuses
        rather than fabricates.
-    - **The corrected contract: detect, never execute, refuse safely.**
-      `git config --get-regexp
-      '^filter\..*\.(clean|process|smudge)$'` (the same genuinely
-      read-only, machine-readable, `--get`-family config query as
-      before — exits 1 with no output when none are configured) is run,
-      with `cwd` at `projectRoot`, **before** any `status`/`diff`
-      invocation that could trigger a configured filter — i.e. as part
-      of (or immediately following) `resolveRepository`'s own
-      validation, not interleaved with working-tree/diff parsing. The
-      identical enumeration also runs, recursively, against every
-      **initialized** submodule's own config (first-level and nested —
-      see the submodule-enumeration mechanism this section cross-
-      references below, itself corrected by Round 6 review finding #2 to
-      use a NUL-safe, non-human-oriented command), since a
-      submodule-local filter driver is exactly as executable during
-      BR3's `--ignore-submodules=none` status inspection (§11) as a
-      superproject-local one — the discovery scope is unchanged from
-      Round 5's; only the *response* to a discovered driver changes.
-      - **If the enumeration discovers zero configured `clean`/`process`/
-        `smudge` drivers anywhere** (superproject and every initialized
-        submodule, at every nesting depth): no filter can execute, `git
-        status`/`git diff --name-status` proceed exactly as this
-        specification otherwise documents (§11, §13), and no refusal
-        occurs. This remains the ordinary, ubiquitous case — most real
-        repositories configure no content-filter driver at all.
-      - **If the enumeration discovers one or more configured `clean`/
-        `process`/`smudge` drivers anywhere in scope** — regardless of
-        whether that specific driver's `required` key is set, and
-        regardless of whether the specific path(s) the current
-        `status`/`diff` call would actually touch are attributed to that
-        driver (determining *that* precisely, without risking invoking
-        the filter to find out, is not a distinction BR3 attempts to
-        draw safely) — `resolveRepository` (for the discovery that runs
-        as part of root validation) or the corresponding
-        `inspectWorkingTree`/`inspectDiff` call (for a driver newly
-        configured after `resolveRepository` already succeeded, if
-        implementation re-checks per-call rather than caching from
-        `resolveRepository` alone — see the caching note below) fails
-        with the new, dedicated `EXTERNAL_GIT_FILTER_UNSUPPORTED` error
-        code (§17), naming the discovered driver(s) in `details`. **The
-        `status`/`diff` invocation that could trigger the driver is never
-        run at all** — BR3 fails *before* the operation that could
-        execute the helper, not by running it with a suppressing
-        override and hoping the result is still faithful.
+    - **Round 6's config-enumeration discovery has its own blind spot —
+      corrected, Round 7 review finding #4.** Round 6 of this
+      specification discovered configured filter drivers via `git config
+      --get-regexp '^filter\..*\.(clean|process|smudge)$'`, run under
+      BR3's own sanitized execution environment (§19) — specifically,
+      with `GIT_CONFIG_GLOBAL` pointed at a null device, which is
+      required, independently, to neutralize an untrusted global
+      `core.excludesFile`/etc. (§19, Round 3 review finding #2). **This
+      is genuinely insufficient on its own:** a repository's
+      `.gitattributes` can declare `*.txt filter=canon` while the
+      corresponding `filter.canon.clean` driver *command* is defined only
+      in the **global** Git config — a config layer BR3's own
+      `GIT_CONFIG_GLOBAL=<null device>` deliberately hides from the
+      config-enumeration query. The enumeration therefore sees no driver
+      configured at all and lets `status`/`diff` proceed — but those
+      commands, run under the identical sanitized environment, encounter
+      an *attribute* that names a filter Git cannot find a driver command
+      for. **Verified directly:** a fixture with a repository
+      `.gitattributes` declaring `*.txt filter=canon`, a **global**
+      config (visible only when `GIT_CONFIG_GLOBAL` is *not* overridden)
+      declaring `filter.canon.clean=<uppercase-normalizer>` and
+      `filter.canon.required=true`, a committed canonical blob `HELLO`,
+      and working-tree content `hello` — ordinary Git, with the real
+      global filter visible, correctly reports the path clean; the
+      identical repository, inspected with `GIT_CONFIG_GLOBAL=/dev/null`
+      (BR3's own mandatory isolation), instead reports the path
+      **modified** — a false working-tree fact, reached *even with*
+      Round 6's config-enumeration discovery in place, since that
+      discovery (also run under the same neutralized global config) finds
+      no `filter.canon.clean` key at all and never triggers a refusal.
+      Config-enumeration alone cannot close this gap, because the very
+      isolation BR3 correctly applies for its *actual* inspection
+      commands is what hides the driver definition from the discovery
+      step too.
+    - **The corrected contract: detect repository-*effective* filter
+      *attribute usage*, not merely visible driver *definitions* —
+      never execute, refuse safely.** Instead of (or in addition to —
+      see below) asking "is a filter driver defined," BR3 asks the more
+      fundamental, correctly-scoped question: **"does any path this
+      inspection would touch have an active `filter` attribute at all,"**
+      using Git's own non-executing attribute-resolution machinery,
+      which answers this truthfully regardless of whether the
+      corresponding driver command is visible, defined, or even exists:
+      1. **Enumerate the relevant tracked paths** using the same
+         NUL-safe `git ls-files --stage -z` primitive already used for
+         submodule discovery (§18) — every tracked path is a candidate,
+         since any of them could carry a `filter` attribute via
+         `.gitattributes`.
+      2. **Query each path's repository-effective `filter` attribute**
+         via `git check-attr --stdin -z filter`, fed the NUL-delimited
+         path list from step 1 on stdin, with `--stdin -z` requested for
+         both input and output (Git supports NUL-delimited stdin/output
+         for `check-attr` specifically for this kind of bulk,
+         path-safe query). This is Git's own documented, **non-executing**
+         attribute-resolution query — `check-attr` reports what
+         attribute value(s) apply to each path exactly as Git's own
+         internal machinery would resolve them (including inherited
+         global/system-level attribute sources, exactly mirroring how a
+         real `status`/`diff` invocation would resolve the same
+         attribute), **without ever invoking the filter driver itself** —
+         it answers "what filter, if any, is attached to this path,"
+         never "run the filter and show me the result." Parsed via the
+         identical byte-first, NUL-split, strict-UTF-8 pipeline §13
+         already defines for every other path-bearing BR3 command.
+      3. **If any queried path reports an active `filter` attribute**
+         (a value other than Git's own `unspecified`/unset signal) —
+         **fail before any `status`/`diff` invocation** with
+         `EXTERNAL_GIT_FILTER_UNSUPPORTED` (§17), naming the affected
+         path(s)/attribute value(s) in `details`. This refusal applies
+         **unconditionally, regardless of where the corresponding driver
+         command is or isn't defined** — repository-local, included from
+         another config file, global/user-level (and therefore
+         intentionally hidden by BR3's own sanitized inspection
+         environment), or not defined anywhere at all (an attribute
+         naming a driver Git cannot even resolve, which — left
+         unaddressed — Git itself would likely fail on anyway, but BR3
+         does not rely on that failure to catch this case; the refusal
+         happens regardless). **The conservative refusal is always
+         preferred to silently proceeding and risking a changed content
+         semantics interpretation** — BR3 does not attempt to determine
+         whether a given attribute's driver would, in this specific
+         instance, actually alter the result; any active `filter`
+         attribute is sufficient grounds for refusal.
+      4. **The check itself never executes the filter** — `check-attr`
+         is, by Git's own design and documentation, a pure
+         attribute-resolution query with no content-transformation
+         side effect; this is what makes it safe to run
+         unconditionally, on every tracked path, before deciding whether
+         `status`/`diff` may proceed at all.
+      5. **`GIT_CONFIG_GLOBAL=<null device>` is preserved, unmodified,
+         for the actual BR3 inspection commands (`status`/`diff`
+         themselves) — this correction does not re-enable arbitrary
+         global Git config to make filter discovery possible.** The
+         `check-attr` query runs under the identical sanitized
+         environment as every other BR3 Git invocation (§19); it does
+         not need to see the global config to answer "does this path
+         have an active filter attribute," since `.gitattributes`
+         (repository-local, always visible) is what declares the
+         attribute in the first place — only the corresponding *driver
+         command definition* can live in the hidden global layer, and
+         this mechanism no longer depends on seeing that definition at
+         all, since it asks about attribute *usage*, not driver
+         *availability*.
+      6. **Config-enumeration discovery (the `filter.<name>.clean=` etc.
+         key search) is retained alongside this mechanism, not replaced
+         by it** — it remains a cheap, useful early signal (a repository
+         with zero declared filter drivers *and* zero active filter
+         attributes can skip even the `check-attr` scan as a fast path,
+         implementation's choice), but **the `check-attr`-based
+         effective-attribute check is the mechanism the correctness
+         guarantee actually rests on**; config-enumeration alone is
+         explicitly documented as insufficient, per the verified global-
+         config gap above, and must never be treated as sufficient on
+         its own by a future maintenance change.
+      7. **Recursion into every initialized submodule, identically —
+         unchanged in scope from Round 6, corrected in mechanism:** the
+         identical `ls-files --stage -z` enumeration → `check-attr
+         --stdin -z filter` query sequence runs, recursively, against
+         every **initialized** submodule's own tracked paths (first-level
+         and nested — via the submodule-enumeration mechanism below,
+         itself corrected by Round 6 review finding #2 to use a NUL-safe,
+         non-human-oriented command, and by Round 7 review finding #5 to
+         be symlink/cycle-safe), since a submodule-local `.gitattributes`
+         rule is exactly as reachable during BR3's
+         `--ignore-submodules=none` status inspection (§11) as a
+         superproject-local one.
       - **`core.fsmonitor` is unaffected by this correction and remains
         suppressed via `-c core.fsmonitor=`, never refused.** `fsmonitor`
         is a pure filesystem-change-detection *optimization hook* — Git's
@@ -2686,21 +2987,22 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
         retained exactly as previously specified, for both the
         superproject and every initialized submodule.
     - **No mutation, no execution, no masking:** at no point does this
-      corrected mechanism run the discovered driver, run a no-op
+      corrected mechanism run a discovered driver, run a no-op
       replacement and present its output as equivalent, or otherwise
-      attempt to "safely" execute or emulate the filter. The enumeration
-      query (`config --get-regexp`) only ever reads configuration text;
-      it never triggers the filter itself (a `--get`-family config query
-      cannot invoke a content filter, which is only ever reachable
-      through a content-comparison operation like `status`/`diff`/
-      `checkout`, none of which run before the refusal is decided).
+      attempt to "safely" execute or emulate the filter. Neither the
+      config-enumeration query (`config --get-regexp`, read-only
+      configuration text only) nor `check-attr --stdin -z` (a pure,
+      non-executing attribute-resolution query, by Git's own design)
+      ever triggers the filter itself — a content filter is only ever
+      reachable through an actual content-comparison operation
+      (`status`/`diff`/`checkout`), none of which run before the refusal
+      is decided.
     - **Caching:** implementation may perform this discovery once per
-      `resolveRepository`-validated `projectRoot` (submodule
-      initialization/filter configuration is not expected to change
-      mid-call) rather than once per `status`/`diff` call — this is an
-      internal implementation choice, not a caller-visible contract,
-      exactly mirroring Round 5's identical caching note for the
-      (withdrawn) suppression mechanism.
+      `resolveRepository`-validated `projectRoot` (tracked-path/attribute
+      configuration is not expected to change mid-call) rather than once
+      per `status`/`diff` call — this is an internal implementation
+      choice, not a caller-visible contract, exactly mirroring Round 5's
+      identical caching note for the (withdrawn) suppression mechanism.
 - **Initialized-submodule enumeration — corrected mechanism, Round 6
   review finding #2: `git submodule status --recursive` is withdrawn.**
   Round 5 of this specification enumerated initialized submodules
@@ -2744,25 +3046,61 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
   3. For each gitlink path found, **determine whether it is genuinely
      initialized (its working tree actually populated) without
      initializing or mutating it and without executing anything inside
-     it:** check, via plain, ordinary filesystem inspection (`fs.stat`/
-     `fs.readdir` — no Git invocation against the submodule path yet),
-     whether `<gitlinkPath>/.git` exists (file or directory). An
-     uninitialized submodule (`git submodule update --init` never run,
-     or explicitly deinitialized) has **no** `.git` entry at all — its
-     directory is empty or absent from the working tree — so this check
-     alone, performed with zero Git subprocess invocations against the
-     submodule path, safely and conclusively distinguishes "nothing to
-     inspect here" from "a real checkout exists here" before BR3 ever
-     runs a Git command with `cwd` inside it. A gitlink path whose `.git`
-     entry is absent is excluded from every further step below —
-     consistent with Round 5's original intent ("an uninitialized
-     submodule has no checked-out working tree... BR3 does not initialize
-     it itself"), now reached via a safe filesystem check instead of
-     parsing a human-oriented status-line prefix character.
-  4. For each gitlink path confirmed initialized by step 3, **validate
-     it safely** before treating it as a nested repository to enumerate
-     into: run `resolveRepository`-equivalent validation (§8) with that
-     path as the candidate root — i.e. the same Git-first
+     it — and, corrected, Round 7 review finding #5, without ever
+     following a symlink at the gitlink working-tree path itself:**
+     - **First, `lstat` (never a symlink-following `stat`/`fs.stat`) the
+       gitlink working-tree path itself** — the plain filesystem entry at
+       `<gitlinkPath>`. **If this entry is a symbolic link, it is never
+       treated as an initialized submodule checkout, unconditionally, no
+       matter what it resolves to.** This is a deliberate, mandatory
+       safety rule, not an incidental check: **verified directly** —
+       replacing a real, previously-checked-out submodule's own working-
+       tree directory (`sub`) with a symlink `sub -> .` (pointing back at
+       the *superproject's own root*) leaves `git ls-files --stage`
+       still, correctly, reporting `sub` as mode `160000` (the gitlink
+       entry lives in the index, unaffected by what currently occupies
+       the working-tree path), while `sub/.git` now resolves (through the
+       symlink) to the *superproject's own* `.git`, and a Git command run
+       with `cwd=sub` genuinely operates against the superproject itself
+       — a naive "does `<gitlinkPath>/.git` exist" check, without first
+       `lstat`-checking `<gitlinkPath>` itself, would treat this as a
+       valid, initialized submodule and recurse into validating and
+       enumerating the *superproject's own repository* as if it were a
+       distinct child — the exact unbounded-recursion hazard this
+       correction closes. A symlinked gitlink path can equally target a
+       wholly unrelated external repository elsewhere on disk, letting
+       recursive submodule enumeration escape the intended repository
+       tree entirely. **Fail safely rather than silently follow it:** a
+       gitlink path whose `lstat` reports a symbolic link produces
+       `UNSAFE_SUBMODULE_PATH` (§17) for the enclosing enumeration —
+       exactly the same "fail rather than silently skip a potentially
+       executable/unsafe configuration" principle §18's filter-discovery
+       mechanism already applies, now extended to a structurally
+       different but equally real hazard (path redirection/traversal,
+       not helper execution).
+     - **Only if `lstat` reports an ordinary directory (or, for a
+       worktree-style checkout, a regular file, mirroring §8's own
+       `.git`-file-or-directory handling) at `<gitlinkPath>` itself**,
+       check, via plain, ordinary filesystem inspection (no Git
+       invocation against the submodule path yet), whether
+       `<gitlinkPath>/.git` exists (file or directory). An uninitialized
+       submodule (`git submodule update --init` never run, or explicitly
+       deinitialized) has **no** `.git` entry at all — its directory is
+       empty or absent from the working tree — so this check alone,
+       performed with zero Git subprocess invocations against the
+       submodule path, safely and conclusively distinguishes "nothing to
+       inspect here" from "a real checkout exists here" before BR3 ever
+       runs a Git command with `cwd` inside it. A gitlink path whose
+       `.git` entry is absent is excluded from every further step below
+       — consistent with Round 5's original intent ("an uninitialized
+       submodule has no checked-out working tree... BR3 does not
+       initialize it itself"), now reached via a safe filesystem check
+       instead of parsing a human-oriented status-line prefix character.
+  4. For each gitlink path confirmed initialized (and confirmed
+     **not** itself a symlink) by step 3, **validate it safely** before
+     treating it as a nested repository to enumerate into: run
+     `resolveRepository`-equivalent validation (§8) with that path as the
+     candidate root — i.e. the same Git-first
      `--is-bare-repository`/`--git-dir`/`--git-common-dir` sequence
      already defined for any other `projectRoot`. If this validation
      fails for any reason (the `.git` entry exists but is itself
@@ -2776,16 +3114,40 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
      round's finding requires: "if a child repository cannot be safely
      inspected, return the appropriate typed failure rather than silently
      skipping a potentially executable configuration."
-  5. **Recurse:** for each safely-validated, initialized submodule path,
-     repeat step 1 (`git ls-files --stage -z`, `cwd` at that submodule's
-     own path) to discover any further, nested gitlinks, applying steps
-     2–4 identically at each level. This naturally walks the full nested
-     submodule tree using only the same safe, NUL-delimited primitive at
-     every depth — there is no separate "nested" mechanism, exactly
-     mirroring how Round 5's `--recursive` flag was intended to cover
-     nesting, but now achieved through recursion over a path-safe
-     command instead of a single human-oriented command's own built-in
-     recursion.
+  4a. **Cycle guard — new, mandatory, Round 7 review finding #5:** before
+     recursing into a step-4-validated child repository, canonicalize its
+     resolved root (`fs.realpath` — the same canonicalization mechanism
+     §8 already uses for `projectRoot`/`--show-toplevel` comparison) and
+     check it against a **visited set of canonical repository roots**
+     maintained for the lifetime of one top-level enumeration call (the
+     top-level `projectRoot`'s own canonical root seeds this set before
+     recursion begins). **If the child's canonical root is already in the
+     visited set, the enumeration fails deterministically with
+     `UNSAFE_SUBMODULE_PATH` (§17) rather than recursing again** — this
+     is what makes a cycle (a symlink or absorbed-gitdir configuration
+     that causes a "child" to resolve back to an already-visited
+     repository, including the top-level repository itself) terminate
+     safely instead of recursing unboundedly. Only after this check
+     passes is the child's canonical root added to the visited set and
+     recursion (step 5) performed into it. This guard is independent of,
+     and in addition to, step 3's symlink rejection — step 3 catches the
+     common, direct case (the gitlink working-tree path itself is a
+     symlink); this guard catches the more general case (an absorbed
+     gitdir, a bind mount, or any other mechanism that could otherwise
+     produce a canonical-root cycle without the gitlink path itself being
+     a symlink).
+  5. **Recurse:** for each safely-validated, initialized, non-symlinked,
+     not-already-visited submodule path, repeat step 1 (`git ls-files
+     --stage -z`, `cwd` at that submodule's own path) to discover any
+     further, nested gitlinks, applying steps 2–4a identically at each
+     level. This naturally walks the full nested submodule tree using
+     only the same safe, NUL-delimited primitive at every depth — there
+     is no separate "nested" mechanism, exactly mirroring how Round 5's
+     `--recursive` flag was intended to cover nesting, but now achieved
+     through recursion over a path-safe command instead of a single
+     human-oriented command's own built-in recursion, and now bounded by
+     the cycle guard above rather than relying on the nested tree being
+     acyclic by assumption.
   6. **`git submodule foreach` is never used, anywhere in BR3, for this
      or any other purpose.** It evaluates a caller/config-supplied
      command string *inside* each submodule's own context — a
@@ -2798,19 +3160,39 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
      initialized" — both the filter/fsmonitor-driver discovery above and
      any other BR3 behavior that reasons about initialized submodules —
      so there is exactly one place this logic could regress, not a
-     duplicated implementation per caller.
+     duplicated implementation per caller. This includes the symlink
+     rejection (step 3) and cycle guard (step 4a): every BR3 consumer of
+     this enumeration mechanism automatically inherits both protections,
+     since they are internal to the one shared mechanism, not a
+     per-caller responsibility.
+  8. **Legitimate shapes remain fully supported:** an ordinary initialized
+     submodule (a plain directory containing a `.git` file pointing into
+     `<superproject>/.git/modules/<name>` — the standard "absorbed
+     gitdir" layout `git submodule add` produces), and a nested submodule
+     (a submodule-of-a-submodule using the identical layout one level
+     deeper), are both ordinary directories at every level — never
+     symlinks — and therefore pass step 3 without triggering
+     `UNSAFE_SUBMODULE_PATH`, exactly as before this round's correction;
+     only a genuinely symlinked gitlink path, or a genuine canonical-root
+     revisit, triggers the new safety behavior.
 
   **Command allowlist correction:** this specification's Git-subcommand
   allowlist (§5, §6, §27, and every place this document names "the
-  commands BR3 invokes") is corrected to add `ls-files` alongside
-  `status`, `diff`, `rev-parse`, `symbolic-ref`, `config` — it is no
-  longer accurate to state BR3's implementation contains only those five
-  read-only subcommands. `ls-files --stage -z` is read-only (it reads the
-  index; it performs no working-tree scan and triggers no content-filter
-  invocation — `--stage` reports the index's own recorded mode/object/
-  stage for each path directly, with no content comparison at all) and
-  fits the identical "argv-array, NUL-delimited, machine-readable
-  plumbing" discipline every other allowlisted command already follows.
+  commands BR3 invokes") is corrected to add `ls-files` and `check-attr`
+  alongside `status`, `diff`, `rev-parse`, `symbolic-ref`, `config` — it
+  is no longer accurate to state BR3's implementation contains only the
+  original five read-only subcommands. `ls-files --stage -z` is
+  read-only (it reads the index; it performs no working-tree scan and
+  triggers no content-filter invocation — `--stage` reports the index's
+  own recorded mode/object/stage for each path directly, with no content
+  comparison at all) and fits the identical "argv-array, NUL-delimited,
+  machine-readable plumbing" discipline every other allowlisted command
+  already follows. `check-attr --stdin -z filter` (added — Round 7
+  review finding #4, the effective-filter-attribute detection mechanism
+  above) is likewise read-only and non-executing by Git's own design —
+  it resolves attribute values for supplied paths without ever invoking
+  a content filter — and follows the identical NUL-delimited,
+  machine-readable-input/output discipline.
 
 ## 19. Determinism
 
@@ -3230,23 +3612,29 @@ includes, unconditionally:
   --untracked-files=all --ignore-submodules=none`, always together, never
   a subset, always preceded by the mandatory `-c core.fsmonitor=`
   override (§11, §18, Round 4 review finding #3) — and only ever run at
-  all once the filter/process-driver discovery (§18, Round 6 review
-  finding #1) has confirmed zero such drivers are configured anywhere in
-  scope; a discovered driver produces `EXTERNAL_GIT_FILTER_UNSUPPORTED`
-  instead, before this invocation ever runs (§17, §18)** (§11 — restated
-  here so this section, §11, §20, and §27 all name the identical command
-  with no drift between them).
+  all once BR3's effective-filter-attribute scan (`git check-attr --stdin
+  -z filter` over every relevant tracked path, superproject and every
+  initialized submodule recursively — §18, Round 6 review finding #1,
+  detection mechanism corrected Round 7 review finding #4) has confirmed
+  no path in scope has an active `filter` attribute; a discovered active
+  attribute produces `EXTERNAL_GIT_FILTER_UNSUPPORTED` instead, before
+  this invocation ever runs (§17, §18)** (§11 — restated here so this
+  section, §11, §20, and §27 all name the identical command with no drift
+  between them).
 - **No reliance on Git aliases:** every BR3 Git invocation uses a
   first-argument literal plumbing/porcelain subcommand name
-  (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`, `ls-files`)
-  that ships with Git itself — never a user-configurable alias name — so
-  a local `~/.gitconfig`'s `[alias]` section can never redirect a BR3
-  invocation to different, unexpected behavior. (`config` is used
-  read-only, for `--get branch.<branch>.remote`/`.merge` — §9/§10's
-  upstream-identity determination, and for the filter/fsmonitor-driver
-  enumeration query — §18; `ls-files --stage -z` is used read-only, for
-  initialized-submodule discovery — §18's corrected submodule-enumeration
-  mechanism, Round 6 review finding #2.)
+  (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`, `ls-files`,
+  `check-attr`) that ships with Git itself — never a user-configurable
+  alias name — so a local `~/.gitconfig`'s `[alias]` section can never
+  redirect a BR3 invocation to different, unexpected behavior. (`config`
+  is used read-only, for `--get branch.<branch>.remote`/`.merge` —
+  §9/§10's upstream-identity determination, and for the
+  filter/fsmonitor-driver-command enumeration query — §18; `ls-files
+  --stage -z` is used read-only, for initialized-submodule discovery —
+  §18's corrected submodule-enumeration mechanism, Round 6 review finding
+  #2; `check-attr --stdin -z filter` is used read-only and
+  non-executing, for effective-filter-attribute detection — §18, Round 7
+  review finding #4.)
 - **`GIT_TERMINAL_PROMPT=0`:** ensures Git never attempts an interactive
   credential/host-key prompt, which is doubly redundant with §6's "no
   network access" guarantee (none of BR3's commands ever contact a
@@ -3399,6 +3787,40 @@ current validation algorithm)**
   --version` produces no `.git/index`/ref/config changes, confirmed by
   the same byte-level snapshot technique the existing index-mutation
   regression test (§20) already uses
+- **Capability probe `cwd` behavior — new, Round 7 review finding #3**
+  (asserted at the `internal/exec.ts` call-site level, e.g. by recording
+  the actual `cwd` option passed for the `git --version` invocation) →
+  confirms this one invocation genuinely uses the documented, explicit
+  exception (`process.cwd()`/a fixed directory), never `projectRoot`
+  (which is not yet known to exist at the point this check runs), and
+  that every other BR3 `execFile` call continues to use `cwd:
+  projectRoot` exactly as before — proving §8 and §18 no longer state
+  contradictory `cwd` contracts
+- **Executable-identity binding — mandatory, new, Round 7 review finding
+  #3** (a test-controlled `PATH` with two distinct fixture `git`-named
+  executables — a real, supported `git` at one `PATH` entry, and a
+  second, distinct executable resolved from a different `PATH` entry
+  after the test rewrites `PATH` mid-test — never uninstalling the
+  real system Git):
+  - First call resolves and validates the first, genuinely-supported
+    `git`, succeeding.
+  - `PATH` (or whatever executable-resolution input the implementation
+    keys on) is then changed so a subsequent `execFile("git", ...)`
+    would resolve to the *second*, distinct executable identity.
+  - A subsequent top-level BR3 operation against the same or a different
+    `projectRoot` **revalidates** the capability check against the newly
+    -resolved executable identity — asserted by confirming the
+    capability-check invocation genuinely runs again (e.g. via a call-count
+    assertion on the shared exec primitive) rather than trusting the
+    first call's cached result for the now-different executable — proving
+    a stale, no-longer-applicable capability result can never be
+    silently reused across a `PATH`/executable-identity change.
+  - A variant of this fixture where the second resolved executable is
+    itself a below-floor (or malformed-version-string) stand-in confirms
+    the revalidation genuinely re-rejects, producing
+    `GIT_VERSION_UNSUPPORTED` for the second call even though the first
+    call, against the first executable, succeeded — proving the binding
+    is genuinely enforced, not merely re-run-but-still-trusting-the-old-result
 
 **Object format / SHA width (§8) — mandatory, new, Round 6 review
 finding #4**
@@ -3419,6 +3841,22 @@ finding #4**
   function is provably unreached (e.g. via a call-count assertion or
   equivalent) once `resolveRepository` has already failed with
   `UNSUPPORTED_OBJECT_FORMAT` for that `projectRoot`
+
+**Ref storage format (§8) — mandatory, new, Round 7 review finding #1**
+- **Healthy traditional (`files`-backend) repository** (ordinary `git
+  init`, no `extensions.refStorage` config key set) →
+  `resolveRepository` succeeds, no `UNSUPPORTED_REF_FORMAT`
+- **Healthy `reftable`-backend repository** (`git init
+  --ref-format=reftable` on a Git version within BR3's supported floor)
+  → `UNSUPPORTED_REF_FORMAT`, with `resolveRepository` failing before any
+  later step is ever reached against that repository — proving BR3 v0.1's
+  reftable-rejection decision is genuinely enforced, not merely stated
+- **Malformed `reftable`-backend repository remains `GIT_COMMAND_FAILED`,
+  never conflated with `UNSUPPORTED_REF_FORMAT`** — re-asserted here
+  against the malformed-bare-`reftable` fixture below, confirming the two
+  codes are reached via genuinely distinct paths (one via the
+  post-Git-failure secondary classifier when Git itself cannot answer at
+  all, the other via a positive, successful config read)
 
 **Ref-backend-aware malformed-repository classification (§8) —
 mandatory, new, Round 6 review finding #5**
@@ -3521,6 +3959,18 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   regression test proving the removed fallback is not reconstructed for
   the local-branch-upstream subcase either, which never had a
   `refs/remotes/` entry to begin with (§9/§10)
+- **Flag-shaped branch name with a valid upstream — mandatory, new, Round
+  7 review finding #6** (a real fixture: `HEAD` pointing at a branch
+  literally named `-foo`, with `branch.-foo.remote` set to `"."` and
+  `branch.-foo.merge` set to `refs/heads/main` against a real local
+  `main` branch) → `inspectHead` correctly resolves `upstream.sha`/
+  `upstream.ref` for this branch, proving
+  `--end-of-options` in the upstream-resolution commands (§9, §10)
+  genuinely prevents Git from misinterpreting `-foo@{upstream}` as a
+  flag-shaped argument — first confirmed, in the test's own setup, that
+  the identical revision expression **without** `--end-of-options` fails
+  against this exact fixture (establishing the hazard is real, not
+  hypothetical), then that `inspectHead` itself succeeds
 - No network operation occurs during any BR3 test (asserted structurally,
   e.g. by running in an environment with no network access, or by
   confirming no test ever configures a real, reachable remote URL)
@@ -3546,12 +3996,26 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
 - Renamed (staged, above the 50% threshold) → `staged_rename` with
   correct `oldPath`/`similarity`
 - **Renamed (unstaged, above the 50% threshold) — new, Round 6 review
-  finding #6** (a tracked file renamed on disk via a plain filesystem
-  rename, deliberately never staged with `git add`, content preserved
-  above the similarity threshold) → `unstaged_rename` with correct
-  `oldPath`/`similarity`, proving the previously-discarded `2 .R`
-  porcelain v2 record data is now genuinely surfaced, not collapsed into
-  a plain `unstaged_modify`
+  finding #6, fixture corrected, Round 7 review finding #2** (a tracked
+  file renamed on disk via a plain filesystem rename (`mv old.txt
+  new.txt`), content preserved above the similarity threshold, followed
+  by `git add -N new.txt` — intent-to-add, a test/fixture-setup-only
+  index operation that stages no content and leaves the change fully
+  unstaged; BR3 itself never performs this or any other index operation)
+  → `unstaged_rename` with correct `oldPath`/`similarity`, proving the
+  previously-discarded `2 .R` porcelain v2 record data is now genuinely
+  surfaced, not collapsed into a plain `unstaged_modify`
+- **Plain filesystem rename with no index operation remains correctly
+  reported as delete + untracked, never a synthesized rename — new,
+  mandatory, Round 7 review finding #2** (the identical `mv old.txt
+  new.txt` as the fixture above, but **without** the `git add -N`
+  intent-to-add step) → `unstaged_delete` on the old path and
+  `untracked` on the new path, as two independent entries — first
+  confirmed, in the test's own setup, that BR3's exact `status`
+  invocation against this exact state genuinely does **not** produce
+  `2 .R`/`unstaged_rename` (establishing this as the real, verified
+  reachability boundary, not an assumption) — proving BR3 never
+  synthesizes a rename relationship Git itself did not provide
 - Renamed below the 50% threshold → represented as separate delete + add,
   never forced into a synthetic rename (both staged and unstaged
   subcases)
@@ -3744,17 +4208,19 @@ signature, corrects Round 1 review finding #4**
   without requiring a refusal, consistent with fsmonitor's status as a
   pure optimization hook that cannot alter clean/modified semantics.
 - **External content-filter refusal — corrected mechanism, mandatory,
-  Round 6 review finding #1 (supersedes Round 4/5's suppression-based
-  tests for `filter.<driver>.clean`/`.process`; withdrawn suppression
-  behavior must not reappear):**
+  Round 6 review finding #1, detection mechanism corrected Round 7 review
+  finding #4 (supersedes Round 4/5's suppression-based tests for
+  `filter.<driver>.clean`/`.process`; withdrawn suppression behavior must
+  not reappear; supersedes reliance on config-enumeration alone, proven
+  insufficient by case D below):**
   - **(A) Ordinary external clean filter → typed refusal, marker never
     executed:** configure a fixture repository with a `.gitattributes`
     rule assigning a `filter=<name>` attribute to a path, and
     `filter.<name>.clean` pointing at a real, marker-writing script (no
     `required` key set). Call `resolveRepository`/`inspectWorkingTree`
     against that fixture and assert: (i) the result is
-    `EXTERNAL_GIT_FILTER_UNSUPPORTED` (§17), naming the driver in
-    `details`; (ii) the marker file was **not** created — proving BR3
+    `EXTERNAL_GIT_FILTER_UNSUPPORTED` (§17), naming the affected path(s)
+    in `details`; (ii) the marker file was **not** created — proving BR3
     never ran `git status`/`git diff` at all for this repository, not
     merely that it ran them with the filter suppressed.
   - **(B) `filter.<driver>.required = true` → identical deterministic
@@ -3772,33 +4238,64 @@ signature, corrects Round 1 review finding #4**
     (`filter.<name>.process`) instead of the two-command `clean`/`smudge`
     pair → same `EXTERNAL_GIT_FILTER_UNSUPPORTED` result, marker never
     created.
-  - **(D) First-level submodule-local filter → refusal:** a superproject
-    with one initialized submodule; the submodule's **own** `.git/config`
-    (verified set from inside the submodule's own checkout, not the
-    superproject's) declares `filter.<name>.clean` pointing at a real
-    marker-writing script, and the submodule's own `.gitattributes`
-    (also inside the submodule's own checkout) assigns `filter=<name>` to
-    a path; the superproject itself declares no such filter anywhere.
-    Call `inspectWorkingTree` against the superproject's `projectRoot`
-    and assert `EXTERNAL_GIT_FILTER_UNSUPPORTED`, marker file **not**
-    created — proving the submodule-scoped enumeration (§18) discovers
-    the submodule-local driver and causes a refusal, not merely a
+  - **(D) `.gitattributes` references a driver defined ONLY in a fake
+    global Git config → refusal before status, even though
+    `GIT_CONFIG_GLOBAL` is neutralized for actual inspection — mandatory,
+    new, Round 7 review finding #4, the specific regression case proving
+    config-enumeration alone is insufficient:** a fixture repository's
+    `.gitattributes` declares `*.txt filter=canon`; a **global** Git
+    config (constructed in the test's own setup, visible only when
+    `GIT_CONFIG_GLOBAL` is *not* overridden) declares
+    `filter.canon.clean=<marker-writing, uppercase-normalizing script>`
+    and `filter.canon.required=true`; the repository's own local config
+    declares no filter at all. First confirm, in the test's own setup,
+    that BR3's config-enumeration query (`git config --get-regexp
+    '^filter\..*\.(clean|process|smudge)$'`) run under BR3's own
+    sanitized (`GIT_CONFIG_GLOBAL=<null device>`) environment genuinely
+    finds **zero** matches for this fixture (establishing that
+    config-enumeration alone would incorrectly conclude "no filter,
+    proceed" — the exact gap this round closes). Then call
+    `resolveRepository`/`inspectWorkingTree` and assert:
+    `EXTERNAL_GIT_FILTER_UNSUPPORTED` is still produced, and the marker
+    script is **not** executed — proving the `check-attr`-based
+    effective-attribute scan catches this case where config-enumeration
+    alone would not.
+  - **(E) Marker proves the filter never executes, including via the
+    check-attr scan itself:** across every fixture above, assert the
+    marker file is never created at any point during the entire
+    `resolveRepository`/`inspectWorkingTree`/`inspectDiff` call sequence
+    — including confirming `check-attr --stdin -z filter` itself,
+    run directly against a filter-attributed path in isolation, does not
+    trigger the marker (proving `check-attr` is genuinely non-executing,
+    not merely "didn't happen to trigger it in these particular
+    fixtures").
+  - **(F) First-level submodule attribute → refusal:** a superproject
+    with one initialized submodule; the submodule's **own**
+    `.gitattributes` (verified set inside the submodule's own checkout,
+    not the superproject's) assigns `filter=<name>` to a path, with
+    `filter.<name>.clean` defined (repository-locally, for this case)
+    pointing at a real marker-writing script; the superproject itself
+    declares no such attribute anywhere. Call `inspectWorkingTree`
+    against the superproject's `projectRoot` and assert
+    `EXTERNAL_GIT_FILTER_UNSUPPORTED`, marker file **not** created —
+    proving the submodule-scoped `check-attr` scan (§18) discovers the
+    submodule-local attribute and causes a refusal, not merely a
     suppressed-but-still-run invocation.
-  - **(E) Nested-submodule-local filter → refusal:** identical to (D),
-    but the filter driver is configured inside a submodule-of-a-submodule
+  - **(G) Nested submodule attribute → refusal:** identical to (F), but
+    the `filter`-attributed path is inside a submodule-of-a-submodule
     rather than the first-level submodule directly → identical
     `EXTERNAL_GIT_FILTER_UNSUPPORTED` result, proving the recursive,
     NUL-safe submodule enumeration (§18, Round 6 review finding #2)
-    genuinely walks the full nested tree for filter-discovery purposes,
-    not only one level deep.
-  - **(F) Normal repository with no external filter remains fully
-    inspectable:** a fixture with zero configured `clean`/`process`/
-    `smudge` drivers anywhere (superproject and any initialized
-    submodules) → `resolveRepository`/`inspectWorkingTree`/`inspectDiff`
-    all succeed normally, proving the discovery-and-refuse mechanism does
-    not introduce a false-positive refusal for the ordinary, filter-free
-    case that constitutes the overwhelming majority of real repositories.
-  - **(G) `core.fsmonitor` suppression remains effective inside submodule
+    genuinely walks the full nested tree for effective-attribute
+    detection, not only one level deep.
+  - **(H) Repository with no filter attribute remains inspectable:** a
+    fixture with zero `filter`-attributed tracked paths anywhere
+    (superproject and any initialized submodules) →
+    `resolveRepository`/`inspectWorkingTree`/`inspectDiff` all succeed
+    normally, proving the discovery-and-refuse mechanism does not
+    introduce a false-positive refusal for the ordinary, filter-free case
+    that constitutes the overwhelming majority of real repositories.
+  - **`core.fsmonitor` suppression remains effective inside submodule
     inspection — restated for the new submodule-enumeration mechanism:**
     a superproject with one initialized submodule; the submodule's own
     `.git/config` (not the superproject's) configures `core.fsmonitor`
@@ -3836,6 +4333,41 @@ signature, corrects Round 1 review finding #4**
   literally searching the implementation for these exact command
   strings, asserting neither appears anywhere in
   `packages/core/src/git/`.
+- **Submodule-enumeration symlink and cycle safety — mandatory, new,
+  Round 7 review finding #5:**
+  - **Normal initialized submodule succeeds** — a plain, ordinary
+    initialized submodule (standard absorbed-gitdir layout, no symlink
+    anywhere in the path) → enumeration succeeds, no
+    `UNSAFE_SUBMODULE_PATH`, re-asserting the ordinary case is unaffected
+    by this round's correction.
+  - **Nested normal submodule succeeds** — a submodule-of-a-submodule,
+    both ordinary directories → enumeration succeeds and recurses two
+    levels deep, no `UNSAFE_SUBMODULE_PATH`.
+  - **Gitlink path replaced by a symlink to the superproject itself**
+    (the verified reproduction: a real initialized submodule's own
+    working-tree directory removed and replaced with a symlink
+    `sub -> .`, so `sub/.git` resolves back to the superproject's own
+    `.git`) → `UNSAFE_SUBMODULE_PATH`, with **no recursion loop** —
+    proven by asserting the enumeration terminates (e.g. within a bounded
+    call-count or time budget) rather than hanging or exhausting stack/
+    memory, and that the symlink is detected via `lstat` before any Git
+    command is ever run with `cwd` inside it.
+  - **Gitlink path replaced by a symlink to an unrelated external
+    repository** (a symlink pointing at a second, separate, real Git
+    repository fixture elsewhere on disk, unrelated to the superproject
+    under test) → `UNSAFE_SUBMODULE_PATH`, with the external repository
+    **never** recursively inspected — proven by asserting no Git
+    subprocess is ever invoked with `cwd` inside the external
+    repository's own directory tree, confirming the symlink rejection
+    happens before any such invocation, not merely that its results are
+    discarded afterward.
+  - **Cycle via a non-symlink mechanism, if constructible** (e.g. an
+    absorbed gitdir configuration engineered so a validated child
+    repository's own canonical root equals an already-visited root) →
+    `UNSAFE_SUBMODULE_PATH` via the visited-canonical-root guard (step
+    4a, §18), independently of the symlink-specific check above —
+    proving the two mechanisms are genuinely independent safety layers,
+    not a single check doing double duty.
 - **Index-mutation regression — mandatory, new (Round 3 review finding
   #1):** against a fixture repository with one committed, unchanged
   tracked file, snapshot `.git/index`'s raw bytes (or a hash of them)
@@ -4098,24 +4630,30 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   execution, evidence generation, agent skills, adapters, CI/network/
   deployment integration) leaked into the implementation.
 - **O.** — new, Round 5 review findings #1 and #2, (ii) corrected by
-  Round 6 review finding #1. **(i)** `GIT_NO_LAZY_FETCH=1` is genuinely
+  Round 6 review finding #1, detection mechanism further corrected by
+  Round 7 review finding #4. **(i)** `GIT_NO_LAZY_FETCH=1` is genuinely
   re-added, unconditionally, to every BR3 Git subprocess after §19's
   `GIT_*`-prefix strip, and a real, fully-local partial-clone fixture
   missing a required object fails deterministically (`GIT_COMMAND_FAILED`)
   rather than triggering a silent on-demand promisor fetch (§6, §19,
-  §20). **(ii)** The `core.fsmonitor` suppression, and the filter-driver
-  **discovery** (`clean`/`process`/`smudge`, leading to a typed
+  §20). **(ii)** The `core.fsmonitor` suppression, and effective-
+  filter-attribute **detection** (via `git check-attr --stdin -z
+  filter` over every relevant tracked path — corrected, Round 7 review
+  finding #4, superseding reliance on config-enumeration of
+  `clean`/`process`/`smudge` driver *definitions* alone, which is
+  insufficient against a driver defined only in a global config BR3's
+  own sanitized environment intentionally hides — leading to a typed
   `EXTERNAL_GIT_FILTER_UNSUPPORTED` refusal rather than a suppressing
-  override — corrected, Round 6 review finding #1), each genuinely
-  extend to every initialized submodule's own local configuration,
-  recursively through nested submodules — not only the superproject's —
-  discovered via the NUL-safe, `git ls-files --stage -z`-based
-  gitlink-enumeration mechanism (never `git submodule status
-  --recursive`/`git submodule foreach` — Round 6 review finding #2), with
-  an uninitialized submodule correctly excluded from the enumeration
-  rather than initialized by BR3 itself, proven by the dedicated
-  first-level and nested-submodule marker-script regression tests (§11,
-  §18, §20).
+  override), each genuinely extend to every initialized submodule's own
+  tracked paths, recursively through nested submodules — not only the
+  superproject's — discovered via the NUL-safe, `git ls-files --stage
+  -z`-based gitlink-enumeration mechanism (never `git submodule status
+  --recursive`/`git submodule foreach` — Round 6 review finding #2, made
+  symlink/cycle-safe by Round 7 review finding #5), with an uninitialized
+  submodule correctly excluded from the enumeration rather than
+  initialized by BR3 itself, proven by the dedicated first-level and
+  nested-submodule marker-script regression tests, including the
+  global-config-blind-spot case (§11, §18, §20).
 - **P.** — new, Round 6 review findings #3, #4, #5, and #7. **(i)** A
   `git` binary below BR3's 2.45.0 capability floor, or one reporting an
   unparseable `--version` string, is rejected as `GIT_VERSION_UNSUPPORTED`
@@ -4138,6 +4676,56 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   already succeeded with `false` is classified as `GIT_COMMAND_FAILED`,
   never `NOT_A_GIT_REPOSITORY` — `NOT_A_GIT_REPOSITORY` remains reachable
   only via the genuine no-repository path (§8, §20).
+- **Q.** — new, Round 7 review finding #1. A healthy repository using
+  Git's `reftable` ref-storage backend (`extensions.refStorage =
+  reftable`, detected via `git config --get extensions.refStorage`, §8
+  step 5b) is rejected as `UNSUPPORTED_REF_FORMAT` — a final, resolved
+  v0.1 contract, not deferred — while a healthy traditional (`files`
+  backend) repository is unaffected, and a **malformed** `reftable`
+  repository continues to be correctly classified as `GIT_COMMAND_FAILED`
+  via the existing, ref-backend-aware post-Git-failure secondary
+  classifier (§8), never conflated with the new, distinct
+  `UNSUPPORTED_REF_FORMAT` code reserved for a healthy repository (§8,
+  §20).
+- **R.** — new, Round 7 review finding #2. `unstaged_rename` is genuinely
+  reachable only via the verified construction (a plain filesystem rename
+  plus `git add -N` intent-to-add against the new path — test/fixture
+  setup only) — a plain filesystem rename **without** that step is
+  correctly, separately proven to produce `unstaged_delete` + `untracked`
+  rather than a synthesized rename, and no statement anywhere in this
+  document any longer implies an ordinary filesystem rename alone
+  reliably produces porcelain v2's `2 .R` record (§11, §14, §20).
+- **S.** — new, Round 7 review finding #3. The Git capability-floor check
+  (§8) is genuinely bound to the exact `git` executable identity every
+  subsequent Git command in the same top-level BR3 operation resolves to
+  — not merely cached for the Node process lifetime against whichever
+  `git` happened to resolve first — such that a `PATH`/executable-identity
+  change between BR3 calls cannot cause a stale, no-longer-applicable
+  capability result to be trusted for a different, now-current `git`
+  binary (§8, §18, §20).
+- **T.** — new, Round 7 review finding #4. BR3's external-filter
+  detection genuinely determines repository-*effective* filter-attribute
+  usage (via `git check-attr --stdin -z filter` over every relevant
+  tracked path, superproject and every initialized submodule recursively)
+  before any `status`/`diff` invocation — not merely whether a filter
+  *driver command* remains visible after `GIT_CONFIG_GLOBAL` is
+  neutralized for the actual inspection commands — so a `.gitattributes`
+  rule whose corresponding driver is defined only in a global config BR3
+  intentionally hides still produces `EXTERNAL_GIT_FILTER_UNSUPPORTED`,
+  never a silently-wrong working-tree fact (§18, §20).
+- **U.** — new, Round 7 review finding #5. Recursive initialized-submodule
+  enumeration (§18) is genuinely safe against a gitlink working-tree path
+  replaced by a symbolic link (detected via `lstat`, never followed) and
+  against a repository-root cycle (via a visited-canonical-root set),
+  failing deterministically with `UNSAFE_SUBMODULE_PATH` rather than
+  looping indefinitely or escaping into an unrelated, externally-targeted
+  repository (§18, §20).
+- **V.** — new, Round 7 review finding #6. Every repository-derived (not
+  merely caller-derived) revision expression BR3 constructs — in
+  particular `<branch>@{upstream}` in upstream resolution — is protected
+  by `--end-of-options` exactly as caller-supplied `DiffRequest` refs
+  already are, proven by a real fixture using a branch literally named
+  `-foo` with a valid local upstream (§9, §10, §20).
 
 ## 20b. Implementation Plan
 
@@ -4337,17 +4925,17 @@ BR3 does not introduce lint tooling.
 6. **CLI surfacing of any BR3 fact.** Explicitly deferred to whichever
    future phase (most likely BR4, alongside `buildrail verify`) decides
    it needs to show Git facts to a human via the CLI — see §21.
-7. **Full `reftable` ref-backend repository support.** BR3's
-   malformed-bare-repository secondary classifier (§8) is ref-backend-aware
-   (recognizes both the `files` and `reftable` backends when classifying
-   an already-failed `--is-bare-repository` call), but a *healthy*
-   `reftable`-backend repository's working-tree/HEAD/diff inspection
-   behavior is not independently re-verified against that backend in this
-   correction round — see §8's ref-backend-awareness correction (Round 6
-   review finding #5) for the exact, narrower scope of what this round
-   does and does not establish. A future round may either verify full
-   `reftable` support or add an explicit, positive unsupported-ref-format
-   typed result for a healthy `reftable` repository.
+7. **Full `reftable` ref-backend repository support.** BR3 v0.1's final
+   decision (§8 step 5b, Round 7 review finding #1) is to explicitly
+   reject a healthy `reftable`-backend repository with
+   `UNSUPPORTED_REF_FORMAT` — this is a resolved, enforced, tested
+   contract, not an open question. A future phase wishing to add genuine
+   `reftable` support would need to independently re-verify every BR3
+   mechanism (porcelain v2 parsing, `@{upstream}` resolution,
+   `symbolic-ref`, HEAD inspection, working-tree/diff inspection) against
+   real `reftable`-backend fixtures and then remove or relax step 5b's
+   rejection — that verification work, not the decision of whether to
+   defer it, is what remains deferred here.
 
 ## 27. Independent Review Requirements
 
@@ -4412,25 +5000,47 @@ The independent reviewer must specifically examine, for BR3:
   from the implementation entirely — confirmed by literally searching the
   implementation for these exact flag strings, which must not appear
   anywhere `status`/`diff` argv is constructed — and whether, in their
-  place, filter-driver discovery (`clean`/`process`/`smudge`, via `git
-  config --get-regexp`, superproject **and** every initialized submodule
-  recursively) causes a genuine, deterministic
-  `EXTERNAL_GIT_FILTER_UNSUPPORTED` refusal **before** the corresponding
-  `status`/`diff` invocation ever runs — proven by the dedicated real
-  marker-script regression tests §20 adds (cases A–G), including: an
-  ordinary clean filter (marker never executed, typed refusal returned);
-  a `filter.<driver>.required=true` driver producing the identical typed
-  refusal rather than an undifferentiated `GIT_COMMAND_FAILED`; a
-  `process`-protocol driver; a filter-free repository remaining fully,
-  normally inspectable (no false-positive refusal); and whether a driver
-  configured solely inside a first-level or nested **initialized**
-  submodule's own `.git/config`/`.gitattributes` is discovered and also
-  produces the refusal on the single top-level `status`/`diff`
-  invocation — not merely by the superproject-only case continuing to
-  pass unmodified — and whether an uninitialized submodule is correctly
-  excluded from this enumeration (checked via plain filesystem
-  inspection of the submodule's own `.git` entry, never by initializing
-  it)
+  place, effective-filter-attribute detection causes a genuine,
+  deterministic `EXTERNAL_GIT_FILTER_UNSUPPORTED` refusal **before** the
+  corresponding `status`/`diff` invocation ever runs — proven by the
+  dedicated real marker-script regression tests §20 adds (cases A–H),
+  including: an ordinary clean filter (marker never executed, typed
+  refusal returned); a `filter.<driver>.required=true` driver producing
+  the identical typed refusal rather than an undifferentiated
+  `GIT_COMMAND_FAILED`; a `process`-protocol driver; a filter-free
+  repository remaining fully, normally inspectable (no false-positive
+  refusal); and whether an attribute configured solely inside a
+  first-level or nested **initialized** submodule's own `.gitattributes`
+  is discovered and also produces the refusal on the single top-level
+  `status`/`diff` invocation — not merely by the superproject-only case
+  continuing to pass unmodified — and whether an uninitialized submodule
+  is correctly excluded from this enumeration (checked via plain
+  filesystem inspection of the submodule's own `.git` entry, never by
+  initializing it)
+- **Global content-filter blind-spot fix — new, mandatory, Round 7 review
+  finding #4:** whether BR3's filter-detection mechanism genuinely
+  determines repository-*effective* filter-attribute usage — via `git
+  check-attr --stdin -z filter` over every relevant tracked path,
+  superproject and every initialized submodule recursively — rather than
+  relying on config-enumeration (`git config --get-regexp
+  '^filter\..*\.(clean|process|smudge)$'`) alone to discover driver
+  *definitions*, which Round 6's design left insufficient. Proven by the
+  dedicated regression fixture (case D) where a repository's
+  `.gitattributes` declares a `filter=<name>` attribute while the
+  corresponding driver command is defined **only** in a fake **global**
+  Git config (never repository-local) — confirming BR3 still produces
+  `EXTERNAL_GIT_FILTER_UNSUPPORTED` for this case, **even though**
+  `GIT_CONFIG_GLOBAL=<null device>` (§19) correctly, and unrelatedly,
+  neutralizes that global config for BR3's own actual inspection commands
+  — proving the refusal is driven by attribute *usage*, not by whether a
+  driver *definition* happens to still be visible under BR3's sanitized
+  environment. Also confirms: `check-attr` itself never executes the
+  filter (proven by the marker-writing fixtures showing the marker is
+  never created merely from running the attribute check); and that
+  `GIT_CONFIG_GLOBAL=<null device>` remains fully in force, unmodified,
+  for the actual `status`/`diff` inspection commands — this correction
+  does not re-enable arbitrary global Git config to make filter
+  discovery possible, it changes what question discovery asks
 - **Submodule-enumeration mechanism — new, Round 6 review finding #2:**
   whether initialized-submodule discovery (for filter-driver discovery
   and any other BR3 need) genuinely uses the NUL-safe `git ls-files
@@ -4447,6 +5057,22 @@ The independent reviewer must specifically examine, for BR3:
   byte-first, NUL-split, strict-UTF-8 pipeline §13 already defines for
   every other path-bearing command — never a separate, line-oriented
   parser
+- **Submodule-enumeration symlink and cycle safety — new, Round 7 review
+  finding #5:** whether every gitlink working-tree path is genuinely
+  `lstat`-checked (never a symlink-following `stat`) before being treated
+  as a potential submodule checkout, with a symlinked gitlink path
+  unconditionally producing `UNSAFE_SUBMODULE_PATH` rather than being
+  followed — proven by the dedicated real fixture reproducing a gitlink
+  path replaced with a symlink back to the superproject itself (`sub ->
+  .`), confirming no recursion loop occurs and no Git command is ever
+  run with `cwd` inside the symlink-resolved location; **and** whether a
+  second fixture, a gitlink path symlinked to an unrelated external
+  repository, is also rejected with the external repository genuinely
+  never recursively inspected (confirmed by asserting no subprocess is
+  ever invoked with `cwd` inside it); **and** whether a visited-set-based
+  cycle guard, keyed on each validated child repository's canonicalized
+  (`fs.realpath`) root, independently prevents an unbounded-recursion or
+  DoS outcome for any cycle not caught by the symlink check alone
 - Whether the command allowlist actually enforced and tested matches this
   document's own stated allowlist exactly — `status`, `diff`,
   `rev-parse`, `symbolic-ref`, `config` (`--get`/`--get-regexp` only),
@@ -4473,23 +5099,46 @@ The independent reviewer must specifically examine, for BR3:
   `NOT_A_GIT_REPOSITORY` for a real bare repository (either backend) with
   a broken `config` file, and never `BARE_REPOSITORY_UNSUPPORTED` (that
   code remains reserved for a bare repository `--is-bare-repository` can
-  positively, successfully confirm — §8); **and** whether a healthy
-  `reftable`-backend repository, if BR3 does not fully support it beyond
-  this classifier, is at minimum never silently misclassified as
-  `NOT_A_GIT_REPOSITORY` (§8, §26)
-- **Git Capability Floor — new, Round 6 review finding #3:** whether
+  positively, successfully confirm — §8)
+- **Healthy `reftable` rejection — new, Round 7 review finding #1,
+  resolving Round 6's deferral:** whether `resolveRepository` genuinely
+  checks `git config --get extensions.refStorage` (§8 step 5b) and
+  rejects a healthy `reftable`-backend repository as
+  `UNSUPPORTED_REF_FORMAT`, distinctly from the malformed-`reftable`
+  case (`GIT_COMMAND_FAILED`, via the unrelated post-Git-failure
+  secondary classifier) — proven by dedicated fixtures for both a healthy
+  `files`-backend repository (unaffected), a healthy `reftable`-backend
+  repository (rejected), and confirming §26's Deferred Items no longer
+  states an unresolved "future round will decide" position for this
+  question
+- **Git Capability Floor — new, Round 6 review finding #3, binding
+  mechanism corrected Round 7 review finding #3:** whether
   `resolveRepository` genuinely checks `git --version` against BR3's
   2.45.0 floor before any other step (including `fs.stat` on
   `projectRoot`), whether an unsupported or unparseable version
   genuinely produces `GIT_VERSION_UNSUPPORTED` distinctly from
   `GIT_EXECUTABLE_UNAVAILABLE`, whether this check performs zero
-  repository mutation and requires no repository to exist at all, and
-  whether §13's "no human-oriented Git output is ever parsed" rule
-  correctly, explicitly carves out only this one narrow exemption — with
-  every actual repository fact still derived exclusively from
-  machine-readable/NUL-safe/exit-code sources — proven by the dedicated
-  regression tests §20 adds (supported, unsupported, malformed-response,
-  and executable-unavailable-remains-distinct cases)
+  repository mutation, and whether §13's "no human-oriented Git output is
+  ever parsed" rule correctly, explicitly carves out only this one narrow
+  exemption — with every actual repository fact still derived exclusively
+  from machine-readable/NUL-safe/exit-code sources — proven by the
+  dedicated regression tests §20 adds (supported, unsupported,
+  malformed-response, and executable-unavailable-remains-distinct cases);
+  **and** whether the capability check's `cwd` behavior is genuinely
+  documented as a single, explicit, named exception to §18's otherwise-
+  universal `cwd: projectRoot` contract, with no remaining contradiction
+  between §8 and §18's stated `cwd` behavior; **and** — the Round 7
+  correction — whether the capability result is genuinely bound to the
+  exact resolved `git` executable identity, not merely cached for the
+  Node process lifetime: proven by the dedicated executable-identity-
+  binding regression test §20 adds, confirming a `PATH`/executable-
+  identity change between two top-level BR3 operations causes the second
+  operation to revalidate against its own, newly-resolved executable
+  rather than silently trusting a capability result validated against a
+  now-different binary — and confirming the Git 2.45/2.46 version-history
+  wording no longer contradicts the chosen 2.45.0 floor (`--no-lazy-fetch`
+  correctly stated as available at 2.45.0 itself)
+- **Object format / SHA width — new, Round 6 review finding #4:**
 - **Object format / SHA width — new, Round 6 review finding #4:**
   whether `resolveRepository` genuinely checks `git rev-parse
   --show-object-format` and rejects anything other than `sha1` as
@@ -4544,18 +5193,32 @@ The independent reviewer must specifically examine, for BR3:
   no-repository case the post-step-2-failure secondary classification
   determines
 - Whether `inspectHead`'s upstream resolution (§9, §10) uses
-  `git rev-parse --verify -q @{upstream}` (and
-  `--symbolic-full-name @{upstream}`) for tracking-ref resolution — never
-  a hand-constructed `refs/remotes/<remote>/<branch>` path, including on
-  the failure path (i.e., a configured-but-unresolvable upstream produces
-  `ref: null`, not a fallback-constructed guess) — proven by a real
-  fixture using a custom `remote.<name>.fetch` refspec and a second real
-  fixture using a local-branch upstream (`branch.<name>.remote = "."`),
-  both resolving correctly, plus three further real fixtures — an
-  ordinary, a custom-refspec, and a local-branch upstream, each with its
-  resolution target subsequently deleted — each correctly producing
-  `ref: null`/`sha: null` with `remote`/`branch` still populated, never a
+  `git rev-parse --verify -q --end-of-options <branch>@{upstream}` (and
+  `--symbolic-full-name --end-of-options <branch>@{upstream}`) for
+  tracking-ref resolution — never a hand-constructed
+  `refs/remotes/<remote>/<branch>` path, including on the failure path
+  (i.e., a configured-but-unresolvable upstream produces `ref: null`, not
+  a fallback-constructed guess) — proven by a real fixture using a custom
+  `remote.<name>.fetch` refspec and a second real fixture using a
+  local-branch upstream (`branch.<name>.remote = "."`), both resolving
+  correctly, plus three further real fixtures — an ordinary, a
+  custom-refspec, and a local-branch upstream, each with its resolution
+  target subsequently deleted — each correctly producing `ref: null`/
+  `sha: null` with `remote`/`branch` still populated, never a
   reconstructed path
+- **`--end-of-options` on repository-derived upstream resolution — new,
+  Round 7 review finding #6:** whether `<branch>` (the current branch
+  name, itself repository-controlled input, not BR3-authored) is
+  protected by `--end-of-options` in both upstream-resolution commands
+  exactly as caller-supplied `DiffRequest` refs already are (§13) —
+  proven by the dedicated regression fixture with a real branch literally
+  named `-foo` (with a valid local `remote="."` upstream configured)
+  correctly resolving instead of Git misinterpreting the revision
+  expression as a flag; and whether every other repository-derived
+  revision expression BR3 constructs anywhere in this specification has
+  been reviewed for the identical hazard and found either already safe by
+  construction (e.g. `refs/heads/<name>`-prefixed strings, which can
+  never begin with `-`) or protected the same way
 - Whether `inspectHead`'s "no upstream configured" determination (§10) is
   genuinely derived only from `branch.<b>.remote`/`.merge` config-key
   presence, never from "how many remotes exist" as an independent or
@@ -4581,7 +5244,9 @@ The independent reviewer must specifically examine, for BR3:
   (i.e., `status`, `diff`, `rev-parse`, `symbolic-ref`, `config`
   (read-only `--get`/`--get-regexp` only), `ls-files` (read-only
   `--stage -z` only, for submodule enumeration — §18, Round 6 review
-  finding #2), and no others)
+  finding #2), `check-attr` (read-only, non-executing, `--stdin -z
+  filter` only, for effective-filter-attribute detection — §18, Round 7
+  review finding #4), and no others)
 - Whether `matchProtectedPaths` is genuinely pure — no Git access, no
   filesystem access, confirmed by a test asserting identical output for
   identical (deep-equal) input across repeated calls, and by static
@@ -4634,16 +5299,24 @@ The independent reviewer must specifically examine, for BR3:
   rename detection (staged **and** unstaged working-tree renames alike),
   and whether a below-threshold pair is genuinely reported as delete+add
   rather than a synthetic rename
-- **Unstaged rename preservation — new, Round 6 review finding #6:**
-  whether porcelain v2's `2 .R` record is genuinely mapped to a first-class
+- **Unstaged rename preservation — new, Round 6 review finding #6,
+  reachability corrected Round 7 review finding #2:** whether porcelain
+  v2's `2 .R` record is genuinely mapped to a first-class
   `unstaged_rename` `WorkingTreeEntryKind`, with `oldPath`/`similarity`
   correctly populated from the record's own score field — not
   under-classified as a plain `unstaged_modify` with the rename
-  relationship discarded — proven by a dedicated real fixture (a tracked
-  file renamed on disk without staging, content preserved above the 50%
-  threshold); and whether protected-path matching (§12) genuinely checks
-  both sides of an `unstaged_rename` exactly as it does for
-  `staged_rename`
+  relationship discarded — proven by a dedicated real fixture using the
+  **genuinely reachable** construction (a tracked file renamed on disk
+  via a plain filesystem rename, then `git add -N` intent-to-add against
+  the new path — test/fixture setup only, never something BR3 itself
+  performs — content preserved above the 50% threshold); **and** whether
+  a plain filesystem rename **without** that intent-to-add step is
+  correctly, separately proven to produce `unstaged_delete` + `untracked`
+  rather than `2 .R`/`unstaged_rename` — confirming the specification no
+  longer asserts that an ordinary filesystem rename alone reliably
+  reaches this porcelain v2 record; and whether protected-path matching
+  (§12) genuinely checks both sides of an `unstaged_rename` exactly as it
+  does for `staged_rename`
 - Whether `-z`/NUL-delimited output parsing correctly handles a filename
   containing a space, a Unicode character, and at least one other
   unusual-but-legal byte sequence, proven by real fixture files with
