@@ -28,10 +28,19 @@ export interface Authorization {
   [key: string]: unknown;
 }
 
+// state.schema.json's `candidate` object declares no `required` array, so
+// branch/base_sha/candidate_sha are each individually schema-optional
+// within a present `candidate` object (in addition to `candidate` itself
+// being absent, per `BuildRailState["candidate"]` below) — this loader
+// type reflects that actual schema permissiveness; it is a distinct,
+// stricter question whether activatePhase's semantic closure-invariant
+// check accepts a given shape (see hasNoInFlightCandidate in
+// lifecycle/index.ts, which requires all three fields explicitly null,
+// not merely schema-valid).
 export interface Candidate {
-  branch: string | null;
-  base_sha: string | null;
-  candidate_sha: string | null;
+  branch?: string | null;
+  base_sha?: string | null;
+  candidate_sha?: string | null;
   [key: string]: unknown;
 }
 
