@@ -146,9 +146,11 @@ inspection immediately before drafting this specification:
    §10's note on this.
 4. **Lifecycle engine** (`packages/core/src/lifecycle`) — the state graph
    from `docs/STATE_MACHINE.md` as data plus pure functions:
-   `isLegalTransition`, `transitionActor` (which actor role, if any, a
+   `isLegalTransition`, `requiredActor` (which actor role, if any, a
    transition requires), and `applyTransition` (returns a new state value
-   or a typed error; does not write files).
+   or a typed error; does not write files) — plus the dedicated operations
+   `authorizeSpecifiedWork`, `activatePhase`, and `completeAndFreezePhase`
+   (§15).
 5. **Authorization policy** (`packages/core/src/policy`) — pure functions
    over an already-loaded `BuildRailState["authorization"]` value: is it
    active, does it cover a given phase, is it human-granted, etc. No
@@ -206,7 +208,8 @@ packages/core/src/
 │   ├── types.ts                # BuildRailState, Authorization, Candidate, Baseline types
 │   └── errors.ts               # StateError union
 ├── lifecycle/
-│   ├── index.ts               # isLegalTransition, transitionActor, applyTransition
+│   ├── index.ts               # isLegalTransition, requiredActor, applyTransition,
+│   │                          # authorizeSpecifiedWork, activatePhase, completeAndFreezePhase
 │   ├── graph.ts                 # the state machine as data (edges + required actor)
 │   └── errors.ts               # LifecycleError union
 └── policy/
@@ -1364,8 +1367,11 @@ drift from it. Concretely, this means `completeAndFreezePhase` inherits
     capability (§4, §6) to do so. Confirming the SHA is real is BR3's
     concern; BR2 only confirms the *shape* is well-formed.
 
-**On success**, returns a new `BuildRailState` with **all** of the
-following changed together — this is exactly the closure shape
+**On success**, returns a **new** `BuildRailState` value — the input
+`state` argument is never mutated (see "Purity and non-mutation" below
+for the full, general contract that applies to every lifecycle-mutation
+function, not only this one) — with **all** of the following changed in
+that new value, together — this is exactly the closure shape
 `activatePhase`'s own precondition (§15) requires of the phase it is
 rolling over *from*, by construction:
 
@@ -1373,55 +1379,125 @@ rolling over *from*, by construction:
 - `authorization.status` set to `"completed"` (the authorization that
   covered this phase's work is now fulfilled — mirroring §12's documented
   `"completed"` meaning; `completeAndFreezePhase` does not otherwise
-  alter any other field of the `authorization` object)
-- `completed_phases` gains `state.current.development_phase` appended
+  alter any other field of the `authorization` object) — in a **new**
+  `authorization` object; the input `authorization` object is left
+  unchanged
+- `completed_phases`: the returned state's array contains the input
+  array's elements plus `state.current.development_phase` appended
   **exactly once** (check 8 above guarantees it was not already present,
-  so this is a genuine append, never a duplicate-avoiding no-op). Unlike
-  `candidate` and `baselines` (below), `completed_phases` **is** in
-  `state.schema.json`'s top-level `required` array (§9, §12) — a validly
-  `loadState`-loaded `BuildRailState` therefore always has it present (as
-  an array, possibly empty), so `completeAndFreezePhase` never needs to
-  create it from scratch; it only ever appends to an already-present
-  array.
-- `baselines` gains **a new entry** (check 9 above guarantees no entry
-  for this phase id already exists, so this is always a fresh insert,
-  never an overwrite) keyed by `state.current.development_phase` with
-  `approved_sha: request.approvedSha` and `status: "frozen"`. **If
-  `state.baselines` itself is absent** (schema-optional — see "Optional
-  `candidate` and `baselines`" below), `completeAndFreezePhase` treats it
-  as an empty map and creates it, containing exactly this one new entry —
-  absence of the whole map is never an error, and is never confused with
-  "the current phase's key already exists" (check 9), which requires the
-  map to be present *and* contain that specific key.
-- `candidate.branch`, `candidate.base_sha`, and `candidate.candidate_sha`
-  all set to `null` — see "Optional `candidate` and `baselines`" below
-  for the exact, deterministic behavior when `state.candidate` itself is
-  absent going in. Closing a phase always leaves behind the canonical
-  fully-`null` `candidate` object, so the next phase activated via
-  `activatePhase` finds `candidate` in exactly the shape its own
-  precondition (§15) requires, without requiring a separate manual reset
-  step.
+  so this is a genuine append, never a duplicate-avoiding no-op) — as a
+  **new** array; the input array is never mutated in place (no `.push()`
+  on it). Unlike `candidate` and `baselines` (below), `completed_phases`
+  **is** in `state.schema.json`'s top-level `required` array (§9, §12) —
+  a validly `loadState`-loaded `BuildRailState` therefore always has it
+  present (as an array, possibly empty), so `completeAndFreezePhase`
+  never needs to *create* `completed_phases` from scratch; see
+  "`completed_phases` is required, not optional" below for the full
+  statement of this distinction.
+- `baselines`: the returned state has a **new** map containing every
+  entry from the input map (if the input had one) plus **a new entry**
+  (check 9 above guarantees no entry for this phase id already exists, so
+  this is always a fresh insert, never an overwrite) keyed by
+  `state.current.development_phase` with `approved_sha:
+  request.approvedSha` and `status: "frozen"`. **If `state.baselines`
+  itself is absent** (schema-optional — see "Optional `candidate` and
+  `baselines`" below), the returned state's new map contains exactly this
+  one new entry — absence of the whole map is never an error, and is
+  never confused with "the current phase's key already exists" (check
+  9), which requires the map to be present *and* contain that specific
+  key. Either way, the input `baselines` value (present or absent) is
+  left exactly as it was.
+- `candidate`: the returned state has a **new** `candidate` object with
+  `branch`, `base_sha`, and `candidate_sha` all set to `null` — see
+  "Optional `candidate` and `baselines`" below for the exact,
+  deterministic behavior (and the non-mutation guarantee) when
+  `state.candidate` itself is absent going in. Closing a phase always
+  leaves behind the canonical fully-`null` `candidate` object in the
+  *returned* state, so the next phase activated via `activatePhase` finds
+  `candidate` in exactly the shape its own precondition (§15) requires,
+  without requiring a separate manual reset step.
 
 **Preserved unchanged:** `current.development_phase`, `planned_phases`,
 `project`, `schema_version`, `review`, `protected_systems`, and every
-other `baselines`/`completed_phases` entry not being added.
+other `baselines`/`completed_phases` entry not being added — present in
+the returned state exactly as they were in the input (by value; not
+necessarily the same object reference, since the containing objects are
+new, but never a different *value*).
 
-Pure, like `applyTransition`/`authorizeSpecifiedWork`/`activatePhase` —
-no file I/O; persisting the result to `.buildrail/state.yml` remains the
-caller's responsibility (§7).
+Pure and non-mutating, like `applyTransition`/`authorizeSpecifiedWork`/
+`activatePhase` — no file I/O; persisting the result to
+`.buildrail/state.yml` remains the caller's responsibility (§7). See
+"Purity and non-mutation" immediately below for the complete, general
+contract.
+
+#### Purity and non-mutation — a contract shared by all four lifecycle-mutation functions
+
+**Every lifecycle-mutation function in this specification —
+`applyTransition`, `authorizeSpecifiedWork`, `activatePhase`, and
+`completeAndFreezePhase` — is a pure, non-mutating transformation. Each
+returns a *new* `BuildRailState` value; none of them ever mutates its
+`state` input, any nested object within it, or any array within it.**
+This is a correctness requirement, not merely a style preference: BR2's
+`Result<T, E>` model (§19) and its "one authoritative path" composition
+guarantees (§15) both implicitly assume a caller can hold onto its
+original `state` value and compare it against a function's return value
+— an assumption that silently breaks if a "pure" function actually
+mutates its input in place, since then the "before" value the caller
+thinks it still has would already reflect the "after" state.
+
+Concretely, none of the four functions may:
+
+- reassign, delete, or add a property directly on the input
+  `BuildRailState` object (`state.foo = ...`, `delete state.foo`)
+- call a mutating array method (`.push()`, `.pop()`, `.splice()`,
+  `.sort()`, etc.) on `state.completed_phases`, `state.planned_phases`,
+  or any other input array
+- reassign or add a property directly on any nested input object,
+  including `state.current`, `state.authorization`, `state.candidate`,
+  or any individual entry inside `state.baselines`
+
+Instead, each function constructs and returns new containing objects/
+arrays wherever a value needs to differ from the input, using ordinary
+non-mutating techniques (e.g. object/array spread, `Array.prototype.map`/
+`.filter`, or an immutable-update helper) — implementation's choice of
+mechanism, but the caller-visible guarantee is fixed: **after any of
+these four functions is called, the original `state` argument passed in
+is still deeply equal to what it was immediately before the call**,
+regardless of whether the call succeeded or failed.
+
+Wording such as "sets its fields to `null` **in place**" appeared in an
+earlier draft of `completeAndFreezePhase`'s `candidate` handling — that
+phrasing is retracted as contrary to this contract; the corrected
+phrasing throughout this document is "the **returned state** has..." or
+"a **new** \<object/array\> with...", never "in place." Any remaining
+occurrence of "in place" language describing one of these four
+functions' output is a defect, not an accepted shorthand.
+
+**Required test (§22):** for `completeAndFreezePhase` specifically —
+snapshot (deep-clone, or an equivalent structural-equality mechanism) the
+complete input `BuildRailState` before a successful call; after the call,
+assert (a) the returned state has every closure change this section
+specifies, and (b) the original input `state` value is still deeply
+equal to its pre-call snapshot. This proves the advertised purity is
+real for nested structures (`authorization`, `candidate`, individual
+`baselines` entries), not merely for the top-level object.
 
 #### Optional `candidate` and `baselines` — deterministic handling of schema-optional absence
 
-**Both `candidate` and `baselines` are schema-optional in
-`state.schema.json` today** — neither appears in the schema's top-level
-`required` array (§12 already established this for `authorization`; the
-same is true of these two properties). An earlier draft of this
-specification contained wording suggesting `candidate` "might" become
-optional "if the schema is ever loosened to allow that" — that statement
-was factually wrong as written: the schema already permits `candidate`'s
-absence today, with no future loosening required. That wording is
-retracted; both properties' current optionality is treated as an
-existing fact BR2 must handle, not a hypothetical future one.
+**`candidate` and `baselines` are schema-optional in `state.schema.json`
+today** — neither appears in the schema's top-level `required` array
+(§12 already established this for `authorization`; the same is true of
+these two properties). **`completed_phases` is different: it *is* in the
+top-level `required` array, and is never schema-optionally absent** — see
+"`completed_phases` is required, not optional" immediately below this
+subsection for the full statement of that distinction. An earlier draft
+of this specification contained wording suggesting `candidate` "might"
+become optional "if the schema is ever loosened to allow that" — that
+statement was factually wrong as written: the schema already permits
+`candidate`'s absence today, with no future loosening required. That
+wording is retracted; `candidate`'s and `baselines`' current optionality
+is treated as an existing fact BR2 must handle, not a hypothetical future
+one.
 
 **`candidate`:**
 
@@ -1429,14 +1505,19 @@ existing fact BR2 must handle, not a hypothetical future one.
   `.base_sha`/`.candidate_sha`) without first handling the case where
   `state.candidate` itself is `undefined` — doing so unconditionally
   would be an unguarded property access on a possibly-absent object.
-- **On successful closure:** if `state.candidate` is present,
-  `completeAndFreezePhase` sets all three of its fields to `null` in
-  place. If `state.candidate` is absent, `completeAndFreezePhase`
-  *creates* the canonical candidate object — `{ branch: null, base_sha:
-  null, candidate_sha: null }` — rather than leaving it absent. Either
-  way, the output always has a `candidate` object present with all three
+- **On successful closure — non-mutating, per "Purity and non-mutation"
+  below:** if the input `state.candidate` is present,
+  `completeAndFreezePhase`'s **returned** state has a **new** `candidate`
+  object with all three fields set to `null` — the input `candidate`
+  object is left untouched, never mutated in place. If the input
+  `state.candidate` is absent, the **returned** state has a newly
+  *created* canonical candidate object — `{ branch: null, base_sha: null,
+  candidate_sha: null }` — rather than leaving it absent; the input
+  `state` object itself still has no `candidate` property afterward, since
+  `completeAndFreezePhase` never modifies its input. Either way, the
+  **output** always has a `candidate` object present with all three
   fields `null`; a caller of `completeAndFreezePhase` never needs to
-  branch on whether `candidate` existed going in.
+  branch on whether `candidate` existed in the input going in.
 - **`activatePhase`'s "no in-flight candidate" precondition (§15) is
   defined to accept exactly two equivalent shapes, not one:**
   - **(A)** `state.candidate` is absent entirely, or
@@ -1459,19 +1540,51 @@ existing fact BR2 must handle, not a hypothetical future one.
 - `completeAndFreezePhase` must define behavior when `state.baselines`
   is absent, not merely when it is present-but-missing-the-current-key.
   **On successful first closure**, an absent `state.baselines` is
-  treated as an empty map: `completeAndFreezePhase` creates it, and the
-  created map contains exactly the one new frozen-baseline entry for the
-  phase being closed.
+  treated as an empty map: the **returned** state has a **newly created**
+  `baselines` map, containing exactly the one new frozen-baseline entry
+  for the phase being closed. The input `state` object still has no
+  `baselines` property afterward — `completeAndFreezePhase` never adds a
+  property to its input.
 - **If `state.baselines` already exists** (from a prior phase's
-  closure), `completeAndFreezePhase` preserves every existing entry
-  unchanged and inserts the new entry alongside them — never replacing
-  the map wholesale, only adding to it.
+  closure), the **returned** state has a **new** `baselines` map that
+  preserves every existing entry (by value — the entries themselves are
+  not deep-mutated) and adds the new entry alongside them. The input
+  `state.baselines` map itself is left completely untouched — never
+  mutated in place, never had a key added to it directly.
 - Check 9 above (rejecting a phase already present as a `baselines` key)
   applies identically whether `state.baselines` was already present with
   other entries or is being created fresh by this very call — "the map
   is absent" and "the map is present but lacks this key" are the only
   two states check 9 must treat as passing; "the map is present and
   contains this key already" is the only state check 9 rejects.
+
+#### `completed_phases` is required, not optional
+
+**Unlike `candidate` and `baselines`, `completed_phases` is in
+`state.schema.json`'s top-level `required` array (§9, §12) and is never
+schema-optionally absent.** A schema-valid `BuildRailState` — i.e.,
+anything `loadState` (§9) could actually have produced — always has
+`completed_phases` present, as an array (possibly empty).
+
+This has one direct, load-bearing consequence for `completeAndFreezePhase`:
+**it never creates `completed_phases` from scratch.** It only ever
+**appends** to an already-present array in its returned state (check 8's
+"not already present" precondition guarantees the phase being closed
+isn't already an element, so the append always adds exactly one new
+element) — the returned array is a **new** array containing the input
+array's elements plus the one new entry; the input array itself is never
+mutated (no `.push()` on the input, no in-place splice). There is no
+"absent `completed_phases`, so create an empty array first" branch for
+`completeAndFreezePhase` to implement, because that state is not
+reachable through `loadState`.
+
+**Do not describe `completed_phases` as schema-optional, and do not
+describe `completeAndFreezePhase` as "creating" `completed_phases`** —
+those two claims are correct only for `baselines`, not for
+`completed_phases`, and conflating the two is the specific error this
+correction removes. `activatePhase`'s own precondition (§15, above) makes
+the same distinction: it assumes `state.completed_phases` is present and
+simply checks membership, with no absent-array case to handle.
 
 **`applyTransition`'s own behavior for this specific pair is precisely
 defined:** `applyTransition(state, "FROZEN", actor)` where
@@ -1748,16 +1861,31 @@ directly instead of asking the caller to compute and pass it.)
      equally valid "no in-flight candidate" evidence. Any other shape
      (present with one or more non-`null` fields, or partially populated)
      fails this precondition.
-   The `completed_phases`/`baselines` bullets above require
-   `current.development_phase` to actually *appear* in each — which is
-   only possible if both are present (non-absent) and populated, so this
-   precondition never needs to separately branch on `completed_phases`/
-   `baselines` being schema-optionally absent: an absent map or array
-   trivially fails to contain the required key/entry, and the
-   precondition fails the same way it would for a present-but-missing-key
-   map. (`completeAndFreezePhase`, above, is the operation responsible for
-   creating both when they are absent — see "Optional `candidate` and
-   `baselines`.")
+   **`completed_phases` and `baselines` are not equivalent in
+   optionality, and this precondition treats them differently, not
+   identically:**
+   - `completed_phases` **is** in `state.schema.json`'s top-level
+     `required` array (§9, §12) — it is never schema-optionally absent.
+     A schema-valid `BuildRailState` (i.e., anything `loadState` could
+     have produced) always has `completed_phases` present, as an array
+     (possibly empty). `activatePhase` therefore assumes
+     `state.completed_phases` is present and simply checks whether
+     `current.development_phase` appears as an element of it — there is
+     no "absent array" case to handle for this field.
+   - `baselines` **is** schema-optional (§15's "Optional `candidate` and
+     `baselines`" subsection above; not in the top-level `required`
+     array). If `state.baselines` is absent entirely, the "current phase
+     has a frozen baseline entry" bullet above simply fails — an absent
+     map trivially fails to contain the required key, exactly as a
+     present-but-missing-key map would, so no separate "handle absence"
+     branch is needed for the *failure* case. (`completeAndFreezePhase`,
+     above, is the operation responsible for *creating* `baselines` from
+     scratch when it is absent on a successful closure — that creation
+     happens there, not inside `activatePhase`, which only ever reads an
+     already-closed phase's state.)
+   - `candidate` **is** schema-optional, and is handled per the already-
+     established Round-5 contract immediately above this bullet list
+     (shape A absent, or shape B fully-`null`, both accepted).
    If any of these does not hold, `activatePhase` fails with
    `LIFECYCLE_TRANSITION_ILLEGAL` — you cannot roll over to a new phase
    while the current one is still mid-flight, or is `FROZEN` in
@@ -2748,6 +2876,22 @@ not merely a suggested one):
   the closing phase — proving `completeAndFreezePhase` treats an absent
   map as empty and creates it, rather than erroring on it or requiring
   the caller to pre-populate an empty map
+- **Purity/non-mutation regression test (required, §15's "Purity and
+  non-mutation"):** deep-clone (or otherwise structurally snapshot) a
+  complete input `BuildRailState` fixture before calling
+  `completeAndFreezePhase` successfully against it. After the call,
+  assert (a) the returned state has every closure change this section
+  specifies (per the success-path test above), and (b) the **original
+  input `state` value is still deeply equal to its pre-call snapshot** —
+  covering not just the top-level object but its nested `authorization`
+  object, `candidate` object, and individual `baselines` entries. This
+  proves the advertised purity is real for nested structures, not merely
+  for the top-level `BuildRailState` reference. Run this same
+  snapshot-before/assert-unchanged-after pattern for `applyTransition`,
+  `authorizeSpecifiedWork`, and `activatePhase` as well — at least one
+  successful call each — since the "Purity and non-mutation" contract
+  applies to all four lifecycle-mutation functions identically, not only
+  `completeAndFreezePhase`.
 - `applyTransition(state, "FROZEN", actor)` — the generic function,
   called directly for this specific pair — fails with
   `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` (does not silently succeed as
@@ -3024,6 +3168,15 @@ existing shape exactly.
   `BASELINE_SHA_INVALID` code — proven by the dedicated test matrix in
   §22, including the end-to-end `completeAndFreezePhase` → `activatePhase`
   compatibility test and the candidate-absent/baselines-absent tests.
+- **X2.** `applyTransition`, `authorizeSpecifiedWork`, `activatePhase`,
+  and `completeAndFreezePhase` are all pure and non-mutating (§15's
+  "Purity and non-mutation") — each returns a new `BuildRailState` value
+  and never mutates its `state` input, any nested object within it
+  (`current`, `authorization`, `candidate`, individual `baselines`
+  entries), or any input array (`completed_phases`, `planned_phases`) —
+  proven by the snapshot-before/assert-unchanged-after purity regression
+  test in §22, run for at least one successful call to each of the four
+  functions.
 - **Y.** `loadConfig`/`loadState` correctly implement the complete
   three-outcome schema error taxonomy (§10): an unregistered schema id
   passed to a healthy `validate()` call returns `{ registered: false }`
@@ -3260,6 +3413,23 @@ The independent reviewer must specifically examine, for BR2:
   `activatePhase`'s own closure-invariant precondition directly —
   including `activatePhase`'s acceptance of both an absent and a
   fully-`null` `candidate` as equivalent
+- **Whether `completed_phases`'s required-not-optional status is
+  correctly distinguished from `baselines`'s and `candidate`'s
+  schema-optional status throughout the implementation** — specifically,
+  whether `completeAndFreezePhase` ever contains logic to "create"
+  `completed_phases` from scratch (it should not — it only ever appends
+  to an already-present array) versus its correct from-scratch creation
+  of `baselines` and `candidate` when either is absent
+- **Whether `applyTransition`, `authorizeSpecifiedWork`, `activatePhase`,
+  and `completeAndFreezePhase` are genuinely pure and non-mutating** (§15's
+  "Purity and non-mutation") — run the snapshot-before/assert-unchanged-
+  after test for at least one successful call to each function and
+  confirm the original input `state` (including nested `authorization`,
+  `candidate`, and `baselines` objects) is unchanged after the call, not
+  merely that the function *returns* a correct new value
+- Whether `requiredActor` is the sole, canonical actor-lookup API name
+  used throughout the specification, with no residual `transitionActor`
+  references from an earlier draft
 - Whether `requiredActor` returns the fully deterministic three-way
   contract (`Actor` value / `null` / `undefined`) specified in §15's API
   section, never throwing for an illegal pair — the corrected replacement
