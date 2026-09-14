@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: AUTHORIZED
+  lifecycle_state: PREFLIGHT
   development_phase: BR2
 
 authorization:
@@ -21,8 +21,8 @@ authorization:
   granted_by: human
 
 candidate:
-  branch: null
-  base_sha: null
+  branch: feature/br2-governance-engine
+  base_sha: 2bc542e683d1d17b5f656329094f5bfa71160dcf
   candidate_sha: null
 
 # Immutable approved checkpoints for completed/frozen phases. Distinct from
