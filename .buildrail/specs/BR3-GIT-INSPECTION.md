@@ -177,7 +177,9 @@ drafting this specification:
   command that changes refs, the index, the working tree, remotes, or
   repository configuration (§5).
 - Network access of any kind — BR3 never fetches, never contacts a
-  remote, and never blocks on network I/O (§6).
+  remote, and never blocks on network I/O (§6), including Git's own
+  automatic promisor-object lazy-fetch mechanism, disabled unconditionally
+  via `GIT_NO_LAZY_FETCH=1` (§19, Round 5 review finding #1).
 - Agent skills becoming CLI-backed (BR5).
 - Claude Code / Codex adapters (BR6/BR7).
 - Any new `buildrail` CLI command (§21) — BR3 is a `@buildrail/core`
@@ -528,13 +530,62 @@ produce deep-equal, identically-ordered arrays:
   `"oldPath"` (matching this document's own consistent ordering
   convention of presenting the current-side case before the
   old-side-of-rename case throughout §7a/§12), (3) `system.name` (ordinal
-  string comparison) — required as its own explicit final tie-breaker
-  because §12 already establishes that one input's `path` can
-  legitimately match **multiple** `ProtectedSystem` entries, each
-  producing its own `ProtectedPathMatch` with identical `path` and
-  `matchedVia` but a different `system` — `system.name` is guaranteed
-  unique per `config.schema.json`'s `protectedSystem` shape (§3) and
-  fully resolves any remaining tie.
+  string comparison), (4) `system.status` (ordinal string comparison over
+  the fixed `ProtectedSystemStatus` value, e.g. `"frozen"` vs. `"guarded"`
+  vs. `"locked"` vs. `"open"`), (5) `system.paths`, canonicalized as a
+  single string by joining each entry (each individually normalized: `/`
+  separators, no leading `./`, no leading `/` — the identical
+  normalization §12 already applies to matching input, applied here
+  purely for comparison purposes and never mutating the `system` value
+  actually returned) with a single `\n` separator, compared ordinally,
+  (6) the matched `ProtectedSystem`'s own original index within the
+  caller-supplied `protectedSystems` array, as the final tie-break —
+  **corrected, Round 5 review finding #3: `system.name` is *not*
+  guaranteed unique.** An earlier draft of this section asserted
+  `config.schema.json`'s `protectedSystem` shape (§3) guarantees
+  `system.name` uniqueness; it does not — §3's schema excerpt requires
+  only that `name` be a non-empty string, imposes no `uniqueItems`-style
+  constraint across `protected_systems`, and separately permits
+  `additionalProperties: true` on each entry, so two distinct,
+  legitimately-configured `ProtectedSystem` entries can share an
+  identical `name` while differing in `status`, `paths`, or any
+  additional, schema-permitted property. Keys (1)–(3) alone are
+  therefore not a total ordering: two matches with identical `path`,
+  `matchedVia`, and `system.name` — but drawn from two distinct
+  `ProtectedSystem` entries — would previously compare equal, leaving
+  their relative order in the returned `matches` array dependent on
+  whatever order the underlying sort happened to preserve for equal
+  keys, rather than on any key this specification actually defines.
+  Keys (4) and (5) resolve every tie two distinct `ProtectedSystem`
+  entries can produce through any of their *schema-meaningful*, own
+  fields this specification's `ProtectedPathMatch.system` value exposes;
+  key (6), the original `protectedSystems` array index, is the final,
+  unconditional tie-break for the residual case where two entries are
+  identical across (3)–(5) as well (identical `name`, `status`, and
+  `paths`, differing only in some `additionalProperties` field this
+  specification does not itself inspect for sorting purposes) — this
+  is possible precisely because the schema's `additionalProperties: true`
+  (§3) means BR3 cannot enumerate every field a caller's config might
+  legitimately set. **Using original array index as this final
+  tie-breaker is a deliberate design choice, not an oversight:**
+  `protected_systems` array order is, by this choice, considered part of
+  the caller's own input state and is therefore stable, and part of the
+  matching result's contract, for one identical `protectedSystems`
+  array/config across repeated `matchProtectedPaths` calls — exactly
+  mirroring how `WorkingTreeStatus.entries`/`DiffResult.changes`'s own
+  determinism guarantee (§19) is scoped to "identical repository state
+  produces identical output," not "output is independent of every
+  possible input representation." A caller that reorders its own
+  `protected_systems` config between two calls is supplying a genuinely
+  different `protectedSystems` array, and this specification makes no
+  claim of index-independent output stability across that kind of input
+  change — only across repeated calls with the *same* array. This
+  document does **not** add a schema-level uniqueness constraint on
+  `protected_systems[].name` — the config schema is BR0/BR2-owned, and
+  changing it is outside this specification-only correction (§1); BR3
+  instead defines a total ordering that remains correct and fully
+  deterministic regardless of whether any future schema change ever adds
+  such a constraint.
 
 This sort is pure, synchronous, in-process array sorting — it requires no
 additional Git invocation, no additional I/O, and is independently unit
@@ -632,32 +683,82 @@ first, using only machine-readable facts:
      `BARE_REPOSITORY_UNSUPPORTED`/`PROJECT_ROOT_MISMATCH` detection; this
      check runs only as a fallback once step 2's own Git invocation has
      already, authoritatively, failed):
-     - Check whether `<projectRoot>/.git` exists at all (as either a
-       directory or a file — covering both an ordinary repository and a
-       worktree/submodule-style `.git` file) **and**, if it is a
-       directory, whether it has the basic shape of a real Git directory
-       (at minimum, a `HEAD` entry directly inside it — verified present
-       in an ordinary repository's `.git/`, including the malformed-config
-       fixture above, whose `.git/HEAD` remains perfectly intact even
-       though `.git/config` is broken).
-     - If `<projectRoot>/.git` is **absent entirely**: this is a genuine
-       plain non-Git directory → `NOT_A_GIT_REPOSITORY` (unchanged from
-       before).
-     - If `<projectRoot>/.git` **exists** (directory or file) but the
-       authoritative `--is-bare-repository` call still failed: this is a
-       real, existing Git repository that BR3 cannot successfully inspect
-       for a specific, different reason — malformed local config being
-       the verified case, filesystem-permission failures reading `.git/`'s
-       contents being a structurally identical unverified-but-plausible
-       case. This is reported as `GIT_COMMAND_FAILED` (§17's existing
-       catch-all code — deliberately **not** a new, more specific code:
-       the underlying cause is open-ended, exactly matching
+     - **Check two distinct candidate repository shapes — corrected,
+       Round 5 review finding #4: the previous version of this check
+       recognized only the non-bare shape, which made a malformed
+       *bare* repository (one with no `.git` child at all, by
+       definition) incorrectly fall through to
+       `NOT_A_GIT_REPOSITORY`, even though it is a real, existing Git
+       repository, exactly the false-negative category this secondary
+       classifier exists to catch:**
+       - **Non-bare shape:** `<projectRoot>/.git` exists at all (as
+         either a directory or a file — covering both an ordinary
+         repository and a worktree/submodule-style `.git` file) **and**,
+         if it is a directory, whether it has the basic shape of a real
+         Git directory (at minimum, a `HEAD` entry directly inside it —
+         verified present in an ordinary repository's `.git/`, including
+         the malformed-config fixture above, whose `.git/HEAD` remains
+         perfectly intact even though `.git/config` is broken).
+       - **Bare shape — new, Round 5 review finding #4:** a real bare
+         repository (`git init --bare`) has **no** `.git` child at all —
+         its own metadata (`HEAD`, `objects/`, `refs/`, `config`) sits
+         directly inside `projectRoot` itself. So, independently of the
+         non-bare check above, also check whether `projectRoot` itself
+         has the shape of a bare repository root: `projectRoot/HEAD`
+         exists as a file, **and** `projectRoot/objects` exists as a
+         directory, **and** `projectRoot/refs` exists as a directory —
+         an appropriately strict combination of multiple, independently
+         meaningful entries (not `HEAD` alone, which is too weak a
+         signal on its own to distinguish a genuine bare-repository root
+         from an unrelated directory that merely happens to contain a
+         file named `HEAD` for some other reason) chosen to mirror the
+         same "real Git directory shape, not just one filename"
+         discipline the non-bare check already applies to `.git/`.
+         **Verified directly:** a real bare repository created via `git
+         init --bare`, then malformed by truncating/breaking its own
+         `config` file (an unterminated `[section` line, the identical
+         malformation technique used for the non-bare fixture above),
+         reproduces the identical failure shape as the non-bare case —
+         `git rev-parse --is-bare-repository` run against it fails with
+         exit 128, `<projectRoot>/.git` is (correctly, for a bare
+         repository) absent, yet `projectRoot/HEAD` remains present
+         (bare-repository config damage does not touch `HEAD`, exactly
+         as non-bare config damage does not touch `.git/HEAD`) alongside
+         intact `objects/`/`refs/` directories — so the bare-shape check
+         above positively identifies this as a real, malformed
+         repository rather than a plain non-Git directory.
+     - If **neither** the non-bare shape **nor** the bare shape is
+       present: this is a genuine plain non-Git directory →
+       `NOT_A_GIT_REPOSITORY` (unchanged from before).
+     - If **either** shape is present (non-bare `<projectRoot>/.git`, or
+       bare `projectRoot/HEAD`+`objects/`+`refs/`) but the authoritative
+       `--is-bare-repository` call still failed: this is a real, existing
+       Git repository — bare or non-bare — that BR3 cannot successfully
+       inspect for a specific, different reason — malformed local config
+       being the verified case for both shapes, filesystem-permission
+       failures reading the repository's own metadata being a
+       structurally identical unverified-but-plausible case for either.
+       This is reported as `GIT_COMMAND_FAILED` (§17's existing catch-all
+       code — deliberately **not** a new, more specific code, and
+       deliberately the *same* code for both the bare and non-bare
+       malformed subcase, since BR3 has no more specific, actionable
+       response to offer a caller for one shape than the other: the
+       underlying cause is open-ended, exactly matching
        `GIT_COMMAND_FAILED`'s existing "Expected as a result shape, but
        the underlying cause is inherently open-ended" definition), with
-       `details` carrying the captured stderr for diagnosis. `resolveRepository`
-       never proceeds past this point once this outcome is reached — no
-       later step assumes a Git command that has already failed this way
-       can somehow still succeed.
+       `details` carrying the captured stderr for diagnosis. Note this is
+       deliberately **not** `BARE_REPOSITORY_UNSUPPORTED` — that code is
+       reserved for step 2's *successful* `true` result (§8's "Bare
+       repositories" decision below), i.e. a bare repository BR3 can
+       positively confirm is bare and simply does not support; a bare
+       repository whose config is too damaged for `--is-bare-repository`
+       to even complete is, instead, "a real repository exists here, but
+       BR3 cannot safely determine anything about it, bare or not" —
+       `GIT_COMMAND_FAILED` is the honest classification, not a
+       confident-but-unverified `BARE_REPOSITORY_UNSUPPORTED` guess.
+       `resolveRepository` never proceeds past this point once this
+       outcome is reached — no later step assumes a Git command that has
+       already failed this way can somehow still succeed.
      - **Unsafe/dubious ownership** (Git's own "detected dubious ownership
        in repository at ..." safety feature, triggered when the
        repository directory's owner differs from the current process
@@ -1292,10 +1393,22 @@ XY-adjacent field) is decoded into `SubmoduleState { commitChanged,
 hasUntrackedContent, hasModifiedContent }` and attached to the relevant
 entry's `submodule` field. BR3 surfaces this because porcelain v2
 provides it essentially for free (no extra command), but does **not**
-recurse into the submodule itself — that would require a second,
-separate `resolveRepository`/`inspectWorkingTree` call by the *caller*,
-against the submodule's own path as a new `projectRoot`, which BR3's
-existing API already supports without special-casing submodules further.
+recurse into the submodule itself for BuildRail's *own* higher-level
+inspection — that would require a second, separate
+`resolveRepository`/`inspectWorkingTree` call by the *caller*, against
+the submodule's own path as a new `projectRoot`, which BR3's existing
+API already supports without special-casing submodules further. **Git
+itself, however, genuinely does inspect each initialized submodule's own
+working tree internally** to determine `hasUntrackedContent`/
+`hasModifiedContent` truthfully under `--ignore-submodules=none` (this
+document's own deliberate flag choice, above) — which means a
+submodule-local content-filter driver is reachable during this single
+`status` invocation even though BR3 never issues a second, explicit
+command against the submodule. §18's external-helper-suppression
+mitigation is therefore extended to discover and suppress filter drivers
+configured inside every initialized submodule's own config, recursively,
+not only the superproject's — see §18's "insufficient once initialized
+submodules are involved" correction for the verified mechanism.
 
 **Path normalization:** every `path`/`oldPath` in `WorkingTreeEntry` is
 the repository-relative path exactly as Git reports it (already relative
@@ -2013,7 +2126,7 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 |---|---|---|
 | `GIT_EXECUTABLE_UNAVAILABLE` | The `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call) | Expected — a real, anticipated environment condition (Git not installed / not on `PATH`); always a typed `GitResult` failure, never an uncaught exception |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
-| `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4.** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms `<projectRoot>/.git` does not exist at all — i.e. `projectRoot` is genuinely not inside any Git repository. (`--show-toplevel`, §8 step 3, failing unexpectedly after step 2 already succeeded is retained as a defensive fallback to this same code, though not expected to be reachable in practice.) A `--is-bare-repository` failure where `<projectRoot>/.git` **does** exist (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8 | Expected |
+| `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4, further revised — corrects Round 5 review finding #4.** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms **neither** candidate repository shape is present — `<projectRoot>/.git` does not exist (non-bare shape) **and** `projectRoot` itself lacks the `HEAD`+`objects/`+`refs/` bare-repository-root shape (bare shape) — i.e. `projectRoot` is genuinely not inside any Git repository, bare or non-bare. (`--show-toplevel`, §8 step 3, failing unexpectedly after step 2 already succeeded is retained as a defensive fallback to this same code, though not expected to be reachable in practice.) A `--is-bare-repository` failure where **either** shape (non-bare `<projectRoot>/.git`, or bare `projectRoot/HEAD`+`objects/`+`refs/`) **is** present (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8 | Expected |
 | `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) | Expected — `details` names the actual resolved toplevel |
 | `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 2) | Expected |
 | `HEAD_UNAVAILABLE` | **Complete, final trigger condition (revised — corrects Round 4 review finding #5, which extended this beyond Round 1's `symbolic-ref`-exit-code-only definition): EITHER (a)** `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal/unborn/corrupt-but-symbolic) or 1 (detached) — verified as exit 128 for genuine `.git/HEAD` corruption — **OR (b)** `git symbolic-ref -q HEAD` succeeds (exit 0) but `git rev-parse --verify -q HEAD^{commit}` fails AND the resolved branch ref name itself (`git rev-parse --verify -q <resolved-ref-name>`, no `^{commit}`) exits 0 — i.e. HEAD is genuinely symbolic and points at a branch ref that exists, but that ref's stored value does not name a real commit object (§9's "corrupt HEAD" case; distinguished from the unborn case, where the same ref-name check exits 1) — **OR (c)** HEAD is direct/detached (`symbolic-ref -q HEAD` exits 1) but `git rev-parse --verify -q HEAD^{commit}` also fails (a detached HEAD pointing at a non-existent object). These three conditions are the exact, complete trigger set §9 defines; there is no fourth, undocumented path to this code | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
@@ -2212,14 +2325,121 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
     driver at all — they operate purely on refs/objects/config, so this
     mitigation is scoped to exactly the two commands verified above
     (`status`, `diff --name-status`) and is not applied elsewhere.
+  - **This enumeration alone is insufficient once initialized submodules
+    are involved — corrected, Round 5 review finding #2.** The
+    enumeration above (`git config --get-regexp
+    '^filter\..*\.(clean|process|smudge)$'`, run with `cwd` at
+    `projectRoot`) only discovers filter drivers configured in the
+    **superproject's own** effective config. It cannot discover a filter
+    driver configured **inside an initialized submodule's own
+    `.git/config`**, declared via that submodule's own
+    `.gitattributes` — a submodule is, from Git's own perspective, a
+    complete, independent repository with its own, entirely separate
+    config and attributes files, invisible to a `git config --get-regexp`
+    query run against the superproject.
+
+    **This is independently reachable, not merely theoretical:** BR3's
+    own documented `status` invocation (§11) is run with
+    `--ignore-submodules=none` specifically so `SubmoduleState`'s
+    `hasUntrackedContent`/`hasModifiedContent` fields are truthful (§11's
+    own stated rationale for that flag choice) — which requires Git to
+    genuinely inspect each initialized submodule's own working tree to
+    determine whether it is dirty. Verified directly, in a real fixture:
+    a superproject with one initialized submodule; the submodule's own
+    `.git/config` (inside the submodule's own checkout, not the
+    superproject's) declares `filter.evil.clean = <marker-writing
+    script>`; the submodule's own `.gitattributes` (also inside the
+    submodule's own checkout) declares `* filter=evil`; the
+    superproject's own config and attributes declare no filter at all.
+    Running BR3's exact documented `status` invocation — including the
+    superproject-only `-c filter.<name>.clean=` overrides the enumeration
+    step above produces, which is empty in this fixture since the
+    superproject declares no filter — against the superproject still
+    invokes the submodule-local `evil` driver (the marker file is
+    created), because the submodule-config-declared filter is entirely
+    outside what the superproject-scoped enumeration could ever discover
+    or suppress.
+
+    **The fix — enumerate every initialized submodule's own filter
+    configuration, recursively, and suppress every discovered driver name
+    in the parent invocation (Option A):**
+    1. After `resolveRepository` succeeds (so `projectRoot` is a
+       confirmed working tree), enumerate every **initialized** submodule
+       path, recursively, via `git submodule status --recursive` (a
+       genuinely read-only, machine-readable-enough command for this
+       purpose: a leading `-` on a status line means that submodule is
+       **not** initialized, and BR3 excludes any such path from the
+       steps below entirely — an uninitialized submodule has no checked-
+       out working tree for Git to inspect, so it cannot execute a
+       filter helper regardless, and BR3 does not initialize it itself,
+       since that would be a mutation outside §4/§6's boundary).
+    2. For every remaining, confirmed-initialized submodule path
+       (including nested submodules-of-submodules, since `--recursive`
+       enumerates the full nested tree in one call), run the identical
+       `git config --get-regexp '^filter\..*\.(clean|process|smudge)$'`
+       enumeration query **with `cwd` set to that submodule's own working
+       tree path**, not `projectRoot` — reading each submodule's own
+       local config without ever executing a helper (`config --get-regexp`
+       never invokes a filter driver; it only reads configuration text),
+       exactly mirroring how the existing superproject-scoped enumeration
+       is itself helper-free.
+    3. Collect the union of every driver `<name>` discovered across the
+       superproject **and** every initialized submodule at every nesting
+       depth into one flat set (driver names are not namespaced per
+       submodule for this purpose — the goal is "no driver executes,"
+       not "track which submodule owns which driver name," and a name
+       collision between two different submodules' independently
+       configured drivers is immaterial: suppressing both by the same
+       name is still correct and safe).
+    4. Add a `-c filter.<name>.clean=`/`-c filter.<name>.process=` pair
+       for **every** name in that unioned set to the single top-level
+       `status`/`diff` invocation's argv (exactly the same argv
+       construction as the existing superproject-only mechanism — no
+       separate per-submodule invocation is added).
+    5. **Propagation into the recursive submodule status inspection is
+       the crux this fix depends on, and is separately verified, not
+       assumed:** Git's own documented, stable behavior is that a `-c
+       name=value` passed to a top-level Git invocation is propagated,
+       via the `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT`-family
+       mechanism, to every Git subprocess that top-level invocation
+       itself spawns to inspect a submodule's own status — this is how
+       `git -c core.fsmonitor= status --ignore-submodules=none` already,
+       correctly, suppresses a **submodule-configured** `core.fsmonitor`
+       hook today (the existing, already-approved fsmonitor mitigation
+       above), which is the identical propagation path this fix now
+       relies on for filter suppression too. **Verified directly, using
+       the same marker-writing-script fixture above:** re-running BR3's
+       exact `status` invocation, this time with the submodule's own
+       `evil` driver name discovered by step 2 and included in step 4's
+       `-c filter.evil.clean=`/`-c filter.evil.process=` overrides on the
+       top-level invocation, no longer creates the marker file — the
+       override genuinely propagates into the submodule-status-inspection
+       subprocess Git spawns internally, not merely into the top-level
+       process's own, separate config view.
+    6. This enumeration + union + override sequence is required before
+       **every** BR3 `status`/`diff` invocation against a `projectRoot`
+       that has at least one initialized submodule — implementation may
+       cache the discovered driver set per `resolveRepository` call
+       (submodule initialization/config is not expected to change
+       mid-call), but must not skip the submodule-scoped enumeration
+       merely because the superproject itself declares no filter driver
+       (the fixture above is exactly the case where the superproject
+       enumeration alone is empty, yet a real helper is still reachable).
+    7. **Nested submodules are covered by construction**, not as a
+       separate mechanism: `--recursive` in step 1 already walks the full
+       submodule tree, so a submodule-of-a-submodule's own filter
+       configuration is discovered and unioned in identically to a
+       first-level submodule's.
   - **No new `GitErrorCode` is introduced for this mitigation.** Because
-    the `-c` overrides above are verified to reliably and unconditionally
-    prevent both external-helper mechanisms from running (not merely
-    "usually" or "when correctly detected"), BR3 never reaches a state
-    where it must choose between silently proceeding with an
-    external-helper invocation risk and failing outright — the mitigation
-    itself is the complete answer, not a detect-and-reject fallback. No
-    `EXTERNAL_GIT_HELPER_UNSUPPORTED`/`UNSAFE_GIT_CONFIGURATION`-style
+    the enumeration in this section and the `-c` overrides above are
+    verified to reliably and unconditionally prevent both external-helper
+    mechanisms from running — across the superproject and every
+    initialized submodule at every nesting depth (Round 5 review finding
+    #2) — not merely "usually" or "when correctly detected," BR3 never
+    reaches a state where it must choose between silently proceeding with
+    an external-helper invocation risk and failing outright — the
+    mitigation itself is the complete answer, not a detect-and-reject
+    fallback. No `EXTERNAL_GIT_HELPER_UNSUPPORTED`/`UNSAFE_GIT_CONFIGURATION`-style
     code is added to §17's union.
 
 ## 19. Determinism
@@ -2300,15 +2520,43 @@ includes, unconditionally:
     from silently altering behavior (e.g. a path's `-text`/`-diff`
     attribute), for the identical rationale as `GIT_CONFIG_NOSYSTEM`
     above.
+  - **`GIT_NO_LAZY_FETCH: "1"`** — **new (Round 5 review finding #1)**;
+    closes the partial-clone/promisor-remote network gap. A partial
+    clone (`git clone --filter=...`) or any repository with one or more
+    configured promisor remotes can be missing objects locally by
+    design; by default, when a BR3-invoked Git command (`status`,
+    `diff`, `rev-parse`, etc.) needs an object that is not present
+    locally, Git automatically attempts to **fetch it on demand from the
+    configured promisor remote** — a genuine network operation triggered
+    transparently from inside an otherwise read-only, "local-only"
+    command, and exactly the kind of hidden network access §6's "no
+    network access of any kind" guarantee exists to rule out.
+    `GIT_NO_LAZY_FETCH=1` (Git's own documented environment-variable
+    mechanism, equivalent to the global `--no-lazy-fetch` flag) instructs
+    Git to **never** perform this on-demand fetch, failing the local
+    operation instead when a required object is genuinely absent. This
+    protection must be BR3's own, unconditionally re-added variable, not
+    merely inherited from the caller's environment: **§19's own
+    unconditional `GIT_*`-prefix strip (step 2 above) removes any
+    inherited `GIT_NO_LAZY_FETCH` a caller may have already set**, so
+    without re-adding it explicitly as one of BR3's own controlled
+    variables, a caller who protected themselves against lazy-fetch would
+    silently lose that protection the moment BR3 invoked Git on their
+    behalf. `GIT_NO_LAZY_FETCH` is therefore added to the same explicit,
+    re-added set as `GIT_OPTIONAL_LOCKS`/`GIT_CONFIG_NOSYSTEM`/
+    `GIT_CONFIG_GLOBAL`/`GIT_ATTR_NOSYSTEM` above — applied unconditionally
+    to every BR3 Git subprocess, not merely the ones expected to touch
+    promisor objects, for the identical "one place, no detect-then-decide
+    race" rationale §18's `core.fsmonitor=` override already establishes.
 
-  This brings the controlled `GIT_*` variable count to **six** (not five,
-  as of Round 3) — every occurrence of "five" describing this set
-  elsewhere in this document is updated to "six" as part of this round's
-  correction.
+  This brings the controlled `GIT_*` variable count to **seven** (not six,
+  as of Round 4) — every occurrence of "six" describing this set
+  elsewhere in this document is updated to "seven" as part of this
+  round's correction.
 
   Together, steps 1–4 mean the final `env` passed to every BR3 `execFile`
   call is `process.env` **minus every `GIT_*`-prefixed key, unconditionally**,
-  **plus** exactly the six `GIT_*` keys named above **plus** `LC_ALL`/
+  **plus** exactly the seven `GIT_*` keys named above **plus** `LC_ALL`/
   `LANG` **plus** the `XDG_CONFIG_HOME` override described immediately
   below (which is not itself a `GIT_*`-prefixed variable, and is counted
   separately) — never a wholesale `{ ...process.env }` spread with ad-hoc
@@ -2397,7 +2645,7 @@ includes, unconditionally:
   creating one per invocation — it need only be empty and contain no
   `git/` subdirectory) as part of the same `env` construction algorithm
   above (added as a non-`GIT_*` override, alongside `LC_ALL`/`LANG`, not
-  counted among the six `GIT_*` variables above since it is not itself
+  counted among the seven `GIT_*` variables above since it is not itself
   `GIT_*`-prefixed).
   - **Repository-local `.git/info/exclude` — explicitly decided: honored
     (verified directly, alongside repository-local `.gitignore` below).**
@@ -2434,6 +2682,59 @@ includes, unconditionally:
     ignore, inherited `XDG_CONFIG_HOME`-based attributes, `GIT_ATTR_NOSYSTEM`
     disabling system attributes, and repository-local ignore/attributes
     behavior remaining intact) are required (§20).
+
+- **Partial-clone / promisor lazy-fetch network isolation — new (Round 5
+  review finding #1):** §6's "no network access of any kind" guarantee,
+  and this section's own `GIT_TERMINAL_PROMPT=0`/read-only mechanisms
+  above, address every *explicit* network-contacting Git command
+  (`fetch`, `pull`, `push` — none of which BR3 ever invokes, §5/§6), but
+  do not by themselves address Git's **implicit, automatic** promisor
+  object lazy-fetch mechanism: a partial clone (`git clone
+  --filter=blob:none`, etc.) or any repository with a configured
+  promisor remote can have objects that exist only on that remote, not
+  locally, by design — and by Git's own default behavior, an ordinary
+  read-oriented command (`status`, `diff`, `rev-parse`, anything that
+  needs to read a missing object's content) silently triggers an
+  on-demand fetch from the configured promisor remote to retrieve it,
+  entirely transparently to the caller. This is a genuine, hidden network
+  operation reachable from inside what this specification otherwise
+  documents as purely local, read-only Git invocations — exactly the gap
+  §6's guarantee must also cover, not only the commands BR3 itself
+  chooses to run.
+
+  **The fix:** `GIT_NO_LAZY_FETCH=1` (re-added centrally, alongside
+  `GIT_OPTIONAL_LOCKS=0`, as one of the seven controlled `GIT_*`
+  variables above — not a separate mechanism) is Git's own documented
+  environment-variable equivalent of the global `--no-lazy-fetch` flag:
+  it instructs Git to never perform this on-demand promisor fetch,
+  regardless of what any repository's local or global configuration
+  declares. Because this is applied via the same unconditional,
+  always-present `env` construction §19 already uses for every other
+  controlled `GIT_*` variable (never a conditional, "only when a partial
+  clone is detected" override), it applies identically whether or not
+  `projectRoot` is actually a partial/promisor repository — inert, and
+  harmless, in the ordinary case; load-bearing whenever it is not.
+
+  **Required behavior:** a partial/promisor repository missing a locally
+  required object must **fail the local BR3 operation** rather than
+  silently causing a network fetch. No new `GitErrorCode` is introduced
+  for this case — the resulting Git subprocess failure (a required
+  object cannot be read because it is neither present locally nor
+  fetchable) is reported through the existing `GIT_COMMAND_FAILED`
+  catch-all (§17), consistent with that code's existing "the underlying
+  cause is inherently open-ended" definition; a more specific code is
+  not clearly justified here, since a caller's only actionable response
+  to either "object missing, lazy-fetch disabled" or any other
+  unanticipated Git failure is the same: this is not a repository shape
+  BR3 documents as supported without a complete local object set. A
+  dedicated regression test (§20) constructs a real local partial-clone
+  fixture (a full-content local "origin" fixture repository plus a
+  `--filter=blob:none` local clone of it, so no real network access is
+  ever required to construct or exercise the fixture) missing at least
+  one blob's content locally, then asserts BR3's Git invocation fails
+  deterministically (`GIT_COMMAND_FAILED`) rather than transparently
+  fetching that blob from the local "origin" — proving lazy-fetch is
+  genuinely disabled, not merely documented as disabled.
 
 - **Read-only guarantee — the actual enforcement mechanism, named
   explicitly (revised — corrects Round 3 review finding #1, which found
@@ -2654,6 +2955,23 @@ current validation algorithm)**
   case even though both produce the identical underlying Git exit code
   (128) — the two fixtures run side-by-side in the same test to prove the
   filesystem-based secondary check genuinely discriminates them
+- **Malformed bare repository (real bare repository created via `git init
+  --bare`, then its own `config` file syntactically broken — an
+  unterminated `[section` line, identical technique to the non-bare
+  malformed-config fixture above) — new, Round 5 review finding #4** →
+  `GIT_COMMAND_FAILED`, genuinely distinct from `NOT_A_GIT_REPOSITORY` —
+  the specific regression test proving this case (verified:
+  `--is-bare-repository` fails with exit 128, identical to both the
+  malformed-non-bare-config case and the plain-non-Git-directory case;
+  `<projectRoot>/.git` is, correctly, absent for a bare repository; yet
+  `projectRoot/HEAD` remains present alongside intact `objects/`/`refs/`
+  directories) is correctly classified via the bare-shape branch of the
+  filesystem-based secondary check (§8), not collapsed into
+  `NOT_A_GIT_REPOSITORY` the way it would have been under the
+  Round-4-only non-bare-shape-only check — this fixture and the
+  malformed-non-bare-config fixture above run side-by-side with the
+  ordinary-non-Git-directory fixture in the same test to prove the
+  secondary check correctly discriminates all three
 - **Unsafe/dubious-ownership repository — not added as a fixture in this
   round (Round 4 review finding #4):** this scenario requires genuinely
   differing file ownership between the repository directory and the
@@ -2748,6 +3066,16 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
 - No network operation occurs during any BR3 test (asserted structurally,
   e.g. by running in an environment with no network access, or by
   confirming no test ever configures a real, reachable remote URL)
+- **Partial-clone/promisor lazy-fetch disabled — new, Round 5 review
+  finding #1** (a real, fully local fixture: a full-content "origin"
+  repository, then a `--filter=blob:none` local clone of it via a
+  `file://`/local-path remote — never a real network remote — with at
+  least one blob subsequently made locally unreachable, e.g. by removing
+  the "origin" fixture or the specific object before the BR3 operation
+  under test runs) → the BR3 operation fails deterministically
+  (`GIT_COMMAND_FAILED`), proving `GIT_NO_LAZY_FETCH=1` (§19) genuinely
+  prevents Git's automatic on-demand promisor fetch rather than BR3
+  silently succeeding via a hidden local-remote fetch
 
 **Working tree (§11)**
 - Clean repository → `clean: true`, `entries: []`
@@ -2892,17 +3220,36 @@ signature, corrects Round 1 review finding #4**
   another (the same set of `ProtectedPathCheckInput` entries, deliberately
   supplied in different orders — including at least one case producing
   multiple matches across different `ProtectedSystem` entries for the
-  identical `path`/`matchedVia`, to exercise the `system.name`
-  tie-breaker) against the same `protectedSystems`, and assert
-  `matchProtectedPaths` returns **deep-equal, identically-ordered**
-  `matches` arrays for both — proving the output order is a function of
-  the matched content alone, never of input array order. This is directly
-  controllable (no reliance on Git's own emission order, which was
-  confirmed during this round's verification to already track path order
-  under ordinary porcelain v2 output in the fixtures tested, making it an
-  unreliable basis for a targeted regression test) and fully exercises
-  §7a's documented sort keys (`path`, then `matchedVia`, then
-  `system.name`).
+  identical `path`/`matchedVia`, to exercise the `system.name`/
+  `system.status`/`system.paths`/original-index tie-breakers) against the
+  same `protectedSystems`, and assert `matchProtectedPaths` returns
+  **deep-equal, identically-ordered** `matches` arrays for both — proving
+  the output order is a function of the matched content alone, never of
+  input array order. This is directly controllable (no reliance on Git's
+  own emission order, which was confirmed during this round's
+  verification to already track path order under ordinary porcelain v2
+  output in the fixtures tested, making it an unreliable basis for a
+  targeted regression test) and fully exercises §7a's documented sort
+  keys (`path`, then `matchedVia`, then `system.name`, then
+  `system.status`, then canonical `system.paths`, then original
+  `protectedSystems` index).
+- **Duplicate-name tie-break — mandatory, new (Round 5 review finding
+  #3):** construct at least two distinct `ProtectedSystem` entries in
+  `protectedSystems` that **share an identical `name`** but differ in
+  `status` and/or `paths` (a schema-legal configuration, since
+  `config.schema.json` imposes no uniqueness constraint on `name` — §3,
+  §7a), each matching the same input `path`/`matchedVia`, and assert both
+  resulting `ProtectedPathMatch` entries appear in `matches`, in the
+  order §7a's full tie-break chain (`system.status`, then canonical
+  `system.paths`, then original `protectedSystems` array index) defines —
+  proving `system.name` alone is not assumed to be a total ordering, and
+  that two same-named systems are still deterministically, correctly
+  ordered rather than left dependent on incidental array processing
+  order. A second case additionally constructs two entries identical in
+  `name`, `status`, **and** `paths` (differing only in some
+  schema-permitted `additionalProperties` field), asserting the two
+  resulting matches are ordered by original `protectedSystems` index —
+  the final, unconditional tie-break.
 
 **Process/command safety (§18, §19)**
 - No BR3 test, across the entire suite, ever leaves a fixture repository
@@ -2945,6 +3292,52 @@ signature, corrects Round 1 review finding #4**
     `unstaged_modify`/`modified` accurately) — proving the mitigation
     neither leaves the helper running nor silently breaks BR3's own
     fact-reporting.
+- **Submodule-local external-helper suppression — mandatory, new (Round 5
+  review finding #2), real marker-writing fixtures, `.gitattributes`
+  entirely inside each submodule's own checkout, never the superproject:**
+  - **(C) Root-repository filter, restated for contrast:** a superproject
+    with one initialized submodule but **no** filter driver configured
+    anywhere in the submodule (only in the superproject itself, as in
+    case (B) above) → the existing superproject-scoped enumeration alone
+    already suppresses it; this fixture exists to prove the new
+    submodule-scoped enumeration does not change or regress this
+    already-passing case.
+  - **(D) First-level submodule-local filter:** a superproject with one
+    initialized submodule; the submodule's **own** `.git/config`
+    (verified set from inside the submodule's own checkout, not the
+    superproject's) declares `filter.<name>.clean` pointing at a real
+    marker-writing script, and the submodule's own `.gitattributes`
+    (also inside the submodule's own checkout) assigns `filter=<name>` to
+    a path; the superproject itself declares no such filter anywhere.
+    First confirm, in the test's own setup, that BR3's exact `status`
+    invocation *without* the new submodule-scoped enumeration/override
+    genuinely invokes the marker script (establishing the gap is real,
+    not hypothetical — this is the Round 5 regression case). Then call
+    `inspectWorkingTree` against the superproject's `projectRoot` and
+    assert the marker file was **not** created, proving the new
+    submodule-scoped enumeration (§18) discovers the submodule-local
+    driver name and the top-level `-c filter.<name>.clean=`/`-c
+    filter.<name>.process=` override genuinely propagates into Git's
+    internal submodule-status-inspection subprocess.
+  - **(E) Nested-submodule-local filter:** identical to (D), but the
+    filter driver is configured inside a submodule-of-a-submodule (a
+    second, nested submodule checked out inside the first submodule's own
+    working tree) rather than the first-level submodule directly →
+    identical assertion (marker file not created), proving the
+    `--recursive` enumeration in §18's fix genuinely walks the full
+    nested submodule tree, not only one level deep.
+  - **(F) `core.fsmonitor` suppression remains effective inside submodule
+    inspection:** a superproject with one initialized submodule; the
+    submodule's own `.git/config` (not the superproject's) configures
+    `core.fsmonitor` pointing at a real marker-writing script. First
+    confirm, in the test's own setup, that an ordinary `git status
+    --ignore-submodules=none` call *without* BR3's `-c core.fsmonitor=`
+    override genuinely invokes the submodule-local hook. Then call
+    `inspectWorkingTree` against the superproject's `projectRoot` and
+    assert the marker file was **not** created — confirming the existing,
+    already-approved `-c core.fsmonitor=` mitigation (§18) genuinely
+    propagates into submodule inspection exactly as the new filter-driver
+    mitigation does, not merely asserted by analogy.
 - **Index-mutation regression — mandatory, new (Round 3 review finding
   #1):** against a fixture repository with one committed, unchanged
   tracked file, snapshot `.git/index`'s raw bytes (or a hash of them)
@@ -3061,7 +3454,13 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   pre-empted by an earlier, less-specific `NOT_A_GIT_REPOSITORY` result —
   under §8's algorithm, which asks Git itself (`--is-bare-repository`,
   `--show-toplevel`) rather than relying on any BR3-side filesystem-shape
-  precheck (§8, Round 2 review finding #1).
+  precheck (§8, Round 2 review finding #1). A malformed **bare**
+  repository (a real `git init --bare` repository with a broken `config`
+  file — no `.git` child by definition) is correctly classified as
+  `GIT_COMMAND_FAILED`, not `NOT_A_GIT_REPOSITORY`, via the secondary
+  classifier's bare-shape check (`HEAD`+`objects/`+`refs/` directly at
+  `projectRoot`), exactly mirroring the already-established malformed
+  non-bare case (§8, Round 5 review finding #4).
 - **B.** `inspectHead` correctly reports all three branch/HEAD states
   (normal, detached, unborn) and all upstream states — not configured,
   configured and resolving (both the remote-tracking and the
@@ -3114,8 +3513,11 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   backslash-escaping, double-quoted literal regions, brace expansion, and
   bracket expressions all enabled — §16, Round 3 review finding #4 and
   Round 4 review finding #6, both Option A), and returns its `matches`
-  array in canonical sorted order (§7a, Round 4 review finding #1) and
-  never throws an uncaught exception for any schema-valid input,
+  array in canonical sorted order — including the full `system.name`/
+  `system.status`/`system.paths`/original-index tie-break chain for two
+  distinct, schema-legally same-named `ProtectedSystem` matches (§7a,
+  Round 4 review finding #1, Round 5 review finding #3) — and never
+  throws an uncaught exception for any schema-valid input,
   including an overlong pattern — every compilation failure reported via
   `invalidPatterns` instead (§16, Round 4 review finding #6, Part B)
   (§7a, §12, §16,
@@ -3134,22 +3536,28 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   determinism `env`/flags (§19) applied at exactly one shared call site
   (§18); **and** that `env` is genuinely sanitized, not a wholesale
   `process.env` spread — every inherited `GIT_*`-prefixed variable is
-  stripped via a prefix filter, with only BR3's own six controlled
+  stripped via a prefix filter, with only BR3's own seven controlled
   `GIT_*` variables (`GIT_PAGER`, `GIT_TERMINAL_PROMPT`,
   `GIT_OPTIONAL_LOCKS`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`,
-  `GIT_ATTR_NOSYSTEM` — the last new in Round 4) re-added, `XDG_CONFIG_HOME`
-  overridden to a fresh empty directory (also new in Round 4, §19), and
-  global (non-repository-local) Git config is neutralized via
-  `GIT_CONFIG_GLOBAL` pointed at a null device — proven by the four
-  dedicated environment-sanitization regression tests (§20, Round 3
-  review finding #2: inherited `GIT_DIR`, inherited `GIT_INDEX_FILE`,
-  `GIT_CONFIG_COUNT`-style injection, fabricated global
+  `GIT_ATTR_NOSYSTEM`, `GIT_NO_LAZY_FETCH` — the last new in Round 5)
+  re-added, `XDG_CONFIG_HOME` overridden to a fresh empty directory (new
+  in Round 4, §19), and global (non-repository-local) Git config is
+  neutralized via `GIT_CONFIG_GLOBAL` pointed at a null device — proven
+  by the four dedicated environment-sanitization regression tests (§20,
+  Round 3 review finding #2: inherited `GIT_DIR`, inherited
+  `GIT_INDEX_FILE`, `GIT_CONFIG_COUNT`-style injection, fabricated global
   `core.excludesFile` — none of which may alter BR3's result); **and**
   an inherited `XDG_CONFIG_HOME`/`$HOME`-fallback-based global ignore
-  file and global attributes file are likewise neutralized (new, Round 4
+  file and global attributes file are likewise neutralized (Round 4
   review finding #2), with repository-local `.gitignore`/`.git/info/exclude`/
   `.gitattributes`/`.git/config` all remaining fully honored — proven by
-  the four dedicated regression tests §20 adds for this round.
+  the four dedicated regression tests §20 adds for that round; **and**
+  `GIT_NO_LAZY_FETCH=1` is genuinely re-added after the strip so a
+  partial/promisor repository missing a locally required object fails
+  the local BR3 operation deterministically instead of silently
+  performing an on-demand network fetch of that object (new, Round 5
+  review finding #1) — proven by the dedicated real local partial-clone
+  regression test §20 adds for this round.
 - **J.** A path that is not valid UTF-8 produces `MALFORMED_GIT_OUTPUT`
   for the containing operation — never silent corruption, never an
   uncaught decoding exception, and never a partial/filtered result
@@ -3169,6 +3577,19 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
 - **N.** None of §6's out-of-scope items (Git mutation, quality-gate
   execution, evidence generation, agent skills, adapters, CI/network/
   deployment integration) leaked into the implementation.
+- **O.** — new, Round 5 review findings #1 and #2. **(i)**
+  `GIT_NO_LAZY_FETCH=1` is genuinely re-added, unconditionally, to every
+  BR3 Git subprocess after §19's `GIT_*`-prefix strip, and a real,
+  fully-local partial-clone fixture missing a required object fails
+  deterministically (`GIT_COMMAND_FAILED`) rather than triggering a
+  silent on-demand promisor fetch (§6, §19, §20). **(ii)** The
+  `core.fsmonitor`/filter-driver external-helper suppression genuinely
+  extends to every initialized submodule's own local configuration,
+  recursively through nested submodules — not only the superproject's —
+  with an uninitialized submodule correctly excluded from the
+  enumeration rather than initialized by BR3 itself, proven by the
+  dedicated first-level and nested-submodule marker-script regression
+  tests (§11, §18, §20).
 
 ## 20b. Implementation Plan
 
@@ -3396,7 +3817,7 @@ The independent reviewer must specifically examine, for BR3:
 - Whether the shared exec helper's `env` (§18, §19) is genuinely
   constructed by stripping every inherited `GIT_*`-prefixed variable
   (via a prefix filter, not an enumerated blocklist) and re-adding only
-  BR3's own six controlled `GIT_*` variables — never a wholesale
+  BR3's own seven controlled `GIT_*` variables — never a wholesale
   `{ ...process.env }` spread — proven by the four dedicated real
   regression tests (§20, Round 3 review finding #2): an inherited
   `GIT_DIR` cannot redirect `resolveRepository`/`inspectHead` to a
@@ -3414,21 +3835,52 @@ The independent reviewer must specifically examine, for BR3:
   regression tests §20 adds for this round, with repository-local
   `.gitignore`/`.git/info/exclude`/`.gitattributes` still fully honored in
   every case
+- Whether `GIT_NO_LAZY_FETCH=1` (new, Round 5 review finding #1) is
+  genuinely re-added, unconditionally, after §19's `GIT_*`-prefix strip —
+  not merely inherited from a caller's own environment, which the strip
+  itself would otherwise remove — and whether a real local partial-clone
+  fixture missing a locally required object genuinely fails BR3's
+  operation (`GIT_COMMAND_FAILED`) rather than silently performing an
+  on-demand promisor fetch, proven by the dedicated regression test §20
+  adds for this round, not merely documented as disabled
 - Whether every BR3 `git status`/`git diff --name-status` invocation
   genuinely includes the mandatory `-c core.fsmonitor=` override, and the
   filter-driver `-c filter.<name>.clean=`/`-c filter.<name>.process=`
   overrides for every configured driver discovered via `git config
-  --get-regexp` (§18, new — Round 4 review finding #3), proven by the two
-  dedicated real marker-script regression tests §20 adds for this round —
-  not merely documented as suppressed
+  --get-regexp` (§18, Round 4 review finding #3), proven by the dedicated
+  real marker-script regression tests §20 adds — not merely documented as
+  suppressed
+- Whether the filter-driver (and `core.fsmonitor`) enumeration genuinely
+  extends to every **initialized submodule's own** local config,
+  recursively through nested submodules, not only the superproject's own
+  config (§11, §18, new — Round 5 review finding #2) — i.e. whether a
+  driver configured solely inside a first-level or nested submodule's own
+  `.git/config`/`.gitattributes` is discovered and suppressed on the
+  single top-level `status` invocation, proven by the dedicated real
+  marker-script regression tests (cases D, E, F) §20 adds for this round,
+  not merely by the superproject-only case continuing to pass
+  unmodified — and whether an uninitialized submodule is correctly
+  excluded from this enumeration (it has no checked-out working tree to
+  inspect, so BR3 does not attempt to read its config or initialize it
+  itself)
 - Whether `resolveRepository`'s `NOT_A_GIT_REPOSITORY`/`GIT_COMMAND_FAILED`
-  classification (§8, new — Round 4 review finding #4) genuinely
-  distinguishes a plain non-Git directory from a real-but-malformed
-  repository (e.g. a syntactically-broken `.git/config`) via the
-  filesystem-based secondary check, not merely by `--is-bare-repository`'s
-  exit code alone (verified identical, 128, for both cases) — proven by
-  the dedicated malformed-config and ordinary-non-repository fixtures §20
-  adds for this round
+  classification (§8, Round 4 review finding #4, extended by Round 5
+  review finding #4) genuinely distinguishes a plain non-Git directory
+  from a real-but-malformed repository (e.g. a syntactically-broken
+  `.git/config`) via the filesystem-based secondary check, not merely by
+  `--is-bare-repository`'s exit code alone (verified identical, 128, for
+  both cases) — proven by the dedicated malformed-config and
+  ordinary-non-repository fixtures §20 adds; **and** whether that
+  secondary check genuinely recognizes **both** the non-bare shape
+  (`<projectRoot>/.git`) **and** the bare-repository-root shape
+  (`projectRoot/HEAD`+`objects/`+`refs/`, directly at `projectRoot`, with
+  no single-filename check standing in for the full combination) — proven
+  by the dedicated malformed-**bare**-repository fixture §20 adds for
+  this round, correctly producing `GIT_COMMAND_FAILED` rather than
+  `NOT_A_GIT_REPOSITORY` for a real bare repository with a broken
+  `config` file, and never `BARE_REPOSITORY_UNSUPPORTED` (that code
+  remains reserved for a bare repository `--is-bare-repository` can
+  positively, successfully confirm — §8)
 - Whether `inspectHead`'s corrupt-HEAD handling (§9, new — Round 4 review
   finding #5) genuinely uses `HEAD^{commit}` peeling (not bare `HEAD`) to
   validate HEAD resolves to a real commit object, and genuinely
@@ -3524,10 +3976,23 @@ The independent reviewer must specifically examine, for BR3:
 - Whether `WorkingTreeStatus.entries`, `DiffResult.changes`, and
   `ProtectedPathMatchResult.matches` are each returned in the exact
   canonical sorted order §7a defines (`path`, then kind/`matchedVia`,
-  then `oldPath`/`system.name`), proven by a dedicated fixture
-  constructing semantically-identical-but-differently-ordered inputs and
-  asserting deep-equal, identically-ordered output (§7a, §20, Round 4
-  review finding #1)
+  then `oldPath`/`system.name`, then — for `matches` specifically —
+  `system.status`, canonical `system.paths`, and original
+  `protectedSystems` index as further tie-breaks), proven by a dedicated
+  fixture constructing semantically-identical-but-differently-ordered
+  inputs and asserting deep-equal, identically-ordered output (§7a, §20,
+  Round 4 review finding #1)
+- Whether `ProtectedPathMatchResult.matches`'s sort genuinely does **not**
+  rely on `system.name` being unique — proven by a dedicated fixture with
+  two distinct, schema-legally same-named `ProtectedSystem` entries
+  (differing in `status`/`paths`) both matching the same input, correctly
+  and deterministically ordered via the `system.status`/`system.paths`/
+  original-index tie-break chain rather than left order-dependent on
+  incidental processing order (§7a, §20, Round 5 review finding #3), and
+  whether this document's earlier, incorrect claim that
+  `config.schema.json` guarantees `system.name` uniqueness has been fully
+  removed, with no BR0/BR2 schema change proposed to manufacture that
+  uniqueness instead
 - Whether copy detection is genuinely disabled (`--find-copies` never
   passed) — confirmed by a fixture proving a copy-shaped change is
   reported as a plain `added` entry, not by reading the specification's
