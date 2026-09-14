@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: CORRECTION_REQUIRED
+  lifecycle_state: IMPLEMENTING
   development_phase: BR2
 
 authorization:
