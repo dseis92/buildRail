@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { createRegistry, STATE_SCHEMA_ID } from "../schema/index.js";
+import { createRegistry, STATE_SCHEMA_ID, type SchemaRegistry } from "../schema/index.js";
 import { SchemaReferenceUnresolvedError, SchemaSetupError } from "../schema/errors.js";
 import { loadYamlDocument } from "../internal/load-yaml-document.js";
 import type { LoadResult } from "../result.js";
@@ -17,19 +17,22 @@ export type {
 export type { StateError, StateErrorCode } from "./errors.js";
 
 /**
- * `schemasDirOverride` is an internal-only test seam forwarded to
- * `createRegistry()` (see schema/registry.ts) — never part of the
- * documented public contract, never re-exported from the package's
- * public `index.ts` barrel. Every real caller invokes `loadState`
- * with a single `projectRoot` argument, unaffected by this parameter.
+ * Constructs a SchemaRegistry via `registryFactory` and translates any
+ * thrown registration-time exception into the corresponding typed
+ * StateError, exactly as the public `loadState()` does — this is the
+ * one, real implementation of that try/catch translation. NOT exported
+ * from the package's public `index.ts` barrel; only reachable via a
+ * direct relative import into this file. `registryFactory` lets tests
+ * inject `() => createRegistryFromDir(fixtureDir)` (see
+ * `../schema/registry.js`) to exercise this exact translation logic
+ * against deliberately broken fixture schemas, without a second public
+ * parameter on `loadState` and without duplicating this logic.
  */
-export async function loadState(
-  projectRoot: string,
-  schemasDirOverride?: string,
-): Promise<LoadResult<BuildRailState, StateError>> {
-  let registry;
+export function buildStateRegistry(
+  registryFactory: () => SchemaRegistry,
+): { ok: true; registry: SchemaRegistry } | { ok: false; error: StateError } {
   try {
-    registry = createRegistry(schemasDirOverride);
+    return { ok: true, registry: registryFactory() };
   } catch (error) {
     if (error instanceof SchemaReferenceUnresolvedError) {
       return {
@@ -53,7 +56,22 @@ export async function loadState(
     }
     throw error;
   }
+}
 
+/**
+ * The real implementation, parameterized over an already-constructed
+ * `SchemaRegistry`. NOT exported from the package's public `index.ts`
+ * barrel — only reachable via a direct relative import into this file
+ * (e.g. from test code, using `createRegistryFromDir` from
+ * `../schema/registry.js` to build a registry against fixture schemas).
+ * This lets tests exercise the exact same downstream loading/translation
+ * logic production uses, without a second public parameter on
+ * `loadState` and without duplicating this function's body.
+ */
+export async function loadStateWithRegistry(
+  projectRoot: string,
+  registry: SchemaRegistry,
+): Promise<LoadResult<BuildRailState, StateError>> {
   const filePath = join(projectRoot, ".buildrail", "state.yml");
   const outcome = await loadYamlDocument(filePath, {
     notFound: "STATE_NOT_FOUND" as const,
@@ -113,4 +131,20 @@ export async function loadState(
     ok: true,
     value: { value: outcome.data as BuildRailState, diagnostics: outcome.diagnostics },
   };
+}
+
+/**
+ * The public, documented entry point: exactly one argument, `projectRoot`.
+ * Always constructs its schema registry via the public, zero-argument
+ * `createRegistry()` — BuildRail's own package-relative schemas, never a
+ * caller-redirectable directory.
+ */
+export async function loadState(
+  projectRoot: string,
+): Promise<LoadResult<BuildRailState, StateError>> {
+  const built = buildStateRegistry(createRegistry);
+  if (!built.ok) {
+    return built;
+  }
+  return loadStateWithRegistry(projectRoot, built.registry);
 }

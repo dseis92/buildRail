@@ -99,19 +99,15 @@ function normalizeAjvErrors(errors: ErrorObject[] | null | undefined): SchemaVal
  * Throws `SchemaSetupError` for every other registration-time failure
  * (missing/unreadable/malformed schema file).
  *
- * `schemasDirOverride` is an internal-only test seam (never part of the
- * documented public contract, never re-exported from the package's public
- * `index.ts` barrel) letting tests point registration at a fixture
- * directory instead of the package's real `packages/core/schemas/`, so
- * the exact production registration/translation algorithm above can be
- * exercised against deliberately broken fixture schemas without any test
- * helper duplicating this function's logic. Every real (non-test) caller
- * — including every call inside `@buildrail/core` itself — invokes
- * `createRegistry()` with no arguments, which is unaffected by this
- * parameter's existence.
+ * This is the real registration algorithm; it is intentionally NOT
+ * exported from `schema/index.ts` or the package's public `index.ts`
+ * barrel — only reachable via a direct relative import into this file
+ * (e.g. from test code). This keeps the schema *directory* itself
+ * entirely out of the public API surface: the public `createRegistry()`
+ * below always calls this with the package's own real `schemasDir()`,
+ * with no way for any public caller to redirect it elsewhere.
  */
-export function createRegistry(schemasDirOverride?: string): SchemaRegistry {
-  const dir = schemasDirOverride ?? schemasDir();
+export function createRegistryFromDir(dir: string): SchemaRegistry {
   const ajv = new Ajv2020({ allErrors: true });
 
   const compiled = new Map<Br2SchemaId, ValidateFunction>();
@@ -177,4 +173,15 @@ export function createRegistry(schemasDirOverride?: string): SchemaRegistry {
       };
     },
   };
+}
+
+/**
+ * The public, documented entry point: takes no arguments and always
+ * registers BuildRail's own package-relative schemas
+ * (`packages/core/schemas/`) via `schemasDir()` — never `process.cwd()`,
+ * never a caller-supplied directory. There is no way to redirect schema
+ * loading elsewhere through this function's public signature.
+ */
+export function createRegistry(): SchemaRegistry {
+  return createRegistryFromDir(schemasDir());
 }

@@ -1,28 +1,28 @@
 import { join } from "node:path";
-import { createRegistry, CONFIG_SCHEMA_ID } from "../schema/index.js";
+import { createRegistry, CONFIG_SCHEMA_ID, type SchemaRegistry } from "../schema/index.js";
 import { SchemaReferenceUnresolvedError, SchemaSetupError } from "../schema/errors.js";
 import { loadYamlDocument } from "../internal/load-yaml-document.js";
 import type { LoadResult } from "../result.js";
 import type { BuildRailConfig } from "./types.js";
 import type { ConfigError } from "./errors.js";
 
-export type { BuildRailConfig } from "./types.js";
-export type { ConfigError, ConfigErrorCode } from "./errors.js";
-
 /**
- * `schemasDirOverride` is an internal-only test seam forwarded to
- * `createRegistry()` (see schema/registry.ts) — never part of the
- * documented public contract, never re-exported from the package's
- * public `index.ts` barrel. Every real caller invokes `loadConfig`
- * with a single `projectRoot` argument, unaffected by this parameter.
+ * Constructs a SchemaRegistry via `registryFactory` and translates any
+ * thrown registration-time exception into the corresponding typed
+ * ConfigError, exactly as the public `loadConfig()` does — this is the
+ * one, real implementation of that try/catch translation. NOT exported
+ * from the package's public `index.ts` barrel; only reachable via a
+ * direct relative import into this file. `registryFactory` lets tests
+ * inject `() => createRegistryFromDir(fixtureDir)` (see
+ * `../schema/registry.js`) to exercise this exact translation logic
+ * against deliberately broken fixture schemas, without a second public
+ * parameter on `loadConfig` and without duplicating this logic.
  */
-export async function loadConfig(
-  projectRoot: string,
-  schemasDirOverride?: string,
-): Promise<LoadResult<BuildRailConfig, ConfigError>> {
-  let registry;
+export function buildConfigRegistry(
+  registryFactory: () => SchemaRegistry,
+): { ok: true; registry: SchemaRegistry } | { ok: false; error: ConfigError } {
   try {
-    registry = createRegistry(schemasDirOverride);
+    return { ok: true, registry: registryFactory() };
   } catch (error) {
     if (error instanceof SchemaReferenceUnresolvedError) {
       return {
@@ -46,7 +46,25 @@ export async function loadConfig(
     }
     throw error;
   }
+}
 
+export type { BuildRailConfig } from "./types.js";
+export type { ConfigError, ConfigErrorCode } from "./errors.js";
+
+/**
+ * The real implementation, parameterized over an already-constructed
+ * `SchemaRegistry`. NOT exported from the package's public `index.ts`
+ * barrel — only reachable via a direct relative import into this file
+ * (e.g. from test code, using `createRegistryFromDir` from
+ * `../schema/registry.js` to build a registry against fixture schemas).
+ * This lets tests exercise the exact same downstream loading/translation
+ * logic production uses, without a second public parameter on
+ * `loadConfig` and without duplicating this function's body.
+ */
+export async function loadConfigWithRegistry(
+  projectRoot: string,
+  registry: SchemaRegistry,
+): Promise<LoadResult<BuildRailConfig, ConfigError>> {
   const filePath = join(projectRoot, ".buildrail", "config.yml");
   const outcome = await loadYamlDocument(filePath, {
     notFound: "CONFIG_NOT_FOUND" as const,
@@ -109,4 +127,20 @@ export async function loadConfig(
     ok: true,
     value: { value: outcome.data as BuildRailConfig, diagnostics: outcome.diagnostics },
   };
+}
+
+/**
+ * The public, documented entry point: exactly one argument, `projectRoot`.
+ * Always constructs its schema registry via the public, zero-argument
+ * `createRegistry()` — BuildRail's own package-relative schemas, never a
+ * caller-redirectable directory.
+ */
+export async function loadConfig(
+  projectRoot: string,
+): Promise<LoadResult<BuildRailConfig, ConfigError>> {
+  const built = buildConfigRegistry(createRegistry);
+  if (!built.ok) {
+    return built;
+  }
+  return loadConfigWithRegistry(projectRoot, built.registry);
 }

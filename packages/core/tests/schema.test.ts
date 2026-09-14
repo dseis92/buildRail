@@ -4,7 +4,22 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createRegistry, loadConfig, loadState, CONFIG_SCHEMA_ID, STATE_SCHEMA_ID, AUTHORIZATION_SCHEMA_ID } from "@buildrail/core";
+import { createRegistry, loadConfig, CONFIG_SCHEMA_ID, STATE_SCHEMA_ID, AUTHORIZATION_SCHEMA_ID } from "@buildrail/core";
+// Internal-only seams, reached by a direct relative import into the
+// compiled source tree rather than through the public dist/index.js
+// barrel (which does not, and must not, re-export them). This lets these
+// tests exercise the exact production registry-construction and
+// loader-translation code paths against fixture schema directories,
+// without a second public parameter on createRegistry/loadConfig/loadState
+// and without duplicating that logic in a test helper.
+// Resolved via the @buildrail/core workspace symlink in node_modules
+// (package.json declares no "exports" map, so this subpath resolves)
+// rather than a source-relative path — this keeps the import correct
+// regardless of the test file's own location, and avoids depending on
+// dist-tests' emitted directory depth matching tests/'s source depth.
+import { createRegistryFromDir } from "@buildrail/core/dist/schema/registry.js";
+import { buildConfigRegistry } from "@buildrail/core/dist/config/index.js";
+import { buildStateRegistry } from "@buildrail/core/dist/state/index.js";
 
 const execFileAsync = promisify(execFile);
 const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -34,57 +49,67 @@ test("authorization $ref inside state.schema.json resolves correctly (invalid ne
   }
 });
 
-test("a deliberately broken internal $ref fails predictably at registry-setup time via createRegistry() itself with SchemaReferenceUnresolvedError", () => {
-  // Exercises the exact production createRegistry() algorithm (not a
-  // duplicated test-only registration routine) via its internal-only
-  // schemasDirOverride seam, pointed at a fixture directory whose three
-  // schema files all load/parse fine but whose authorization.schema.json
-  // has a deliberately mismatched $id, so state.schema.json's relative
-  // $ref to it cannot resolve.
+test("a deliberately broken internal $ref fails predictably at registry-setup time via the production createRegistryFromDir() algorithm with SchemaReferenceUnresolvedError", () => {
+  // Exercises the exact production registration algorithm (the same one
+  // the public, zero-argument createRegistry() calls) via the internal
+  // createRegistryFromDir() seam, pointed at a fixture directory whose
+  // three schema files all load/parse fine but whose
+  // authorization.schema.json has a deliberately mismatched $id, so
+  // state.schema.json's relative $ref to it cannot resolve. This is not
+  // a duplicated test-only registration routine.
   assert.throws(
-    () => createRegistry(join(fixturesDir, "broken-ref-schema")),
+    () => createRegistryFromDir(join(fixturesDir, "broken-ref-schema")),
     (error: unknown) => error instanceof Error && error.constructor.name === "SchemaReferenceUnresolvedError",
   );
 });
 
-test("a broken internal $ref surfaces through the production loadConfig()/loadState() translation path as SCHEMA_REFERENCE_UNRESOLVED", async () => {
+test("a broken internal $ref surfaces through the production loadConfig()/loadState() translation path as SCHEMA_REFERENCE_UNRESOLVED", () => {
   const brokenRefSchemasDir = join(fixturesDir, "broken-ref-schema");
-  const validProject = join(fixturesDir, "valid-project");
 
-  const configResult = await loadConfig(validProject, brokenRefSchemasDir);
-  assert.equal(configResult.ok, false);
-  if (!configResult.ok) {
-    assert.equal(configResult.error.code, "SCHEMA_REFERENCE_UNRESOLVED");
+  // buildConfigRegistry/buildStateRegistry are the exact try/catch
+  // translation logic the public loadConfig()/loadState() use around
+  // their own createRegistry() call — here it is given a registry
+  // factory pointed at a broken fixture directory instead of the
+  // package's real schemas/, so the same production translation code
+  // runs, not a parallel implementation.
+  const configBuilt = buildConfigRegistry(() => createRegistryFromDir(brokenRefSchemasDir));
+  assert.equal(configBuilt.ok, false);
+  if (!configBuilt.ok) {
+    assert.equal(configBuilt.error.code, "SCHEMA_REFERENCE_UNRESOLVED");
   }
 
-  const stateResult = await loadState(validProject, brokenRefSchemasDir);
-  assert.equal(stateResult.ok, false);
-  if (!stateResult.ok) {
-    assert.equal(stateResult.error.code, "SCHEMA_REFERENCE_UNRESOLVED");
+  const stateBuilt = buildStateRegistry(() => createRegistryFromDir(brokenRefSchemasDir));
+  assert.equal(stateBuilt.ok, false);
+  if (!stateBuilt.ok) {
+    assert.equal(stateBuilt.error.code, "SCHEMA_REFERENCE_UNRESOLVED");
   }
 });
 
-test("a missing schema asset file fails predictably at registry-setup time via createRegistry() itself with SchemaSetupError", () => {
+test("a missing schema asset file fails predictably at registry-setup time via the production createRegistryFromDir() algorithm with SchemaSetupError", () => {
   assert.throws(
-    () => createRegistry(join(fixturesDir, "missing-schema-asset")),
+    () => createRegistryFromDir(join(fixturesDir, "missing-schema-asset")),
     (error: unknown) => error instanceof Error && error.constructor.name === "SchemaSetupError",
   );
 });
 
 test("a missing schema asset file surfaces through the production loadConfig()/loadState() translation path as SCHEMA_SETUP_FAILED", async () => {
   const missingAssetSchemasDir = join(fixturesDir, "missing-schema-asset");
-  const validProject = join(fixturesDir, "valid-project");
 
-  const configResult = await loadConfig(validProject, missingAssetSchemasDir);
-  assert.equal(configResult.ok, false);
-  if (!configResult.ok) {
-    assert.equal(configResult.error.code, "SCHEMA_SETUP_FAILED");
+  // Same exact translation logic (buildConfigRegistry/buildStateRegistry)
+  // the public loadConfig()/loadState() run around their own
+  // createRegistry() call — here exercised via a registry factory
+  // pointed at a fixture directory missing one schema asset file, so the
+  // real SchemaSetupError -> SCHEMA_SETUP_FAILED translation path runs.
+  const configBuilt = buildConfigRegistry(() => createRegistryFromDir(missingAssetSchemasDir));
+  assert.equal(configBuilt.ok, false);
+  if (!configBuilt.ok) {
+    assert.equal(configBuilt.error.code, "SCHEMA_SETUP_FAILED");
   }
 
-  const stateResult = await loadState(validProject, missingAssetSchemasDir);
-  assert.equal(stateResult.ok, false);
-  if (!stateResult.ok) {
-    assert.equal(stateResult.error.code, "SCHEMA_SETUP_FAILED");
+  const stateBuilt = buildStateRegistry(() => createRegistryFromDir(missingAssetSchemasDir));
+  assert.equal(stateBuilt.ok, false);
+  if (!stateBuilt.ok) {
+    assert.equal(stateBuilt.error.code, "SCHEMA_SETUP_FAILED");
   }
 });
 
@@ -115,6 +140,18 @@ test("no network call is made during any schema test (createRegistry succeeds fu
   // fetch, this environment has no server to answer it and the call
   // would hang/throw, not silently succeed.
   assert.doesNotThrow(() => createRegistry());
+});
+
+test("the public API does not expose a schema-directory override (compile-time regression guard)", () => {
+  // @ts-expect-error — createRegistry() takes no arguments; a second
+  // argument here must be a compile error, proving the public,
+  // documented signature genuinely has no way to redirect schema
+  // loading away from BuildRail's own package-relative schemas.
+  createRegistry("some/other/directory");
+  // @ts-expect-error — loadConfig(projectRoot) takes exactly one
+  // argument.
+  void loadConfig(fixturesDir, "some/other/directory");
+  assert.ok(true, "the two @ts-expect-error directives above are the actual assertion");
 });
 
 test("CONFIG_SCHEMA_ID, STATE_SCHEMA_ID, AUTHORIZATION_SCHEMA_ID are exactly the three real schema $ids", () => {
