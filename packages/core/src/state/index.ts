@@ -21,12 +21,15 @@ export type { StateError, StateErrorCode } from "./errors.js";
  * thrown registration-time exception into the corresponding typed
  * StateError, exactly as the public `loadState()` does — this is the
  * one, real implementation of that try/catch translation. NOT exported
- * from the package's public `index.ts` barrel; only reachable via a
- * direct relative import into this file. `registryFactory` lets tests
- * inject `() => createRegistryFromDir(fixtureDir)` (see
- * `../schema/registry.js`) to exercise this exact translation logic
- * against deliberately broken fixture schemas, without a second public
- * parameter on `loadState` and without duplicating this logic.
+ * from the package's public `index.ts` barrel. Test code reaches it via
+ * the package-private `#internal/state/index.js` specifier, defined in
+ * `packages/core/package.json`'s `"imports"` field, which Node resolves
+ * only for code inside this package — never for an external consumer of
+ * the published package. `registryFactory` lets tests inject
+ * `() => createRegistryFromDir(fixtureDir)` (reached the same way, via
+ * `#internal/schema/registry.js`) to exercise this exact translation
+ * logic against deliberately broken fixture schemas, without a second
+ * public parameter on `loadState` and without duplicating this logic.
  */
 export function buildStateRegistry(
   registryFactory: () => SchemaRegistry,
@@ -61,12 +64,13 @@ export function buildStateRegistry(
 /**
  * The real implementation, parameterized over an already-constructed
  * `SchemaRegistry`. NOT exported from the package's public `index.ts`
- * barrel — only reachable via a direct relative import into this file
- * (e.g. from test code, using `createRegistryFromDir` from
- * `../schema/registry.js` to build a registry against fixture schemas).
- * This lets tests exercise the exact same downstream loading/translation
- * logic production uses, without a second public parameter on
- * `loadState` and without duplicating this function's body.
+ * barrel. Test code reaches it via the package-private
+ * `#internal/state/index.js` specifier (see `buildStateRegistry`'s
+ * comment above), using `createRegistryFromDir` (via
+ * `#internal/schema/registry.js`) to build a registry against fixture
+ * schemas. This lets tests exercise the exact same downstream
+ * loading/translation logic production uses, without a second public
+ * parameter on `loadState` and without duplicating this function's body.
  */
 export async function loadStateWithRegistry(
   projectRoot: string,

@@ -101,11 +101,20 @@ function normalizeAjvErrors(errors: ErrorObject[] | null | undefined): SchemaVal
  *
  * This is the real registration algorithm; it is intentionally NOT
  * exported from `schema/index.ts` or the package's public `index.ts`
- * barrel — only reachable via a direct relative import into this file
- * (e.g. from test code). This keeps the schema *directory* itself
- * entirely out of the public API surface: the public `createRegistry()`
- * below always calls this with the package's own real `schemasDir()`,
- * with no way for any public caller to redirect it elsewhere.
+ * barrel. Test code reaches it via the package-private
+ * `#internal/schema/registry.js` specifier, defined in
+ * `packages/core/package.json`'s `"imports"` field — Node resolves that
+ * specifier only for code inside this package itself, regardless of the
+ * package's `"exports"` map, so no external consumer of the published
+ * package can import it. `packages/core/package.json`'s `"exports"` map
+ * separately restricts the package's public *code* API surface to the
+ * root `.` export (it also intentionally exports `./package.json` as
+ * metadata), so a raw subpath import such as
+ * `@buildrail/core/dist/schema/registry.js` is not publicly resolvable
+ * either. Together these keep the schema *directory* itself entirely out
+ * of the public API surface: the public `createRegistry()` below always
+ * calls this with the package's own real `schemasDir()`, with no way for
+ * any public caller to redirect it elsewhere.
  */
 export function createRegistryFromDir(dir: string): SchemaRegistry {
   const ajv = new Ajv2020({ allErrors: true });
