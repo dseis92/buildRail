@@ -603,12 +603,20 @@ never stderr-text matching (revised — corrects Round 1 review finding
 #5; each step below verified against real scratch repositories during
 this correction round):**
 
-- **Branch vs. detached:** `git symbolic-ref -q HEAD` — succeeds (exit 0,
-  prints the branch ref, e.g. `refs/heads/main`) for a normal branch
-  (including unborn); fails (exit 1, **no stderr at all** with `-q`) for
-  detached HEAD. This is a clean binary exit-code signal, not an error
-  condition — a non-zero exit here is never treated as
-  `GIT_COMMAND_FAILED`.
+- **Branch vs. detached vs. genuinely unavailable:** `git symbolic-ref -q
+  HEAD` — succeeds (exit 0, prints the branch ref, e.g. `refs/heads/main`)
+  for a normal branch (including unborn); fails with **exit 1** (**no
+  stderr at all** with `-q`) for the ordinary "HEAD is not a symbolic
+  ref" case, i.e. detached HEAD; fails with a **different, non-1 exit
+  code** (verified: **exit 128**, with a fatal-error message on stderr,
+  e.g. `fatal: not a git repository...`) when `HEAD` itself cannot be
+  read at all — genuine repository damage (verified directly by deleting
+  `.git/HEAD` from an otherwise-valid repository and re-running the same
+  command). **This exit-code distinction (1 vs. 128), not any stderr text
+  inspection, is what makes `HEAD_UNAVAILABLE` (§17) a reachable,
+  well-defined outcome distinct from ordinary detached HEAD** — BR3 reads
+  only the exit code to tell the two apart, never the fatal message's
+  text content.
 - **Unborn vs. has-commits:** `git rev-parse --verify -q HEAD` — succeeds
   (exit 0, prints the 40-hex SHA) once at least one commit exists; fails
   (exit 1, **no stderr at all** with `-q`) when the branch is unborn.
@@ -620,18 +628,29 @@ this correction round):**
   $ git rev-parse --verify -q HEAD; echo "exit=$?"
   exit=1                    # (zero stderr output — nothing to match against)
   ```
-  Combining both commands' exit codes is sufficient to derive all three
-  branch/HEAD states with no error-text inspection anywhere:
-  `symbolic-ref` exit 0 + `rev-parse --verify -q HEAD` exit 1 → unborn
-  branch; `symbolic-ref` exit 0 + `rev-parse --verify -q HEAD` exit 0 →
-  normal branch with commits; `symbolic-ref` exit 1 (regardless of
-  `rev-parse`, which will succeed since a detached HEAD always points at
-  a real commit) → detached. `LC_ALL=C` (§19) may still be set globally
-  for whatever diagnostic text ends up in `GitError.details` for a
-  genuinely unanticipated failure, but — stated explicitly here as the
-  corrected contract — **no BR3 control-flow branch is ever gated on
-  inspecting stderr content; every classification above is derived
-  purely from exit codes and/or separate machine-readable stdout.**
+  and, separately, for the exit-128 corruption case:
+  ```
+  $ rm .git/HEAD   # simulated corruption in an otherwise-valid repo
+  $ git symbolic-ref -q HEAD; echo "exit=$?"
+  fatal: not a git repository (or any of the parent directories): .git
+  exit=128
+  ```
+  Combining `symbolic-ref -q HEAD`'s three-way exit code (0 / 1 / other)
+  with `rev-parse --verify -q HEAD`'s two-way exit code (0 / 1) is
+  sufficient to derive every branch/HEAD state with no error-text
+  inspection anywhere: `symbolic-ref` exit 0 + `rev-parse --verify -q
+  HEAD` exit 1 → unborn branch; `symbolic-ref` exit 0 + `rev-parse
+  --verify -q HEAD` exit 0 → normal branch with commits; `symbolic-ref`
+  exit 1 (regardless of `rev-parse`, which will succeed since a detached
+  HEAD always points at a real commit) → detached; `symbolic-ref` exit
+  anything other than 0 or 1 (e.g. 128) → `HEAD_UNAVAILABLE`, checked
+  before either of the other two interpretations is attempted. `LC_ALL=C`
+  (§19) may still be set globally for whatever diagnostic text ends up in
+  `GitError.details` for this last, genuinely unanticipated case, but —
+  stated explicitly here as the corrected contract — **no BR3
+  control-flow branch is ever gated on inspecting stderr content; every
+  classification above is derived purely from exit codes and/or separate
+  machine-readable stdout.**
 
 **Upstream determination — no network, ever (revised — corrects Round 1
 review finding #2):**
