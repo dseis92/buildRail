@@ -2,8 +2,9 @@
 
 **Status: AUTHORIZED — IMPLEMENTATION NOT STARTED**
 
-The BR2 specification was independently reviewed, approved, and merged
-(`d5a8a8762daf90d7ea628faa8be55b272e12c03b`). The human owner has since
+The BR2 specification was independently reviewed and approved at
+candidate `d5a8a8762daf90d7ea628faa8be55b272e12c03b`, merged via
+`2c0fc991e9df15025f19e761ab27dddf917fe61d`. The human owner has since
 granted implementation authorization (`.buildrail/state.yml`:
 `current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR2`).
 **Implementation has not yet started** — the next required step is BR2
