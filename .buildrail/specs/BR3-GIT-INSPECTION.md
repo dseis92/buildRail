@@ -317,9 +317,14 @@ own implementation, OS-level loader, or execution semantics never
 launches a further interpreter or subprocess of its own (§18's dedicated
 correction documents a concrete, verified instance of this: an
 executable text file without a shebang, satisfying every one of BR3's
-own POSIX candidate-validity rules, can still be run through the OS
-kernel's own `ENOEXEC`/interpreter-fallback behavior, entirely outside
-anything Node's `shell: false` `execFile` contract governs). **This is a
+own POSIX candidate-validity rules, can still, on some platforms, run
+through an interpreter fallback — the kernel itself only reports
+`ENOEXEC` for an unsuitable executable image, and it is the
+`execvp`-family/libuv/runtime execution path, not the kernel, that may
+then act on that report by re-attempting the fallback — entirely outside
+anything Node's `shell: false` `execFile` contract governs; §18's
+correction attributes this precisely — corrected, mandatory, Round 14
+review finding #5). **This is a
 categorically different, and separately, fully mandatory, threat
 boundary from the repository-controlled external-helper protections
 this specification already requires** (content-filter refusal,
@@ -481,11 +486,33 @@ interface UpstreamInfo {
                       // BR3 cannot tell you where its data lives" state, never
                       // a guess presented as fact. When non-null,
                       // strict-UTF-8-decoded (§13 Category 2).
-  sha: string | null; // resolved via @{upstream} — see §9/§10. null exactly
-                      // when ref is null: whenever @{upstream} itself fails
-                      // to resolve locally (§9's "configured but unresolvable"
-                      // case) — ref and sha are null/non-null together, never
-                      // independently
+  sha: string | null; // the RAW object ID returned by
+                      // `git rev-parse --verify -q --end-of-options
+                      // <branch>@{upstream}` — no `^{commit}` peel, no
+                      // additional dereferencing beyond what that exact,
+                      // bare command performs (§9/§10, Round 14 review
+                      // finding #2). This is NOT guaranteed to be a
+                      // commit SHA whenever mergeRef/ref names a
+                      // non-branch ref: for a local ANNOTATED tag
+                      // target, this is the tag OBJECT's own SHA, a
+                      // different object ID than the peeled commit SHA
+                      // `<branch>@{upstream}^{commit}` would return —
+                      // BR3 never performs that peel. For a lightweight
+                      // tag or an ordinary refs/heads/*-or-remote-tracking
+                      // branch target, the raw SHA already IS a commit
+                      // SHA (no distinct tag object exists to peel
+                      // through) — but that is a property of the target,
+                      // never of this field's own definition, which is
+                      // namespace-general and identical for every
+                      // supported mergeRef shape. null exactly when ref
+                      // is null: whenever @{upstream} itself fails to
+                      // resolve locally (§9's "configured but
+                      // unresolvable" case) — ref and sha are
+                      // null/non-null together, never independently. Do
+                      // NOT call this field "commit SHA," "branch tip
+                      // commit," or "resolved commit" except when a
+                      // statement is specifically scoped to a
+                      // refs/heads/*-or-remote-tracking-branch target.
 }
 
 function inspectHead(projectRoot: string): Promise<GitResult<HeadInfo>>;
@@ -1861,14 +1888,15 @@ every case below — there is no separate function per case.
 |---|---|---|---|---|---|
 | Normal branch, has commits | branch name | `false` | `false` | 40-hex SHA | per below |
 | Detached HEAD (checked out to a SHA/tag directly) | `null` | `true` | `false` | 40-hex SHA | `null` (detached HEAD never has an upstream — there is no current branch name for §10's `branch.<name>` config lookup to key on at all) |
-| Unborn branch (fresh `git init`, zero commits) | branch name (the to-be-created branch, from `git symbolic-ref HEAD` — this resolves even with no commits) | `false` | `true` | `null` | **per below — corrected, Round 13 review finding #4A: not unconditionally `null`** |
+| Unborn branch (fresh `git init`, zero commits) | branch name (the to-be-created branch, from `git symbolic-ref HEAD` — this resolves even with no commits) | `false` | `true` | `null` | **per below — corrected, Round 13 review finding #4A and Round 14 review finding #1: not unconditionally `null`, and unborn status alone does not force `ref`/`sha` null either** |
 | Corrupt HEAD (symbolic-ref resolves to a branch name, but that branch ref does not point at a real, existing commit object) | branch name (from `symbolic-ref`, still reported — the ref name itself is knowable even though it does not resolve to a real commit) | `false` | `false` | `null` | `null` | (see `HEAD_UNAVAILABLE`, below) |
 
 **Unborn-branch upstream semantics — corrected, mandatory, Round 13
-review finding #4A (an earlier draft of this table unconditionally
-reported `upstream: null` for every unborn branch, reasoning "no commit
-exists yet to have an upstream relationship against" — that reasoning
-conflates two genuinely distinct BR3 concepts this specification already,
+review finding #4A, corrected again, mandatory, Round 14 review finding
+#1 (an earlier draft of this table unconditionally reported
+`upstream: null` for every unborn branch, reasoning "no commit exists
+yet to have an upstream relationship against" — that reasoning conflates
+two genuinely distinct BR3 concepts this specification already,
 elsewhere, carefully separates: whether an upstream is *configured* at
 all, versus whether it currently *resolves*).** A symbolic, unborn
 branch (HEAD points at `refs/heads/<name>`, but that ref file does not
@@ -1877,21 +1905,47 @@ yet exist because nothing has been committed) can still have both
 in `.git/config` — most commonly because a fresh repository was cloned
 from a template, or because a caller/tool explicitly set up tracking
 before the first commit. This is a real, **configured** upstream
-identity, even though `<name>@{upstream}` itself cannot resolve yet,
-precisely because the local branch ref the tracking relationship is
-anchored to does not exist yet — exactly the "configured but currently
-unresolvable" shape §9/§10 already define and require for other cases
-(a deleted remote-tracking ref, a deleted local-upstream target), not a
-"nothing is configured" shape. Treating every unborn branch's upstream
-as unconditionally `null` — regardless of what `.git/config` actually
-declares — would silently discard a real, configured fact, which
-directly contradicts this specification's own, already-established
-"configured but unresolvable is not the same as not configured" principle
-(§9/§10, corrected in earlier rounds specifically to stop BR3 from
-conflating these two states for other cases).
+identity — exactly the "configured but currently unresolvable" shape
+§9/§10 already define and require for other cases (a deleted
+remote-tracking ref, a deleted local-upstream target) whenever
+resolution genuinely fails, not a "nothing is configured" shape. Treating
+every unborn branch's upstream as unconditionally `null` — regardless of
+what `.git/config` actually declares — would silently discard a real,
+configured fact, which directly contradicts this specification's own,
+already-established "configured but unresolvable is not the same as not
+configured" principle (§9/§10, corrected in earlier rounds specifically
+to stop BR3 from conflating these two states for other cases).
+
+**Round 13's own correction still contained a further false assumption,
+now withdrawn — mandatory, Round 14 review finding #1.** Round 13 assumed
+`<name>@{upstream}` categorically *cannot* resolve while the current
+branch itself remains unborn, and therefore hard-coded `ref: null`,
+`sha: null` for every unborn-with-configured-upstream case. **That
+assumption is false and independently reproducible.** `@{upstream}`
+resolution keys on the **configured tracking relationship**
+(`branch.<name>.remote`/`.merge`), not on the current branch ref's own
+existence — Git can resolve `<name>@{upstream}` to a real object as long
+as the *configured target* itself exists, regardless of whether `<name>`
+itself has ever been committed to. Verified reproduction against a real
+scratch repository (Git 2.47.3): with a normal repository already
+containing a commit on `master`, running `git symbolic-ref HEAD
+refs/heads/new` points HEAD at a `new` branch ref that does not yet
+exist (HEAD is genuinely unborn — `git symbolic-ref -q HEAD` succeeds,
+`git rev-parse --verify -q refs/heads/new` fails); configuring
+`branch.new.remote=.` and `branch.new.merge=refs/heads/master` and then
+running `git rev-parse --verify -q --end-of-options 'new@{upstream}'`
+**succeeds**, printing `master`'s commit SHA, and
+`git rev-parse --verify -q --symbolic-full-name --end-of-options
+'new@{upstream}'` **succeeds**, printing `refs/heads/master`. The
+existence of the current local branch ref is therefore **not** a
+precondition for Git to resolve its configured upstream identity — only
+the existence of the *target* the configuration points at matters, which
+is exactly the same "configured but currently resolves" vs. "configured
+but currently fails to resolve" distinction §9/§10 already apply to every
+other case in this specification.
 
 **The corrected, complete decision table for `upstream` across every
-`branch`/`detached`/`unborn` combination:**
+`branch`/`detached`/`unborn` combination — Round 14 revision:**
 - **Detached HEAD:** `upstream: null` — unconditionally, always; there is
   no current branch name at all for §10's `branch.<name>.remote`/`.merge`
   config lookup to key on (unchanged from the existing, correct
@@ -1900,22 +1954,25 @@ conflating these two states for other cases).
   configured:** `upstream: null` — the ordinary "no upstream configured"
   case, determined purely by config-key absence (§10 step 1), unaffected
   by whether the branch is unborn.
-- **Symbolic normal branch (has commits), `branch.<name>.remote`/`.merge`
-  configured:** unchanged, existing behavior — `UpstreamInfo` returned,
-  `ref`/`sha` resolved via `@{upstream}` if possible, `null` for both if
-  configured-but-unresolvable (§10).
-- **Symbolic unborn branch, `branch.<name>.remote`/`.merge` genuinely
-  configured — the corrected case:** `UpstreamInfo` is returned, **not**
-  `null` — `remote`/`mergeRef`/`branch` populated exactly as §10 step 1
-  already specifies (directly from config, independent of resolution);
-  `ref: null`, `sha: null`, since `<name>@{upstream}` cannot resolve
-  while the branch itself remains unborn — this is the identical
-  "configured but unresolvable" shape §9/§10 already define, reached for
-  a different underlying reason (the branch not existing yet, rather
-  than a tracking ref having been deleted) but represented identically:
-  a truthful, configured `UpstreamInfo` with `ref`/`sha` both `null`,
-  never collapsed to an undifferentiated `upstream: null` that would
-  erase the fact that something real is configured.
+- **Symbolic branch (normal or unborn), `branch.<name>.remote`/`.merge`
+  configured:** `UpstreamInfo` is returned, **not** `null`, and **the
+  identical resolution procedure runs regardless of whether the current
+  branch is normal or unborn — corrected, Round 14 review finding #1**:
+  `remote`/`mergeRef`/`branch` populated exactly as §10 step 1 specifies
+  (directly from config, independent of resolution and independent of
+  unborn status); `<name>@{upstream}` is then **attempted** (both the
+  plain-SHA and `--symbolic-full-name` resolution calls, §10 step 2) —
+  **never skipped merely because the branch is unborn**. If both
+  resolution calls succeed (the configured target genuinely exists,
+  whether or not the current branch itself has any commits), `ref`/`sha`
+  are populated from the result exactly as the normal-branch case already
+  specifies. If resolution genuinely fails (the configured target itself
+  does not exist, or does not yet exist, for any reason — including but
+  not limited to the current branch being unborn with a self-referential
+  or otherwise-unresolvable target), `ref: null`, `sha: null` — the
+  identical "configured but unresolvable" shape §9/§10 already define.
+  **Unborn status by itself is never sufficient reason to force `ref`/
+  `sha` null** — only a genuine `@{upstream}` resolution failure is.
 
 **Determination method — exit codes and machine-readable facts only,
 never stderr-text matching (revised — corrects Round 1 review finding
@@ -2308,10 +2365,11 @@ data is actually present.
        anything under `refs/remotes/` — and `sha` is that other local
        branch's own current tip.
      - **Non-branch local upstream target — new, mandatory, Round 13
-       review finding #3.** `branch.<name>.remote = "."` does not
-       require the configured `.merge` target to itself be a branch —
-       Git equally supports a local tag or an arbitrary local ref
-       namespace as the configured upstream. **Verified directly:** a
+       review finding #3; `sha`'s exact meaning corrected, mandatory,
+       Round 14 review finding #2.** `branch.<name>.remote = "."` does
+       not require the configured `.merge` target to itself be a
+       branch — Git equally supports a local tag or an arbitrary local
+       ref namespace as the configured upstream. **Verified directly:** a
        real repository with `branch.<current>.remote = "."` and
        `branch.<current>.merge = refs/tags/v1` — `git rev-parse
        --symbolic-full-name --verify -q --end-of-options
@@ -2319,11 +2377,26 @@ data is actually present.
        with the SHA resolving correctly too; the identical mechanism
        succeeds equally for an arbitrary `refs/custom/foo` namespace.
        In both cases `ref` is the exact, faithfully-resolved target
-       (`refs/tags/v1`/`refs/custom/foo`), `sha` is that target's own
-       resolved commit, and `UpstreamInfo.mergeRef` (step 1) already
-       preserves the identical, unshortened configured value —
-       `UpstreamInfo.branch` is correctly `null` for both, since neither
-       target lives under `refs/heads/` (§7a).
+       (`refs/tags/v1`/`refs/custom/foo`), and `UpstreamInfo.mergeRef`
+       (step 1) already preserves the identical, unshortened configured
+       value — `UpstreamInfo.branch` is correctly `null` for both, since
+       neither target lives under `refs/heads/` (§7a). **`sha` is the
+       raw object ID `git rev-parse --verify -q --end-of-options
+       <branch>@{upstream}` itself returns — never assumed to be a
+       commit SHA for these non-branch cases.** For `v1` created as a
+       genuine **annotated** tag (`git tag -a`), the raw SHA is the
+       **annotated tag object's own SHA** — verified directly to differ
+       from `git rev-parse '<current>@{upstream}^{commit}'`'s peeled
+       commit SHA, a command BR3 never runs. For a **lightweight** tag
+       (a plain ref with no tag object), the raw SHA already is the
+       commit SHA it points at directly — not a special case in the
+       command, merely a property of that particular target. For an
+       arbitrary `refs/custom/foo` namespace pointing at any object type
+       (commit, tag, tree, or blob), the raw SHA is faithfully returned
+       exactly as Git resolves it, with BR3 never asserting or assuming
+       the object's type. See §10's dedicated `UpstreamInfo.sha` exact-meaning
+       correction for the complete, namespace-general definition that
+       applies uniformly to every subcase in this section.
 
      **This is the entirety of what "upstream SHA" means in BR3, for
      any subcase** — the SHA `@{upstream}`'s own already-resolved
@@ -2406,19 +2479,47 @@ repository at all — a genuinely configured upstream that has nothing to
 do with any remote. BR3 never special-cases "how many remotes exist" as
 its own signal; it only ever reads the two `branch.<b>.*` config keys.
 
+**§10's `UpstreamInfo` shape — reconciled with §7a's Round 13
+`UpstreamInfo` interface, mandatory, Round 14 review finding #3 (this
+section had fallen stale after Round 13 updated §7a's interface to add
+`mergeRef` and make `branch` nullable; §10 still described the earlier,
+superseded `{ remote, ref, branch, sha }` shape and claimed
+`remote`/`branch` "remain populated" for every configured-but-unresolvable
+upstream — no longer universally true now that `branch` is deliberately
+`null` for any `mergeRef` outside `refs/heads/*`). There is exactly
+**one** authoritative `UpstreamInfo` shape in this specification —
+defined once in §7a, restated identically (never abbreviated in a way
+that omits `mergeRef` without saying so) everywhere else it appears:**
+
 - **No upstream configured** (`branch.<b>.remote`/`.merge` config keys
   both absent — including, as one way this can happen, a repository with
   no remotes defined at all): `upstream: null`. Not an error.
 - **Upstream configured, `@{upstream}` resolves:** `upstream: { remote,
-  ref, branch, sha: <40-hex SHA> }`, where `ref` is whatever symbolic
-  full name `@{upstream}` itself resolves to (honoring custom fetch
-  refspecs and the `remote="."` local-upstream case — see §9's corrected
-  method) — never a BR3-constructed `refs/remotes/<remote>/<branch>`
-  guess.
+  mergeRef, branch, ref, sha }`, where `mergeRef` is the exact, complete,
+  first configured `branch.<b>.merge` value verbatim (§7a, §9, Round 9
+  review finding #2's first-value semantics, Round 13 review finding #3's
+  namespace-preserving contract), `branch` is `string | null` — populated
+  only when `mergeRef` genuinely begins with the literal prefix
+  `refs/heads/`, `null` for any other target namespace (a local tag, a
+  custom-namespace ref, or anything else outside `refs/heads/*`) — `ref`
+  is whatever symbolic full name `@{upstream}` itself resolves to
+  (honoring custom fetch refspecs and the `remote="."` local-upstream
+  case — see §9's corrected method) — never a BR3-constructed
+  `refs/remotes/<remote>/<branch>` guess — and `sha` is the raw object ID
+  `git rev-parse --verify -q --end-of-options <branch>@{upstream}`
+  reports, defined exactly once, precisely, and namespace-generally —
+  see the dedicated "`UpstreamInfo.sha` — exact meaning" correction below
+  (mandatory, Round 14 review finding #2).
 - **Upstream configured, `@{upstream}` fails to resolve (revised —
-  corrects Round 3 review finding #3):** `upstream: { remote, ref: null,
-  branch, sha: null }` — `remote`/`branch` remain populated (config-key
-  presence, independent of resolvability), but `ref` is `null`, **not** a
+  corrects Round 3 review finding #3; `branch`'s nullability corrected,
+  Round 14 review finding #3):** `upstream: { remote, mergeRef, branch,
+  ref: null, sha: null }` — `remote`/`mergeRef` remain populated
+  (config-key presence, independent of resolvability); `branch` remains
+  populated **only when** `mergeRef` genuinely begins with
+  `refs/heads/` — it is `null` whenever the configured target is outside
+  that namespace, exactly as in the resolves-successfully case above,
+  since `branch`'s nullability is purely a function of `mergeRef`'s
+  namespace, never of resolvability. `ref` is `null`, **not** a
   fallback-constructed `refs/remotes/<remote>/<branch>` guess (an earlier
   draft of this specification used exactly that guess as a "best-effort
   label"; it is removed because it is simply false whenever the
@@ -2426,7 +2527,11 @@ its own signal; it only ever reads the two `branch.<b>.*` config keys.
   neither of which has a real target anywhere under
   `refs/remotes/<remote>/<branch>`) — since Git itself has nothing to
   resolve in this case, BR3 reports that truthfully as `null` rather than
-  presenting a guess as fact.
+  presenting a guess as fact. **Unborn status of the current branch is
+  never, by itself, a reason resolution is treated as having failed —
+  see §9's corrected decision table (Round 14 review finding #1); this
+  case is reached only by a genuine `@{upstream}` resolution failure,
+  regardless of whether the current branch has any commits.**
 - **Upstream is a local branch** (`branch.<name>.remote = "."`): fully
   supported, not a distinct case from BR3's caller's point of view —
   `@{upstream}` resolves such a configuration correctly (verified in
@@ -2436,9 +2541,66 @@ its own signal; it only ever reads the two `branch.<b>.*` config keys.
   remote to be configured at all) and `sha` from that local branch's own
   current tip. `remote` is reported exactly as Git config stores it (the
   literal string `.`), since BR3 reports facts as Git records them rather
-  than translating `.` into some other sentinel.
+  than translating `.` into some other sentinel. `mergeRef` is the exact
+  configured `refs/heads/<other-branch>` value; `branch` is populated
+  (`<other-branch>`) since this target genuinely is under `refs/heads/`.
+- **Upstream target is not a branch** (`mergeRef` outside `refs/heads/*`
+  — e.g. a local annotated/lightweight tag, `branch.<name>.merge =
+  refs/tags/v1`, or any other custom-namespace ref, `branch.<name>.merge
+  = refs/custom/foo`): fully supported. `mergeRef` is the exact
+  configured value verbatim; `branch` is `null` (this target is not a
+  branch, and BR3 never mischaracterizes it as one, §7a Round 13 review
+  finding #3); `ref` is the symbolic full name `@{upstream}` resolves to
+  when resolution succeeds (`refs/tags/v1`, `refs/custom/foo`, verbatim);
+  `sha` is the raw object ID `@{upstream}` resolves to — see the exact
+  meaning correction immediately below, mandatory, Round 14 review
+  finding #2.
 - **HEAD is detached:** `upstream: null` unconditionally — detached HEAD
   has no branch, and only branches have configured upstreams.
+
+**`UpstreamInfo.sha` — exact meaning, corrected, mandatory, Round 14
+review finding #2 (an earlier draft of this section described the tag
+case's `sha` as the target's "resolved commit," which is false for the
+exact, bare `rev-parse` command this specification requires; do not call
+this field a "commit SHA," "branch tip commit," or "resolved commit"
+unless that statement is specifically scoped to a `refs/heads/*` or
+ordinary remote-tracking-branch case, where the target genuinely is a
+ref that points directly at a commit).** `sha` is defined, for every
+supported `mergeRef` namespace, as exactly and only:
+
+> **The raw SHA-1 object ID returned by
+> `git rev-parse --verify -q --end-of-options <branch>@{upstream}`** —
+> the object ID the resolved upstream ref *itself currently records*,
+> with no additional peeling, dereferencing, or commit-resolution step
+> performed beyond what that exact, bare command itself does.
+
+This is **not guaranteed to identify a commit object** whenever
+`mergeRef`/`ref` names a non-branch ref — BR3 performs no `^{commit}`
+peel, and never silently changes this into one. **Verified
+reproduction:** for a local **annotated** tag target
+(`branch.<current>.merge = refs/tags/v1`, `v1` created via `git tag -a`,
+a genuine annotated tag object distinct from the commit it points at),
+`git rev-parse <current>@{upstream}` returns the **annotated tag
+object's own SHA** — a different object ID than
+`git rev-parse '<current>@{upstream}^{commit}'`, which returns the
+**peeled commit SHA**. BR3's documented command is the former, never the
+latter; `UpstreamInfo.sha` for this case is therefore the tag object's
+SHA, not the commit it points at. For a **lightweight** tag (a plain ref
+with no tag object of its own), the raw SHA and the commit SHA are
+identical, since a lightweight tag ref points directly at the commit —
+this is not a special case in the command, merely a case where the raw
+object ID happens to already be a commit ID. For an arbitrary
+`refs/custom/foo` target, the raw SHA is faithfully returned regardless
+of what kind of object it names (commit, tag, tree, or blob) — BR3
+reports whatever object ID Git's own bare `rev-parse` resolves to,
+truthfully, without assuming or asserting the object's type. This
+preserves BR3's long-standing meaning for the ordinary `refs/heads/*`
+case — "the already-recorded local upstream SHA" — without inventing a
+commit-peel the documented command does not perform. **If a future BR3
+phase needs a guaranteed-commit upstream SHA, that must be a separately
+named, separately defined field or a later API decision — this
+correction does not introduce one, and `sha` must never be silently
+redefined into a commit peel.**
 
 BR3 never fetches. This is restated as a hard, testable requirement in
 §20 ("no network operation" is a mandatory test case) and §6.
@@ -3698,11 +3860,19 @@ in-process mechanism this helper itself performs.
   shebang line, made executable via `chmod +x`) invoked by its absolute
   path via `execFile(path, [], { shell: false })` succeeds and produces
   the script's own output — Node/libuv's POSIX execution path uses
-  `execvp`-family semantics, and the OS kernel's own `ENOEXEC` handling
-  for a non-binary, non-shebang executable text file can itself fall
-  back to invoking a shell/interpreter to run it, entirely below Node's
-  own `shell: false` contract and outside anything `execFile`'s own
-  argument-passing discipline can prevent. **A candidate satisfying
+  `execvp`-family semantics; **attributed precisely, corrected, mandatory,
+  Round 14 review finding #5:** the OS kernel itself does not invoke a
+  shell — for a non-binary, non-shebang executable text file, the kernel
+  merely reports `ENOEXEC` ("exec format error") for the unsuitable
+  executable image, and it is the C library's `execvp`-family fallback
+  behavior (which libuv's process-spawning path relies on) that may, upon
+  receiving that `ENOEXEC` report, itself re-attempt the exec via
+  `/bin/sh`. This interpreter fallback happens entirely below Node's own
+  `shell: false` contract and outside anything `execFile`'s own
+  argument-passing discipline can prevent — BR3 never requests it, and it
+  originates in the platform's C-library/libuv execution path acting on a
+  kernel-reported condition, never in the kernel performing the fallback
+  itself. **A candidate satisfying
   BR3's own resolver rules (§8: exists, a regular file after symlink
   resolution, executable) does not, on its own, prove the OS will treat
   it as a native binary with no interpreter fallback of its own** — this
@@ -4144,16 +4314,36 @@ in-process mechanism this helper itself performs.
          `status` invocation (`inspectWorkingTree` only — never
          `inspectDiff`, per §13's Round 9 review finding #5 correction)
          that could otherwise trigger a content filter — full stop.
-         Config-enumeration (the
-         `filter.<name>.clean=` etc. key search) may still be retained
-         **purely as supplementary diagnostic information** (e.g. to
-         enrich `details` with a driver name when one happens to be
-         discoverable) — but it is never, under any circumstance, treated
-         as sufficient grounds to skip or short-circuit the mandatory
-         `check-attr` scan; config-enumeration alone is explicitly
-         documented as insufficient, per the verified global-config gap
-         above, and must never be treated as sufficient on its own, for
-         any purpose, by a future maintenance change.
+         **Config-enumeration is entirely removed from BR3's contract —
+         withdrawn, mandatory, Round 14 review finding #4 (an earlier
+         draft of this bullet retained the `filter.<name>.clean=` etc.
+         key search as "supplementary diagnostic information" to enrich
+         `details` with a driver name when discoverable; that retention
+         is itself withdrawn).** Config-enumeration was never Git's
+         own machine-readable, NUL-delimited output — plain
+         `config --get-regexp` is line-oriented, and a Git config value
+         may legally contain an embedded newline, reintroducing exactly
+         the record-boundary ambiguity Round 13 (review finding #2)
+         already eliminated for `branch.<name>.merge` by moving to `-z`.
+         Since config-enumeration is not the safety mechanism to begin
+         with — `check-attr --stdin -z filter` alone fully determines
+         whether `EXTERNAL_GIT_FILTER_UNSUPPORTED` applies, and does so
+         correctly regardless of whether any driver definition is
+         visible at all (this section's own Round 7 correction, above) —
+         it earns its keep only as an optional diagnostic enrichment, and
+         that enrichment is not worth reintroducing a NUL-unsafe parser,
+         an extra Git subprocess/query, and additional command-surface
+         for a purely cosmetic benefit. **BR3 v0.1 therefore removes
+         `git config --get-regexp` entirely: no config-enumeration query
+         of any kind runs, anywhere in BR3, for any purpose.** The sole,
+         authoritative filter-safety mechanism is the `check-attr
+         --stdin -z filter` scan already fully specified above — no
+         driver-definition enumeration of any kind is needed to make the
+         refusal decision. This also removes an entire class of
+         maintenance risk: a future change could otherwise be tempted to
+         treat a "no driver found via config-enumeration" result as
+         meaningful, which — as this section's own Round 7 correction
+         already proved — it is not.
       7. **Recursion into every initialized submodule, identically —
          unchanged in scope from Round 6, corrected in mechanism:** the
          identical `ls-files --stage -z` enumeration → `check-attr
@@ -4186,12 +4376,12 @@ in-process mechanism this helper itself performs.
     - **No mutation, no execution, no masking:** at no point does this
       corrected mechanism run a discovered driver, run a no-op
       replacement and present its output as equivalent, or otherwise
-      attempt to "safely" execute or emulate the filter. Neither the
-      config-enumeration query (`config --get-regexp`, read-only
-      configuration text only) nor `check-attr --stdin -z` (a pure,
-      non-executing attribute-resolution query, by Git's own design)
-      ever triggers the filter itself — a content filter is only ever
-      reachable through an actual content-comparison operation
+      attempt to "safely" execute or emulate the filter. `check-attr
+      --stdin -z` (a pure, non-executing attribute-resolution query, by
+      Git's own design — the sole mechanism BR3 uses here, config-
+      enumeration having been removed entirely, Round 14 review finding
+      #4) never triggers the filter itself — a content filter is only
+      ever reachable through an actual content-comparison operation
       (`status` — never `diff`/`checkout`, per §13's independence
       correction, Round 9 review finding #5), which does not run before
       the refusal is decided.
@@ -5818,17 +6008,34 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   `symbolic-ref -q HEAD`/`rev-parse --verify -q HEAD^{commit}` exit codes
   alone (§9), not from any stderr text
 - **Unborn symbolic branch with `branch.<name>.remote`/`.merge`
-  genuinely configured — mandatory, new, Round 13 review finding #4A**
-  (a fresh repository, zero commits, `HEAD` symbolic and unborn as
-  above, but `branch.<name>.remote`/`.merge` config keys set directly —
-  e.g. via `git config` before any commit exists) → `upstream` is a
+  genuinely configured, target RESOLVES — mandatory, new, Round 13 review
+  finding #4A, corrected, Round 14 review finding #1** (a repository
+  containing a real commit on `master`; `HEAD` repointed to an unborn
+  `refs/heads/new` via `git symbolic-ref HEAD refs/heads/new`, verified
+  unborn — `symbolic-ref -q HEAD` succeeds, `rev-parse --verify -q
+  refs/heads/new` fails; `branch.new.remote=.`/`branch.new.merge=refs/heads/master`
+  configured directly) → `unborn: true`, and `upstream` is a genuinely
+  configured, non-null `UpstreamInfo` — `remote`/`mergeRef`/`branch`
+  correctly populated directly from config, **and** `ref`/`sha` **both
+  correctly resolved and non-null** (`ref: refs/heads/master`, `sha`:
+  `master`'s tip) — proving `<new>@{upstream}` genuinely resolves even
+  though the current branch itself remains unborn, since only the
+  *configured target*'s existence matters, never the current branch ref's
+  own existence — the specific regression test proving unborn status
+  alone is never sufficient reason to force `ref`/`sha` null.
+- **Unborn symbolic branch with `branch.<name>.remote`/`.merge`
+  genuinely configured, target MISSING — mandatory, new, Round 13 review
+  finding #4A, corrected, Round 14 review finding #1** (identical setup,
+  but `branch.new.merge` points at a target that itself does not exist,
+  e.g. `refs/heads/does-not-exist`) → `unborn: true`, `upstream` is a
   genuinely configured, non-null `UpstreamInfo` — `remote`/`mergeRef`/
   `branch` correctly populated directly from config — with `ref: null`,
-  `sha: null` (since `<name>@{upstream}` cannot resolve while the branch
-  remains unborn) — proving BR3 does not conflate "configured but
-  currently unresolvable because the branch is unborn" with "no upstream
-  configured at all," the identical distinction §9/§10 already enforce
-  for other configured-but-unresolvable shapes.
+  `sha: null`, since `@{upstream}` genuinely fails to resolve for this
+  fixture (a real resolution failure, never an assumption based on
+  unborn status) — proving BR3 does not conflate "configured but
+  currently unresolvable" with "no upstream configured at all," the
+  identical distinction §9/§10 already enforce for other
+  configured-but-unresolvable shapes.
 - **Direct/detached HEAD pointing at a nonexistent object — new, Round 4
   review finding #5** (constructed by writing a non-existent, all-zeros
   SHA directly into a detached `.git/HEAD` file) → `HEAD_UNAVAILABLE`
@@ -5911,21 +6118,38 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   real; then confirming BR3's own NUL-safe parsing genuinely recovers
   the correct value count and content via `git config -z --get-all`,
   never fabricating a third merge value out of the embedded newline.
-- **Local-tag upstream target — mandatory, new, Round 13 review finding
-  #3** (`branch.<current>.remote = "."`, `branch.<current>.merge =
-  refs/tags/v1`, a real local tag `v1` existing) → `mergeRef:
+- **Local lightweight-tag upstream target — mandatory, new, Round 13
+  review finding #3** (`branch.<current>.remote = "."`,
+  `branch.<current>.merge = refs/tags/v1`, `v1` a real **lightweight**
+  local tag — a plain ref with no tag object of its own) → `mergeRef:
   "refs/tags/v1"`, `branch: null` (never treated as a branch name),
   `ref`/`sha` correctly resolved via `@{upstream}` to the tag's own
-  target — proving BR3's upstream model correctly represents a
-  non-branch upstream target rather than misrepresenting or rejecting
-  it.
-- **Custom-namespace local upstream target — mandatory, new, Round 13
-  review finding #3** (identical structure to the tag case, but
-  `branch.<current>.merge = refs/custom/foo`, a real ref existing at
-  that exact path) → `mergeRef: "refs/custom/foo"`, `branch: null`,
-  `ref`/`sha` correctly resolved — proving the same correctness for an
-  arbitrary, non-conventional ref namespace, not merely the
-  already-well-known tag case.
+  target, and `sha` equal to the commit it directly points at (no tag
+  object exists to distinguish it from) — proving BR3's upstream model
+  correctly represents a non-branch upstream target rather than
+  misrepresenting or rejecting it.
+- **Local ANNOTATED-tag upstream target, `sha` object-ID distinctness —
+  mandatory, new, Round 14 review finding #2** (identical structure, but
+  `v1` created via `git tag -a` — a genuine annotated tag **object**
+  distinct from the commit it points at) → `mergeRef: "refs/tags/v1"`,
+  `branch: null`, `ref: "refs/tags/v1"`, and `UpstreamInfo.sha` asserted
+  to equal `git rev-parse refs/tags/v1` (the **annotated tag object's
+  own SHA**) — and explicitly asserted to **differ** from
+  `git rev-parse refs/tags/v1^{commit}` (the peeled commit SHA) for the
+  identical ref — the specific regression test proving BR3 never
+  performs a `^{commit}` peel and never mischaracterizes the tag object's
+  own SHA as a commit SHA.
+- **Custom-namespace local upstream target, non-commit object — mandatory,
+  new, Round 13 review finding #3, extended Round 14 review finding #2**
+  (identical structure to the tag case, but `branch.<current>.merge =
+  refs/custom/foo`, a real ref existing at that exact path and pointing
+  at a **tree object** directly, not a commit) → `mergeRef:
+  "refs/custom/foo"`, `branch: null`, `ref`/`sha` correctly resolved —
+  `sha` asserted to be the tree object's own raw SHA, faithfully returned
+  with no type assumption or commit-peel attempted — proving the same
+  correctness for an arbitrary, non-conventional ref namespace pointing
+  at a non-commit object, not merely the already-well-known
+  branch/tag-to-commit cases.
 - **Upstream configured under a custom fetch refspec** (e.g.
   `remote.origin.fetch` rewritten to land tracking refs under a
   non-standard namespace instead of `refs/remotes/<remote>/`, then
@@ -6383,24 +6607,34 @@ signature, corrects Round 1 review finding #4**
     global Git config → refusal before status, even though
     `GIT_CONFIG_GLOBAL` is neutralized for actual inspection — mandatory,
     new, Round 7 review finding #4, the specific regression case proving
-    config-enumeration alone is insufficient:** a fixture repository's
-    `.gitattributes` declares `*.txt filter=canon`; a **global** Git
-    config (constructed in the test's own setup, visible only when
-    `GIT_CONFIG_GLOBAL` is *not* overridden) declares
+    a config-enumeration-based approach would have been insufficient
+    (config-enumeration itself is not part of BR3's contract at all —
+    withdrawn entirely, Round 14 review finding #4; this fixture's
+    purpose is solely to prove `check-attr` catches what a
+    config-enumeration-based design would have missed, not to exercise
+    any BR3-internal config-enumeration mechanism, since none exists):**
+    a fixture repository's `.gitattributes` declares `*.txt filter=canon`;
+    a **global** Git config (constructed in the test's own setup, visible
+    only when `GIT_CONFIG_GLOBAL` is *not* overridden) declares
     `filter.canon.clean=<marker-writing, uppercase-normalizing script>`
     and `filter.canon.required=true`; the repository's own local config
-    declares no filter at all. First confirm, in the test's own setup,
-    that BR3's config-enumeration query (`git config --get-regexp
-    '^filter\..*\.(clean|process|smudge)$'`) run under BR3's own
-    sanitized (`GIT_CONFIG_GLOBAL=<null device>`) environment genuinely
-    finds **zero** matches for this fixture (establishing that
-    config-enumeration alone would incorrectly conclude "no filter,
-    proceed" — the exact gap this round closes). Then assert
-    `resolveRepository(projectRoot)` succeeds, and calling
-    `inspectWorkingTree(projectRoot)`: `EXTERNAL_GIT_FILTER_UNSUPPORTED`
-    is produced, and the marker script is **not** executed — proving the
-    `check-attr`-based effective-attribute scan catches this case where
-    config-enumeration alone would not.
+    declares no filter at all. First confirm, in the test's own setup
+    only (a plain, ad hoc `git config --get-regexp
+    '^filter\..*\.(clean|process|smudge)$'` invocation the test harness
+    runs purely to document the premise — never a BR3 code path, and
+    never run under BR3's own execution environment or command
+    allowlist), that this query, run under a `GIT_CONFIG_GLOBAL=<null
+    device>` environment, genuinely finds **zero** matches for this
+    fixture (establishing that a config-enumeration-based approach would
+    have incorrectly concluded "no filter, proceed" — the exact gap
+    `check-attr` closes, and the reason config-enumeration was removed
+    from BR3's contract rather than merely relegated to a diagnostic
+    role). Then assert `resolveRepository(projectRoot)` succeeds, and
+    calling `inspectWorkingTree(projectRoot)`:
+    `EXTERNAL_GIT_FILTER_UNSUPPORTED` is produced, and the marker script
+    is **not** executed — proving the `check-attr`-based
+    effective-attribute scan, BR3's sole filter-safety mechanism, catches
+    this case.
   - **(E) Marker proves the filter never executes, including via the
     check-attr scan itself:** across every fixture above, assert the
     marker file is never created at any point during
@@ -6937,9 +7171,11 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   §17).
 - **H.** Zero Git mutation occurs anywhere in the implementation — every
   Git subcommand string used is one of `status`, `diff`, `rev-parse`,
-  `symbolic-ref`, `config` (read-only `--get`/`--get-all`/`--get-regexp`
-  only — `--get-all` named explicitly, Round 9 review finding #2, for
-  multi-valued `branch.<branch>.merge` reads), `ls-files` (read-only
+  `symbolic-ref`, `config` (read-only `--get`/`--get-all` only —
+  `--get-all` named explicitly, Round 9 review finding #2, for
+  multi-valued `branch.<branch>.merge` reads; `--get-regexp` is not
+  used anywhere in BR3's contract — config-enumeration is withdrawn
+  entirely, Round 14 review finding #4), `ls-files` (read-only
   `--stage -z` only, for submodule enumeration — §18, Round 6 review
   finding #2), `check-attr` (read-only, non-executing, `--stdin -z
   filter` only, for effective-filter-attribute
@@ -7301,19 +7537,24 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   §13, §19, §20, and §27 no longer contain a stale restatement omitting
   `-c status.renameLimit=0` or `-l0`; and the command allowlist
   (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`
-  (`--get`/`--get-all`/`--get-regexp`), `ls-files`, `check-attr`) is
-  stated identically everywhere it appears, with no remaining reference
-  to `config` supporting only `--get`/`--get-regexp` (§11, §13, §19,
-  §20, §27).
+  (`--get`/`--get-all` only — `--get-regexp` removed entirely, Round 14
+  review finding #4), `ls-files`, `check-attr`) is stated identically
+  everywhere it appears, with no remaining reference to `config`
+  supporting `--get-regexp` anywhere in the current contract (§11, §13,
+  §18, §19, §20, §27).
 - **AC.** — new, Round 13 review finding #1. §8/§18's process-security
   wording states the honest, narrower guarantee — "BR3 itself never
   requests a shell or performs shell-string interpolation; Git is
   invoked through a resolved executable path with a separate argv array"
   — never the overclaim "there is no shell in the invocation path at
   all," which is verifiably false on POSIX (a `chmod +x` executable text
-  file with no shebang can still be run through the OS kernel's own
-  `ENOEXEC`/interpreter-fallback behavior when invoked via `execFile`
-  with `shell: false`). The resolved Git executable is explicitly
+  file with no shebang can still be run through an interpreter-fallback
+  behavior when invoked via `execFile` with `shell: false` — attributed
+  precisely, Round 14 review finding #5: the kernel itself only reports
+  `ENOEXEC` for the unsuitable executable image; it is the
+  `execvp`-family/libuv runtime execution path, never the kernel, that
+  may act on that report by re-attempting the exec via an interpreter).
+  The resolved Git executable is explicitly
   documented as a **trusted environment dependency** BR3 verifies the
   reported version of but does not authenticate — a categorically
   different, and separately still fully mandatory, threat boundary from
@@ -7345,20 +7586,65 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   only when `mergeRef` genuinely begins with `refs/heads/`, and is
   `null` otherwise — a local tag or custom-namespace upstream target is
   never mischaracterized as a branch (§7a, §9, §10, §20).
-- **AF.** — new, Round 13 review finding #4. **(A)** A symbolic, unborn
-  branch with `branch.<name>.remote`/`.merge` genuinely configured in
-  `.git/config` reports a non-null, genuinely configured `UpstreamInfo`
-  (`ref: null`, `sha: null`, since `@{upstream}` cannot yet resolve) —
-  never collapsed to an undifferentiated `upstream: null`, which would
-  conflate "configured but currently unresolvable" with "not configured
-  at all," the identical distinction this specification already enforces
-  for every other configured-but-unresolvable shape (§9, §20). **(B)**
-  §11's porcelain v2 submodule-marker table row and prose correctly
-  describe `<sub>` (`S<c><m><u>`) as its own, independent, separate
-  record field — never as residing "in" or "adjacent to" `<XY>` in a way
-  that could be read as requiring a search within `<XY>` itself — with a
-  real dirty-submodule fixture (`1 .M S.M. ...`) proving the parser
-  reads the two fields independently (§11, §20).
+- **AF.** — new, Round 13 review finding #4, revised, Round 14 review
+  finding #1. **(A)** A symbolic branch — normal or unborn — with
+  `branch.<name>.remote`/`.merge` genuinely configured in `.git/config`
+  reports a non-null, genuinely configured `UpstreamInfo`; the identical
+  `@{upstream}` resolution procedure is attempted regardless of unborn
+  status — `ref`/`sha` are populated whenever that resolution genuinely
+  succeeds (which does not require the current branch itself to have any
+  commits, only that the *configured target* exists), and are `null`
+  only when resolution genuinely fails — never collapsed to an
+  undifferentiated `upstream: null`, which would conflate "configured but
+  currently unresolvable" with "not configured at all," the identical
+  distinction this specification already enforces for every other
+  configured-but-unresolvable shape (§9, §20). **(B)** §11's porcelain v2
+  submodule-marker table row and prose correctly describe `<sub>`
+  (`S<c><m><u>`) as its own, independent, separate record field — never
+  as residing "in" or "adjacent to" `<XY>` in a way that could be read as
+  requiring a search within `<XY>` itself — with a real dirty-submodule
+  fixture (`1 .M S.M. ...`) proving the parser reads the two fields
+  independently (§11, §20).
+- **AG.** — new, Round 14 review finding #1. §9/§10's `@{upstream}`
+  resolution procedure runs identically for a normal or an unborn current
+  branch — unborn status is never, by itself, treated as a resolution
+  failure. `ref: null`/`sha: null` are reported only when
+  `<branch>@{upstream}` genuinely fails to resolve (the configured
+  target itself does not exist), proven by a fixture where an unborn
+  current branch's configured upstream target genuinely exists
+  (`upstream.ref`/`.sha` both populated) and a second fixture where it
+  does not (`upstream.ref`/`.sha` both null) (§9, §20).
+- **AH.** — new, Round 14 review finding #2. `UpstreamInfo.sha` has
+  exactly one meaning for every supported `mergeRef` namespace: the raw
+  object ID `git rev-parse --verify -q --end-of-options
+  <branch>@{upstream}` returns, with no `^{commit}` peel performed or
+  implied. Never called a "commit SHA," "branch tip commit," or
+  "resolved commit" except when explicitly scoped to a
+  `refs/heads/*`-or-remote-tracking-branch target — proven by a dedicated
+  annotated-tag fixture where `sha` equals the tag object's own SHA and
+  explicitly differs from the peeled commit SHA (§7a, §9, §10, §20).
+- **AI.** — new, Round 14 review finding #3. §10 is fully reconciled with
+  §7a's `UpstreamInfo` interface: no remaining restatement of the
+  superseded `{ remote, ref, branch, sha }` shape omitting `mergeRef`,
+  and no remaining claim that `remote`/`branch` "remain populated" for
+  every configured-but-unresolvable upstream — `branch`'s nullability is
+  purely a function of `mergeRef`'s namespace, independent of
+  resolvability. Exactly one authoritative `UpstreamInfo` contract exists
+  across §7a/§9/§10 (§20).
+- **AJ.** — new, Round 14 review finding #4. `git config --get-regexp`
+  filter-driver-definition enumeration is removed entirely from BR3's
+  contract — not retained even as an optional diagnostic. The command
+  allowlist (§5, §6, §18, §20, §27) lists only `config --get`/`--get-all`;
+  `check-attr --stdin -z filter` is BR3's sole, self-sufficient
+  filter-safety mechanism, requiring no driver-definition enumeration of
+  any kind (§18, §20).
+- **AK.** — new, Round 14 review finding #5 (wording cleanup only). §6/§8/§18
+  never attribute an interpreter/shell fallback to the OS kernel itself —
+  the kernel only reports `ENOEXEC` for an unsuitable executable image;
+  the `execvp`-family/libuv runtime execution path is what may act on
+  that report. The Round 13 trust-boundary conclusion itself (no shell
+  requested, no shell interpolation, trusted-but-unauthenticated resolved
+  executable) is unchanged (§6, §8, §18).
 
 ## 20b. Implementation Plan
 
@@ -7846,16 +8132,20 @@ The independent reviewer must specifically examine, for BR3:
   `stat` on it would report a plausible shape
 - Whether the command allowlist actually enforced and tested matches this
   document's own stated allowlist exactly — `status`, `diff`,
-  `rev-parse`, `symbolic-ref`, `config` (`--get`/`--get-all`/`--get-regexp`
-  only — `--get-all` corrected in here, Round 10 review finding #4B, an
+  `rev-parse`, `symbolic-ref`, `config` (`--get`/`--get-all` only —
+  `--get-all` corrected in here, Round 10 review finding #4B, an
   earlier draft of this exact bullet omitted it despite Round 9 already
-  requiring it for `branch.<branch>.merge`), `ls-files` (`--stage -z`
+  requiring it for `branch.<branch>.merge`; `--get-regexp` removed
+  entirely, Round 14 review finding #4 — config-enumeration is
+  withdrawn, never part of BR3's contract), `ls-files` (`--stage -z`
   only), `check-attr` (`--stdin -z filter` only) — corrected, Round 8
   review finding #6D — and no others (§5, §6, §18, §27, Round 6 review
-  finding #2, Round 7 review finding #4, Round 9 review finding #2) —
-  with no stale reference anywhere in the specification still asserting
-  only the original five, the six omitting `check-attr`, or the seven
-  omitting `--get-all`
+  finding #2, Round 7 review finding #4, Round 9 review finding #2,
+  Round 14 review finding #4) — with no stale reference anywhere in the
+  specification still asserting only the original five, the six omitting
+  `check-attr`, the seven
+  omitting `--get-all`, or an eight-command form still including
+  `--get-regexp`
 - Whether `resolveRepository`'s `NOT_A_GIT_REPOSITORY`/`GIT_COMMAND_FAILED`
   classification (§8, Round 4 review finding #4, extended by Round 5
   review finding #4 and made ref-backend-aware by Round 6 review finding
@@ -8212,8 +8502,9 @@ The independent reviewer must specifically examine, for BR3:
   Git-subcommand string used, and cross-checking each one against the
   explicit read-only allowlist implied by §5's Scope and §6's Out-of-Scope
   (i.e., `status`, `diff`, `rev-parse`, `symbolic-ref`, `config`
-  (read-only `--get`/`--get-all`/`--get-regexp` only — `--get-all` named
-  explicitly, Round 9 review finding #2), `ls-files` (read-only
+  (read-only `--get`/`--get-all` only — `--get-all` named explicitly,
+  Round 9 review finding #2; `--get-regexp` is never used, Round 14
+  review finding #4), `ls-files` (read-only
   `--stage -z` only, for submodule enumeration — §18, Round 6 review
   finding #2), `check-attr` (read-only, non-executing, `--stdin -z
   filter` only, for effective-filter-attribute detection — §18, Round 7
@@ -8351,8 +8642,11 @@ The independent reviewer must specifically examine, for BR3:
   overclaim "there is no shell in the invocation path at all," verified
   false on POSIX (an executable text file with no shebang, satisfying
   every one of BR3's own candidate-validity rules, can still be run
-  through the OS kernel's own `ENOEXEC`/interpreter-fallback behavior
-  under shell-free `execFile`); whether the resolved Git executable is
+  through an interpreter-fallback behavior under shell-free `execFile` —
+  precisely attributed to the `execvp`-family/libuv runtime execution
+  path acting on a kernel-reported `ENOEXEC` condition, never to the
+  kernel itself performing the fallback, Round 14 review finding #5);
+  whether the resolved Git executable is
   explicitly documented as a trusted environment dependency BR3 verifies
   the reported version of but does not cryptographically or otherwise
   authenticate; and whether the repository-controlled external-helper
@@ -8405,6 +8699,76 @@ The independent reviewer must specifically examine, for BR3:
   misread as requiring a search inside it — proven by the dedicated
   real dirty-submodule fixture (`1 .M S.M. ...`) confirming the two
   fields are parsed independently, never confused
+- **Unborn-branch upstream RESOLUTION correctness — new, mandatory,
+  Round 14 review finding #1 (corrects a further false assumption Round
+  13's own correction introduced):** whether §9/§10 attempt the identical
+  `@{upstream}` resolution procedure regardless of whether the current
+  symbolic branch is normal or unborn — never skipping resolution, and
+  never hard-coding `ref: null`/`sha: null`, merely because the current
+  branch happens to be unborn. Proven by the dedicated fixture
+  (configuring `branch.new.remote=.`/`branch.new.merge=refs/heads/master`
+  on an unborn `new` branch pointing HEAD at a `refs/heads/new` that does
+  not yet exist, against a repository with a real commit already on
+  `master`) asserting `unborn: true` together with a fully resolved,
+  non-null `upstream.ref`/`upstream.sha` — confirming unborn status alone
+  never forces resolution failure; and by a second fixture where the
+  configured target itself does not exist, asserting `unborn: true`
+  together with a genuinely null `upstream.ref`/`upstream.sha` (a real
+  resolution failure, not an assumed one) — proving both directions of
+  the corrected contract are exercised, not merely the previously-assumed
+  one
+- **`UpstreamInfo.sha` exact object-ID meaning — new, mandatory, Round 14
+  review finding #2:** whether `sha` is documented, everywhere it
+  appears (§7a, §9, §10), as exactly and only the raw object ID
+  `git rev-parse --verify -q --end-of-options <branch>@{upstream}`
+  returns, with no `^{commit}` peel performed or implied — never called a
+  "commit SHA," "branch tip commit," or "resolved commit" except when
+  explicitly scoped to a `refs/heads/*`-or-remote-tracking-branch target.
+  Proven by a dedicated annotated-tag fixture asserting
+  `UpstreamInfo.sha` equals the tag object's own SHA (`git rev-parse
+  refs/tags/v1`) and explicitly does **not** equal the peeled commit SHA
+  (`git rev-parse refs/tags/v1^{commit}`) for the identical ref, plus a
+  lightweight-tag fixture and a non-commit custom-ref fixture confirming
+  the raw SHA is faithfully returned in each case with no type assumption
+- **Single authoritative `UpstreamInfo` contract across §7a/§9/§10 — new,
+  mandatory, Round 14 review finding #3:** whether §10 was fully
+  reconciled with §7a's Round 13 `UpstreamInfo` interface — no remaining
+  restatement of the superseded `{ remote, ref, branch, sha }` shape
+  omitting `mergeRef`, and no remaining claim that `remote`/`branch`
+  "remain populated" for every configured-but-unresolvable upstream
+  (false now that `branch` is independently nullable by namespace,
+  regardless of resolvability) — confirmed by a full-document sweep for
+  `{ remote, ref, branch, sha }`, "remote/branch remain populated," and
+  equivalent shorthand omitting `mergeRef` without explicitly flagging
+  the omission as prose brevity
+- **`config --get-regexp` filter-driver enumeration fully removed — new,
+  mandatory, Round 14 review finding #4:** whether the implementation
+  contains zero uses of `git config --get-regexp` anywhere, whether the
+  command allowlist stated in every location it appears (§5, §6, §18,
+  §20, §27) lists only `config --get`/`--get-all`, and whether
+  `check-attr --stdin -z filter` is documented as BR3's sole,
+  self-sufficient filter-safety mechanism, needing no driver-definition
+  enumeration of any kind to decide `EXTERNAL_GIT_FILTER_UNSUPPORTED`.
+  Proven by confirming the case-D regression fixture (§20) no longer
+  exercises any BR3-internal config-enumeration code path (the fixture's
+  own ad hoc `--get-regexp` check, if retained, exists solely as
+  test-setup documentation of the premise, clearly marked as not a BR3
+  code path) and that no acceptance criterion, implementation-plan step,
+  or independent-review bullet anywhere still describes config-enumeration
+  as retained, even as an optional diagnostic
+- **POSIX kernel/runtime attribution precision — new, mandatory, Round 14
+  review finding #5 (wording cleanup only; the Round 13 trust-boundary
+  decision itself is unchanged and preserved):** whether §6/§8/§18 avoid
+  the imprecise claim that "the OS kernel's `ENOEXEC` handling invokes a
+  shell," correctly attributing the interpreter/shell fallback (when one
+  occurs) to the `execvp`/libuv/runtime execution path that may act on a
+  kernel-reported `ENOEXEC`, never to the kernel itself, which only
+  reports that an executable image is unsuitable and performs no
+  fallback of its own — while continuing to state, unchanged: BR3 itself
+  never requests a shell, BR3 never shell-interpolates argv, the resolved
+  executable is a trusted environment dependency, BR3 does not
+  authenticate the Git executable, and BR3 does not claim the trusted
+  executable can never itself launch an interpreter or subprocess
 - Whether test evidence is real (tests actually run against real,
   ephemeral, temporary Git repositories — not mocked Git command output)
 
