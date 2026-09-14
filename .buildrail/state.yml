@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: REVIEW_APPROVED
+  lifecycle_state: HUMAN_QA
   development_phase: BR2
 
 authorization:
@@ -43,10 +43,10 @@ baselines:
 
 # BR0 and BR1 have each been independently reviewed, approved, and frozen
 # at the SHAs recorded under `baselines`. BR1 established the first real,
-# executable BuildRail CLI (packages/cli). BR2 implementation is complete
-# and pending independent review (candidate.branch above) — Git
-# inspection and verification-report generation remain unimplemented
-# until BR3/BR4.
+# executable BuildRail CLI (packages/cli). BR2 implementation
+# (candidate.branch above) has been independently reviewed and approved
+# and is now in Human QA — Git inspection and verification-report
+# generation remain unimplemented until BR3/BR4.
 completed_phases:
   - BR0
   - BR1
