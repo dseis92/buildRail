@@ -12,7 +12,7 @@ export interface CliResult {
 
 const KNOWN_COMMANDS = new Set(["init", "status", "help"]);
 
-export function runCli(argv: string[]): CliResult {
+export async function runCli(argv: string[]): Promise<CliResult> {
   if (argv.length === 0) {
     return { stdout: HELP_TEXT, exitCode: EXIT_SUCCESS };
   }
@@ -52,7 +52,7 @@ export function runCli(argv: string[]): CliResult {
       return { stdout: invalidUsageError(reason), exitCode: EXIT_INVALID_USAGE };
     }
 
-    return first === "init" ? runInit(showHelp) : runStatus(showHelp);
+    return first === "init" ? runInit(showHelp) : await runStatus(showHelp);
   }
 
   // Unreachable: "help" is the only remaining member of KNOWN_COMMANDS.

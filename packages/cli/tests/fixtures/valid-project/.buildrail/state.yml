@@ -1,0 +1,33 @@
+schema_version: 1
+project:
+  name: FixtureProject
+current:
+  lifecycle_state: FROZEN
+  development_phase: BR1
+authorization:
+  id: BR1
+  type: feature
+  title: CLI Skeleton
+  status: completed
+  specification: .buildrail/specs/BR1-CLI-SKELETON.md
+  granted_by: human
+candidate:
+  branch: null
+  base_sha: null
+  candidate_sha: null
+baselines:
+  BR0:
+    approved_sha: 04c93767510c51916fcc51f60b85b674c7d6f1cc
+    status: frozen
+  BR1:
+    approved_sha: 36f7b0a569eeee0cd1c5d7472cf176763c818a2e
+    status: frozen
+completed_phases:
+  - BR0
+  - BR1
+planned_phases:
+  - BR2
+protected_systems: []
+review:
+  independent_review: required
+  self_approval: forbidden

@@ -2,7 +2,7 @@
 
 import { runCli } from "./cli.js";
 
-const result = runCli(process.argv.slice(2));
+const result = await runCli(process.argv.slice(2));
 
 process.stdout.write(result.stdout);
 process.exitCode = result.exitCode;

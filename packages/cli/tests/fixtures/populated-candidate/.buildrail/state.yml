@@ -1,0 +1,34 @@
+schema_version: 1
+project:
+  name: FixtureProject
+current:
+  lifecycle_state: IMPLEMENTING
+  development_phase: BR3
+authorization:
+  id: BR3
+  type: feature
+  title: Git Inspection
+  status: authorized
+  specification: .buildrail/specs/BR3-GIT-INSPECTION.md
+  granted_by: human
+candidate:
+  branch: feature/br3-git-inspection
+  base_sha: "1111111111111111111111111111111111111111"
+  candidate_sha: "2222222222222222222222222222222222222222"
+baselines:
+  BR0:
+    approved_sha: 04c93767510c51916fcc51f60b85b674c7d6f1cc
+    status: frozen
+  BR1:
+    approved_sha: 36f7b0a569eeee0cd1c5d7472cf176763c818a2e
+    status: frozen
+completed_phases:
+  - BR0
+  - BR1
+  - BR2
+planned_phases:
+  - BR4
+protected_systems: []
+review:
+  independent_review: required
+  self_approval: forbidden

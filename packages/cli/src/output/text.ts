@@ -7,7 +7,7 @@ Usage:
 
 Commands:
   init        Show initialization availability
-  status      Show status availability
+  status      Show governance status
   help        Show help
 
 Options:
@@ -34,7 +34,10 @@ that boundary truthfully and does not create or modify any files.
 
 export const STATUS_HELP_TEXT = `buildrail status
 
-Reports whether BuildRail governance status inspection is available.
+Reports BuildRail governance status: project, development phase,
+lifecycle state, authorization, completed phases, baselines, and any
+in-progress candidate — all read from .buildrail/config.yml and
+.buildrail/state.yml in the current directory.
 
 Usage:
   buildrail status [options]
@@ -42,22 +45,16 @@ Usage:
 Options:
   --help, -h    Show this help
 
-BR1 status: state-backed status reporting is not implemented yet. This
-command reports that boundary truthfully and does not read any BuildRail
-governance files.
+Governance files are resolved relative to the current working directory
+only (no parent-directory search, no Git-repository discovery). This
+command performs no Git inspection of its own — any branch/SHA-shaped
+values shown are exactly what is recorded in state.yml, not queried live.
 `;
 
 export const INIT_UNAVAILABLE_TEXT = `BuildRail initialization is not available yet.
 
 The CLI shell is installed successfully.
 Project initialization is implemented in a later BuildRail phase.
-`;
-
-export const STATUS_UNAVAILABLE_TEXT = `BuildRail status requires the governance engine.
-
-CLI command routing is working.
-State inspection will become available after the governance engine is
-implemented.
 `;
 
 export function unknownCommandError(command: string): string {
