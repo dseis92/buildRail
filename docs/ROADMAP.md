@@ -8,7 +8,7 @@ authorized, regardless of how "obviously next" it may seem.
 |-------|------|---------|--------|
 | BR0 | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. | **COMPLETE + INDEPENDENTLY APPROVED + FROZEN** (baseline `04c93767510c51916fcc51f60b85b674c7d6f1cc`) |
 | BR1 | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` | **COMPLETE + INDEPENDENTLY APPROVED + HUMAN QA PASSED + FROZEN** (approved candidate `36f7b0a569eeee0cd1c5d7472cf176763c818a2e`, merged as `3b695399eae01720804ec496e7735d636edaed41`) |
-| BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions | **SPECIFIED** (not implementation-authorized) |
+| BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions | **AUTHORIZED — IMPLEMENTATION NOT STARTED** (specification independently reviewed, approved, and merged at `d5a8a8762daf90d7ea628faa8be55b272e12c03b`; implementation authorization granted, `.buildrail/state.yml`) |
 | BR3 | Git Inspection | Branch detection, HEAD/remote SHA, working tree, diff inspection, protected-path/deletion/rename detection | PLANNED |
 | BR4 | Verification | Quality gate commands, candidate-bound verification, `buildrail verify`, evidence reports | PLANNED |
 | BR5 | Agent Skills | Planning, preflight, implementation, verification, review, completion, handoff skills | PLANNED |
@@ -48,5 +48,8 @@ already established by earlier phases:
 As of this writing, BR0 and BR1 are complete, independently reviewed,
 approved, and frozen at the baseline SHAs recorded in
 `.buildrail/state.yml` (`baselines.BR0`, `baselines.BR1`). BR1 additionally
-passed Human QA before merge. No implementation phase is currently
-authorized. BR2–BR8 remain planned and not implementation-authorized.
+passed Human QA before merge. BR2 (Governance Engine) is now authorized
+for implementation (`.buildrail/state.yml`: `current.lifecycle_state:
+AUTHORIZED`, `current.development_phase: BR2`) — implementation has not
+yet started; the next required step is BR2 preflight. BR3–BR8 remain
+planned and not implementation-authorized.

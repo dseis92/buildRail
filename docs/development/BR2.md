@@ -1,6 +1,14 @@
 # BR2 — Governance Engine
 
-**Status: SPECIFIED / NOT IMPLEMENTATION AUTHORIZED**
+**Status: AUTHORIZED — IMPLEMENTATION NOT STARTED**
+
+The BR2 specification was independently reviewed, approved, and merged
+(`d5a8a8762daf90d7ea628faa8be55b272e12c03b`). The human owner has since
+granted implementation authorization (`.buildrail/state.yml`:
+`current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR2`).
+**Implementation has not yet started** — the next required step is BR2
+preflight, followed by implementation, verification, independent review,
+and human QA.
 
 See `.buildrail/specs/BR2-GOVERNANCE-ENGINE.md` for the detailed BR2
 specification (architectural boundary, config/state loading contracts,
@@ -8,9 +16,8 @@ schema registry and `$ref` resolution strategy, active/historical
 authorization semantics, lifecycle engine, CLI integration, error model,
 dependency proposals, test architecture, and acceptance criteria). That
 document is the authoritative BR2 specification; this page remains a
-short summary. Writing that specification does not authorize
-implementation — a separate human-owner governance activation is required
-before BR2 implementation may begin.
+short summary. This governance activation does not itself change or
+reinterpret that specification's architecture or contracts in any way.
 
 ## Goal
 
@@ -42,8 +49,10 @@ and enforcing legal lifecycle transitions.
 
 ## Entry Conditions
 
-- BR1 reviewed, approved, and authorized as a base
-- BR2 explicitly authorized by the human owner
+- BR1 reviewed, approved, and authorized as a base — **satisfied** (BR1
+  complete, independently approved, Human-QA-passed, merged, and frozen)
+- BR2 explicitly authorized by the human owner — **satisfied**
+  (`.buildrail/state.yml`: `authorization.id: BR2`, `status: authorized`)
 
 ## Exit Conditions
 
