@@ -197,10 +197,10 @@ drafting this specification:
    `inspectDiff(projectRoot, request)` returning changed paths between two
    resolved refs/SHAs, with rename/deletion classification (§13, §14, §15).
 5. **Protected-path matching** (`packages/core/src/git/protectedPaths.ts`)
-   — `matchProtectedPaths(paths, protectedSystems)`, a **pure function**
+   — `matchProtectedPaths(inputs, protectedSystems)`, a **pure function**
    with no Git or filesystem access, matching a caller-supplied list of
-   repository-relative paths against already-loaded `ProtectedSystem[]`
-   declarations (§12, §16).
+   `ProtectedPathCheckInput` entries against already-loaded
+   `ProtectedSystem[]` declarations (§7a, §12, §16).
 6. **Process execution primitive** (`packages/core/src/git/exec.ts` or
    `internal/`) — the one, shared, safe Git-subprocess-invocation helper
    every other BR3 module calls through; never exported publicly (§18,
@@ -254,8 +254,8 @@ packages/core/src/git/
 ├── head.ts                 # inspectHead(projectRoot) (§9, §10)
 ├── workingTree.ts           # inspectWorkingTree(projectRoot) (§11)
 ├── diff.ts                  # inspectDiff(projectRoot, request) (§13–§15)
-└── protectedPaths.ts        # matchProtectedPaths(paths, systems) — pure,
-                             # no Git/filesystem access (§12, §16)
+└── protectedPaths.ts        # matchProtectedPaths(inputs, systems) — pure,
+                             # no Git/filesystem access (§7a, §12, §16)
 ```
 
 This tree is illustrative for reviewers, not exhaustive or binding —
@@ -285,10 +285,16 @@ test-only seam are never re-exported, following BR2's established
 // ---- repository.ts ----
 
 interface RepositoryInfo {
-  root: string;       // absolute, resolved path — the confirmed repository root
-  gitDir: string;      // absolute, resolved path to the .git directory (or the
-                        // resolved target of a .git *file*, for worktrees/submodules)
-  isWorktree: boolean;  // true if this is a linked worktree (not the primary checkout)
+  root: string;           // absolute, resolved path — the confirmed repository root
+  gitDir: string;          // absolute, resolved --git-dir (per-checkout Git directory;
+                            // resolved target of a .git *file* for worktrees/submodules)
+  gitCommonDir: string;     // absolute, resolved --git-common-dir (the shared/common Git
+                            // directory — identical to gitDir except for a linked
+                            // worktree, where it points at the primary checkout's own
+                            // .git; see §8's isWorktree derivation)
+  isWorktree: boolean;      // gitDir !== gitCommonDir — true only for a linked worktree,
+                            // never true for an ordinary repository or a submodule
+                            // checkout (both have gitDir === gitCommonDir) — see §8
 }
 
 function resolveRepository(projectRoot: string): Promise<GitResult<RepositoryInfo>>;
@@ -370,19 +376,43 @@ interface DiffResult {
 function inspectDiff(projectRoot: string, request: DiffRequest): Promise<GitResult<DiffResult>>;
 
 // ---- protectedPaths.ts (PURE — no Git, no filesystem access) ----
+// This is the one, final, authoritative signature — corrects Round 1
+// review finding #4, which found this function defined with two
+// different, contradictory signatures (an earlier draft here, and a
+// second one later in §17). Only this definition exists now; see §17
+// for the error-code implication.
+
+interface ProtectedPathCheckInput {
+  path: string;                             // repository-relative
+  origin: "current" | "old_side_of_rename"; // see §12's renamed-file handling —
+                                              // this field is what lets matchedVia
+                                              // be *derived*, not guessed, since a
+                                              // flat string[] cannot itself carry
+                                              // this provenance
+}
 
 interface ProtectedPathMatch {
-  path: string;               // the input path that matched
-  matchedVia: "path" | "oldPath"; // see §12's renamed-file handling
-  system: ProtectedSystem;      // the full matched ProtectedSystem record
-                                 // (ProtectedSystem/ProtectedSystemStatus already
-                                 // exported from @buildrail/core by BR2 — §3)
+  path: string;                    // the input's own `path` field, echoed back
+  matchedVia: "path" | "oldPath";   // derived directly from the matching input's
+                                     // `origin`: "current" -> "path",
+                                     // "old_side_of_rename" -> "oldPath" — never
+                                     // inferred or guessed by matchProtectedPaths
+  system: ProtectedSystem;           // the full matched ProtectedSystem record
+                                      // (ProtectedSystem/ProtectedSystemStatus already
+                                      // exported from @buildrail/core by BR2 — §3)
+}
+
+interface ProtectedPathMatchResult {
+  matches: ProtectedPathMatch[];
+  invalidInputs: ProtectedPathCheckInput[]; // inputs excluded for containing ".."
+  invalidPatterns: string[];                 // declared ProtectedSystem path patterns
+                                               // excluded for containing ".."
 }
 
 function matchProtectedPaths(
-  paths: string[],
+  inputs: ProtectedPathCheckInput[],
   protectedSystems: ProtectedSystem[]
-): ProtectedPathMatch[];
+): ProtectedPathMatchResult;
 ```
 
 **Split rationale (per the task's explicit A/B/C separation requirement):**
@@ -434,28 +464,51 @@ BR3 function (`inspectHead`, `inspectWorkingTree`, `inspectDiff`) calls
 internally before doing anything else — no other BR3 I/O function may
 skip this validation.
 
-**Validation algorithm:**
+**Validation algorithm (revised — corrects Round 1 review finding #1):**
+verified against real bare/worktree/submodule repositories before being
+written here (commands run against scratch fixtures during this
+correction round; exact output quoted below each step).
 
 1. Confirm `projectRoot` exists and is a directory (`fs.stat` — no Git
    invocation needed yet). If not: `PROJECT_ROOT_NOT_FOUND`.
 2. Confirm `<projectRoot>/.git` exists, as **either** a directory (the
    ordinary case) **or** a regular file (the linked-worktree / submodule
    case, where `.git` is a text file containing a `gitdir: <path>`
-   pointer). If neither exists: `NOT_A_GIT_REPOSITORY`.
-3. Run `git rev-parse --show-toplevel` with `cwd` set to exactly
-   `projectRoot` (via the shared internal exec helper, §18). This is the
-   authoritative check — step 2 is a fast pre-check, not a substitute for
-   asking Git itself.
-   - If the command fails because `projectRoot` is not inside any Git
-     work tree at all: `NOT_A_GIT_REPOSITORY`.
-   - If the command fails because the repository is **bare** (no working
-     tree) — Git reports this as `--show-toplevel` returning an error in
-     a bare repo run from inside `.git` itself, or, for a bare repo
-     invoked from the bare directory, an explicit "this operation must be
-     run in a work tree" style error — BR3 returns `BARE_REPOSITORY_UNSUPPORTED`
-     (§8's "Bare repositories" decision below).
-   - If the command succeeds, compare its stdout (the resolved toplevel
-     path, normalized for trailing separators and symlink resolution via
+   pointer). If neither exists: `NOT_A_GIT_REPOSITORY`. This remains a
+   fast pre-check only — every subsequent step re-derives the same facts
+   from Git itself, so this step can never be the sole source of a
+   BR3 conclusion.
+3. **Bare-repository check FIRST, before anything that assumes a working
+   tree:** run `git rev-parse --is-bare-repository` with `cwd` set to
+   exactly `projectRoot`. This prints exactly `true` or `false` on stdout
+   — an unambiguous, machine-readable fact requiring no error-path
+   inference. Verified:
+   ```
+   $ git rev-parse --is-bare-repository   # run inside a real bare repo
+   true
+   $ git rev-parse --is-bare-repository   # run inside a real non-bare repo
+   false
+   ```
+   If the command itself fails to run at all (not inside any Git
+   repository): `NOT_A_GIT_REPOSITORY`. If it succeeds and prints `true`:
+   `BARE_REPOSITORY_UNSUPPORTED` immediately (§8's "Bare repositories"
+   decision below) — no further step runs, since every remaining step
+   assumes a working tree a bare repository does not have. This
+   **replaces** the previous design, which tried to infer "bare" from
+   `--show-toplevel`'s *failure* — verified that a bare repository's
+   `--show-toplevel` does fail (`fatal: this operation must be run in a
+   work tree`, exit 128), but that failure is indistinguishable, by exit
+   code alone, from "not a Git repository at all" without a further,
+   separate, fragile error-text check. `--is-bare-repository` avoids that
+   ambiguity entirely by asking Git the direct question.
+4. If step 3 reports `false` (has a working tree), run
+   `git rev-parse --show-toplevel` (same `cwd`).
+   - If this fails: `NOT_A_GIT_REPOSITORY` (this should not be reachable
+     if step 2's precheck passed and step 3 succeeded, but is retained as
+     a defensive, correctly-typed fallback for an edge case neither step
+     anticipates).
+   - If it succeeds, compare its stdout (the resolved toplevel path,
+     normalized for trailing separators and symlink resolution via
      `fs.realpath` on both sides before comparison) against `projectRoot`
      (itself passed through `fs.realpath` first, so symlinked project
      roots compare correctly). If they **do not match**, `projectRoot` is
@@ -463,18 +516,45 @@ skip this validation.
      repository's root: `PROJECT_ROOT_MISMATCH`, with `details` naming
      the actual resolved toplevel BR3 found. BR3 never silently operates
      against the parent repository in this case.
-4. If step 3 succeeds and the toplevel matches, run
-   `git rev-parse --git-dir` (same `cwd`) to resolve the actual `.git`
-   directory (this correctly resolves the `gitdir:` pointer for
-   worktrees/submodules from step 2's file case). Resolve it to an
+5. Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`
+   (same `cwd`) to resolve both the per-checkout and the shared/common
+   Git directory (this correctly resolves the `gitdir:` pointer for
+   worktrees/submodules from step 2's file case). Resolve each to an
    absolute path relative to `projectRoot` if Git returns a relative one.
-5. Determine `isWorktree`: true if the resolved `--git-dir` path is
-   **not** a direct child of `projectRoot` named `.git` — i.e., it points
-   somewhere under a different repository's `.git/worktrees/<name>`
-   directory. (Ordinary repositories: `--git-dir` resolves to exactly
-   `<projectRoot>/.git`; linked worktrees: it resolves elsewhere.)
-6. If the Git executable itself cannot be located/spawned at any point
-   in steps 3–4 (`ENOENT` from the underlying `child_process` call, or
+6. **Determine `isWorktree` by comparing `--git-dir` against
+   `--git-common-dir` — corrects Round 1 review finding #1's submodule
+   misclassification.** Verified directly against real fixtures:
+   ```
+   # ordinary repository
+   --git-dir:        .git
+   --git-common-dir: .git                    # IDENTICAL
+
+   # linked worktree (git worktree add)
+   --git-dir:        <primary>/.git/worktrees/<name>
+   --git-common-dir: <primary>/.git           # DIFFERENT
+
+   # submodule checkout (git submodule add)
+   --git-dir:        <superproject>/.git/modules/<name>
+   --git-common-dir: <superproject>/.git/modules/<name>   # IDENTICAL
+   ```
+   An ordinary repository and a submodule checkout both have `--git-dir
+   === --git-common-dir` (a submodule's own `.git` file points at a
+   dedicated, self-contained directory under the superproject's
+   `.git/modules/`, which is that submodule's *own* complete Git
+   directory — not a "shared with the primary checkout, this-one-is-a-
+   worktree" relationship at all). A linked worktree is the **only** of
+   the three shapes where `--git-dir` and `--git-common-dir` diverge,
+   because a worktree deliberately shares one common object store
+   (`--git-common-dir`, pointing at the primary checkout) while having
+   its own per-worktree HEAD/index/refs directory (`--git-dir`). BR3
+   therefore sets `isWorktree: (gitDir !== gitCommonDir)` — this is
+   suffient on its own; no additional signal (such as
+   `--show-superproject-working-tree`) is needed to distinguish these
+   three cases, since a submodule and an ordinary repository already
+   share the "identical" bucket and correctly both report
+   `isWorktree: false`.
+7. If the Git executable itself cannot be located/spawned at any point
+   in steps 3–6 (`ENOENT` from the underlying `child_process` call, or
    equivalent): `GIT_EXECUTABLE_UNAVAILABLE`. This is checked structurally
    by the shared exec helper (§18) and surfaces identically from every
    BR3 entry point, not just `resolveRepository`.
@@ -497,6 +577,16 @@ Git's own `--git-dir` resolution already handles the shared-object-store
 plumbing transparently, so BR3 does not need special-case logic beyond
 correctly reporting `isWorktree` for caller awareness.
 
+**Submodule checkouts are supported and correctly distinguished from
+worktrees** — a submodule checkout's `.git` file (pointing into
+`<superproject>/.git/modules/<name>`) is superficially similar to a
+worktree's `.git` file (pointing into `<primary>/.git/worktrees/<name>`),
+but step 6's `--git-dir`-vs-`--git-common-dir` comparison correctly
+reports `isWorktree: false` for a submodule, since a submodule has no
+common/shared object store relationship with any other checkout — it is,
+from Git's own perspective, simply an independent repository that
+happens to be nested inside another one's working tree.
+
 ## 9. Branch + HEAD Model
 
 `inspectHead(projectRoot)` returns exactly one `HeadInfo` value covering
@@ -508,43 +598,104 @@ every case below — there is no separate function per case.
 | Detached HEAD (checked out to a SHA/tag directly) | `null` | `true` | `false` | 40-hex SHA | `null` (detached HEAD never has an upstream) |
 | Unborn branch (fresh `git init`, zero commits) | branch name (the to-be-created branch, from `git symbolic-ref HEAD` — this resolves even with no commits) | `false` | `true` | `null` | `null` (no commit exists yet to have an upstream relationship against) |
 
-**Determination method:** `git symbolic-ref -q HEAD` determines
-branch-vs-detached (succeeds with the branch ref for a normal branch;
-fails for detached HEAD — a non-zero exit here, distinct from an actual
-error, is the detection signal for `detached: true`, not a `GIT_COMMAND_FAILED`
-error). `git rev-parse HEAD` determines `unborn` vs. having a `headSha`
-(fails with a specific, recognizable "unknown revision" message when
-unborn — BR3 distinguishes this specific failure from a genuine
-`GIT_COMMAND_FAILED`, per §17's expected-vs-exceptional distinction).
+**Determination method — exit codes and machine-readable facts only,
+never stderr-text matching (revised — corrects Round 1 review finding
+#5; each step below verified against real scratch repositories during
+this correction round):**
 
-**Upstream determination — no network, ever:**
+- **Branch vs. detached:** `git symbolic-ref -q HEAD` — succeeds (exit 0,
+  prints the branch ref, e.g. `refs/heads/main`) for a normal branch
+  (including unborn); fails (exit 1, **no stderr at all** with `-q`) for
+  detached HEAD. This is a clean binary exit-code signal, not an error
+  condition — a non-zero exit here is never treated as
+  `GIT_COMMAND_FAILED`.
+- **Unborn vs. has-commits:** `git rev-parse --verify -q HEAD` — succeeds
+  (exit 0, prints the 40-hex SHA) once at least one commit exists; fails
+  (exit 1, **no stderr at all** with `-q`) when the branch is unborn.
+  Verified directly:
+  ```
+  $ git init && git symbolic-ref -q HEAD; echo "exit=$?"
+  refs/heads/main
+  exit=0
+  $ git rev-parse --verify -q HEAD; echo "exit=$?"
+  exit=1                    # (zero stderr output — nothing to match against)
+  ```
+  Combining both commands' exit codes is sufficient to derive all three
+  branch/HEAD states with no error-text inspection anywhere:
+  `symbolic-ref` exit 0 + `rev-parse --verify -q HEAD` exit 1 → unborn
+  branch; `symbolic-ref` exit 0 + `rev-parse --verify -q HEAD` exit 0 →
+  normal branch with commits; `symbolic-ref` exit 1 (regardless of
+  `rev-parse`, which will succeed since a detached HEAD always points at
+  a real commit) → detached. `LC_ALL=C` (§19) may still be set globally
+  for whatever diagnostic text ends up in `GitError.details` for a
+  genuinely unanticipated failure, but — stated explicitly here as the
+  corrected contract — **no BR3 control-flow branch is ever gated on
+  inspecting stderr content; every classification above is derived
+  purely from exit codes and/or separate machine-readable stdout.**
 
-`upstream` is populated by asking Git for the branch's configured
-upstream **and its already-fetched local remote-tracking ref**, never by
-contacting the remote:
+**Upstream determination — no network, ever (revised — corrects Round 1
+review finding #2):**
 
-1. `git rev-parse --abbrev-ref --symbolic-full-name @{upstream}` (run
-   with `cwd` at `projectRoot`, current branch implied by HEAD) resolves
-   the *configured* upstream identity (`remote`, `branch`) without
-   needing the remote-tracking ref itself to exist. If this fails (exit
-   code non-zero, specific "no upstream configured" message), `upstream`
-   is `null` — **not** an error; this is the ordinary "no upstream" case.
-2. If step 1 succeeds, BR3 has `remote`/`branch`/`ref` (the full
-   `refs/remotes/<remote>/<branch>` form). BR3 then runs
-   `git rev-parse <ref>` to read the **local, already-recorded**
-   remote-tracking SHA.
-   - If this succeeds: `sha` is populated with that SHA. **This is the
-     entirety of what "remote SHA" means in BR3** — the SHA the local
-     repository's remote-tracking ref already records, as of whenever it
-     was last updated by an actual `git fetch` the *user* (not BR3) ran.
-     BR3 never runs `git fetch` itself, under any circumstance.
-   - If this fails (the upstream is *configured* in `.git/config` but the
-     remote-tracking ref itself doesn't exist locally — e.g. the remote
-     branch was deleted, or the user never actually fetched after
-     configuring the upstream by hand), `sha` is `null` while `remote`/
-     `branch`/`ref` remain populated — this is the explicit "configured
-     but remote-tracking ref unavailable locally" case, distinct from "no
-     upstream configured" (case 1's `null` `upstream` altogether).
+`upstream` is populated entirely from **Git config** for the *configured*
+identity, plus a **separate** `rev-parse --verify` check for whether the
+local remote-tracking ref actually exists — never via `@{upstream}`,
+which the previous draft incorrectly relied on:
+
+**Why `@{upstream}` cannot be used:** `@{upstream}` is itself a *ref
+expression* that Git resolves by first locating the remote-tracking ref
+it names — if that tracking ref does not exist locally, resolving
+`@{upstream}` fails *entirely*, indistinguishable by exit code or output
+shape from "no upstream configured at all." Verified directly: with
+`branch.main.remote`/`branch.main.merge` genuinely configured but the
+corresponding `refs/remotes/origin/main` deleted,
+`git rev-parse --abbrev-ref --symbolic-full-name @{upstream}` fails with
+exit 128 — the exact same failure shape as when no upstream is configured
+at all. The previous draft's claim that this command could distinguish
+"no upstream configured" from "upstream configured, tracking ref absent"
+was false.
+
+**Corrected method:**
+
+1. **Configured identity, independent of the tracking ref's existence:**
+   `git config --get branch.<branch>.remote` and
+   `git config --get branch.<branch>.merge` (both genuinely read-only —
+   a bare `--get`, never `--set`/`--add`; added to §27's read-only
+   command allowlist). `<branch>` is the branch name from the
+   branch/detached determination above (this step is skipped entirely,
+   `upstream: null`, if HEAD is detached — a detached HEAD has no branch
+   name to look up config for).
+   - If either config key is absent (`git config --get` exits 1 with no
+     stdout): `upstream: null`. **Not** an error — this is the ordinary
+     "no upstream configured" case, determined by config-key absence, not
+     by any ref resolution having been attempted at all.
+   - If both are present, BR3 has the remote name (from
+     `branch.<branch>.remote`, e.g. `origin`) and the merge ref (from
+     `branch.<branch>.merge`, e.g. `refs/heads/main`) — from which the
+     remote-side branch name (`main`) and the full local tracking-ref
+     path (`refs/remotes/<remote>/<branch>`, e.g.
+     `refs/remotes/origin/main`) are constructed directly, with no
+     further Git call needed to know the *identity*.
+2. **Tracking-ref existence and SHA, checked separately:**
+   `git rev-parse --verify -q refs/remotes/<remote>/<branch>` (the exact
+   constructed path from step 1).
+   - If this succeeds (exit 0): `sha` is populated with the printed SHA.
+     **This is the entirety of what "remote SHA" means in BR3** — the SHA
+     the local repository's remote-tracking ref already records, as of
+     whenever it was last updated by an actual `git fetch` the *user*
+     (not BR3) ran. BR3 never runs `git fetch` itself, under any
+     circumstance.
+   - If this fails (exit 1, no stderr with `-q`): `sha` is `null` while
+     `remote`/`branch`/`ref` remain populated from step 1 — the explicit
+     "configured but remote-tracking ref unavailable locally" case,
+     genuinely distinct from step 1's "no upstream configured" `null`
+     case, and now genuinely *reachable and distinguishable*, which the
+     previous `@{upstream}`-based design could not achieve. Verified
+     directly against a scratch repository with `branch.main.remote`/
+     `.merge` configured but `refs/remotes/origin/main` deleted: step 1
+     still reports the configured remote/branch (config keys are
+     unaffected by the tracking ref's deletion), and step 2's
+     `rev-parse --verify -q` on the now-absent ref fails cleanly with
+     exit 1 and no stderr.
 
 **"Remote SHA" is therefore precisely and only: the SHA currently
 recorded by the local remote-tracking ref for the current branch's
@@ -596,15 +747,56 @@ implement `change_control.unexpected_deletion`/`unexpected_rename`
 policy, which needs to know *which* path and *what kind* of change, not
 merely "something changed").
 
-**Determination method: `git status --porcelain=v2 -z`**, run with `cwd`
-at `projectRoot`. Porcelain v2 (not v1) is chosen because it is Git's own
-stable, unambiguous, machine-oriented status format — it distinguishes
-staged vs. unstaged changes to the *same* path as two separate XY-style
-status characters on one v2 record, natively reports renames with
-similarity scores, natively reports submodule state, and, per §13's
-requirement, correctly represents conflicted/unmerged paths without the
-caller needing to hand-parse v1's more ambiguous single-character-pair
-format.
+**Determination method — exact command (revised, fully explicit — corrects
+Round 1 review finding #6):**
+
+```
+git status --porcelain=v2 -z --find-renames=50% --untracked-files=all --ignore-submodules=none
+```
+
+run with `cwd` at `projectRoot`. This exact invocation — verified to
+accept all five flags together without error — is what §19
+(determinism), §20 (test plan), and §27 (independent review) all
+reference; no section states a different or partial form of this
+command. Each flag is individually required, not incidental:
+
+- **`--porcelain=v2`** (not v1): Git's own stable, unambiguous,
+  machine-oriented status format — it distinguishes staged vs. unstaged
+  changes to the *same* path as two separate XY-style status characters
+  on one v2 record, natively reports renames with similarity scores,
+  natively reports submodule state, and, per §13's requirement, correctly
+  represents conflicted/unmerged paths without the caller needing to
+  hand-parse v1's more ambiguous single-character-pair format.
+- **`-z`**: NUL-delimited records (§13).
+- **`--find-renames=50%`**: makes the rename-detection threshold explicit
+  on the `status` invocation itself, rather than relying on porcelain v2
+  "using the same algorithm as `diff --find-renames`" as an implicit,
+  undocumented-on-this-specific-command-line default — this is the exact
+  same 50% threshold §14 establishes for `inspectDiff`, applied
+  identically here so the two functions' rename-detection behavior can
+  never silently drift apart from one another.
+- **`--untracked-files=all`**: forces deterministic, explicit untracked-file
+  reporting. Git's *default* untracked-file behavior is controlled by the
+  `status.showUntrackedFiles` config value, which can be set to `no`,
+  `normal`, or `all` in any given repository's or user's Git config —
+  leaving this unset would mean BR3's actual behavior silently depends on
+  whatever config happens to be in effect wherever it runs, which directly
+  violates §19's determinism requirement. `--untracked-files=all` forces
+  the same, fully-recursive untracked-file listing (not just the
+  top-level directory of an untracked directory) regardless of local
+  config.
+- **`--ignore-submodules=none`**: explicit, deterministic submodule-state
+  behavior. Git's `--ignore-submodules` also has a config-controllable
+  default (`submodule.<name>.ignore` / `diff.ignoreSubmodules`); `none`
+  means "ignore nothing" — every kind of submodule state change
+  (commit-changed, untracked content, modified content) is reported.
+  This is the correct choice given `SubmoduleState { commitChanged,
+  hasUntrackedContent, hasModifiedContent }` is part of BR3's public
+  contract (§7a) specifically to surface this information — a
+  config-dependent partial-ignore default would silently make some of
+  those three fields permanently `false` in some environments and not
+  others, which is exactly the kind of environment-dependent behavior
+  §19 forbids.
 
 **Per-entry mapping from porcelain v2 record types to `WorkingTreeEntryKind`:**
 
@@ -659,19 +851,26 @@ existing API already supports without special-casing submodules further.
 the repository-relative path exactly as Git reports it (already relative
 to the repository root, already using `/` separators regardless of
 platform, since Git internally always uses `/`), decoded from the `-z`
-NUL-delimited output (§13) so paths containing spaces, tabs, quotes, or
-unusual bytes are never corrupted or truncated. See §12 for how these
-same normalized paths feed into protected-path matching.
+NUL-delimited output (§13) so paths containing spaces, tabs, or quotes are
+never corrupted or truncated, and — for the UTF-8-decodable paths that
+are BR3's definitive contract (§13's "Path byte semantics" subsection) —
+exactly round-tripped; a non-UTF-8 path instead produces
+`MALFORMED_GIT_OUTPUT` for the whole `inspectWorkingTree` call, per §13.
+See §12 for how these same normalized paths feed into protected-path
+matching.
 
 ## 12. Protected-System Matching — Path Normalization Rules
 
-`matchProtectedPaths(paths, protectedSystems)` is pure (§7a, §16) and
-receives already-normalized repository-relative paths (as produced by
-`inspectWorkingTree`/`inspectDiff`, or supplied directly by a caller/test
-with the same normalization already applied — the function does not
-re-derive normalization from a live Git call, since it has none).
+`matchProtectedPaths(inputs, protectedSystems)` is pure (§7a, §16) and
+receives already-normalized repository-relative paths, each wrapped in a
+`ProtectedPathCheckInput { path, origin }` (§7a — revised, corrects Round
+1 review finding #4; `origin` is `"current"` or `"old_side_of_rename"`)
+as produced by the caller from `inspectWorkingTree`/`inspectDiff` output,
+or supplied directly by a caller/test with the same normalization already
+applied — the function does not re-derive normalization from a live Git
+call, since it has none.
 
-**Normalization contract, applied uniformly to both the input `paths`
+**Normalization contract, applied uniformly to both each input's `path`
 and each `protectedSystems[].paths` glob pattern before matching:**
 
 - **Separators:** `/` only. BR3 targets the paths Git itself already
@@ -693,13 +892,17 @@ and each `protectedSystems[].paths` glob pattern before matching:**
   filesystem root," since every input BR3 receives is, by construction,
   already scoped to one repository.
 - **`..` (parent-directory traversal):** a normalized input path or
-  pattern containing a literal `..` path segment is **rejected outright**
-  as `INVALID_PATH_PATTERN` (protected-path patterns) — Git itself never
-  emits a path containing `..` for a real repository-relative path, so an
-  input path containing one indicates a caller bug, not a normalization
-  case to silently resolve. This is a defense-in-depth measure: BR3 must
-  never let a `..`-containing pattern be interpreted as "match paths
-  outside the declared scope" via a naive glob engine that resolves it.
+  declared pattern containing a literal `..` path segment is **rejected
+  outright** — excluded from matching and reported via
+  `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns` (§17;
+  revised, corrects Round 1 review finding #4 — this is no longer framed
+  as a `GitErrorCode`, since `matchProtectedPaths` never returns a
+  `GitResult` at all) — Git itself never emits a path containing `..` for
+  a real repository-relative path, so an input path containing one
+  indicates a caller bug, not a normalization case to silently resolve.
+  This is a defense-in-depth measure: BR3 must never let a
+  `..`-containing pattern be interpreted as "match paths outside the
+  declared scope" via a naive glob engine that resolves it.
 - **Case sensitivity:** matching is **case-sensitive**, unconditionally —
   Git repository paths are byte-sequences and are case-sensitive on the
   vast majority of real-world Git hosting/CI environments (Linux); making
@@ -723,46 +926,55 @@ and each `protectedSystems[].paths` glob pattern before matching:**
   standard glob semantics (§13's chosen library, §13, implements exactly
   this).
 
-**Duplicate matches / overlapping protected systems:** if one input path
-matches patterns from **multiple** `ProtectedSystem` entries (e.g. an
-overly-broad `**` system and a more specific nested system both declare
-overlapping paths), `matchProtectedPaths` returns **one
-`ProtectedPathMatch` per (path, system) pair** — i.e., a path matching
-two systems produces two `ProtectedPathMatch` entries in the returned
-array, one per system, never silently collapsed to "the most specific
-match" or "the most restrictive status." **BR3 does not decide which
-match "wins"** — that is a policy-layer decision (should the most
-restrictive status apply? should all matched systems' rules apply
-simultaneously?) squarely outside BR3's boundary (§4). BR3's job ends at
-reporting every intersection completely and accurately.
+**Duplicate matches / overlapping protected systems:** if one input's
+`path` matches patterns from **multiple** `ProtectedSystem` entries (e.g.
+an overly-broad `**` system and a more specific nested system both
+declare overlapping paths), `matchProtectedPaths` returns **one
+`ProtectedPathMatch` per (input, system) pair** — i.e., a path matching
+two systems produces two `ProtectedPathMatch` entries in `matches`, one
+per system, never silently collapsed to "the most specific match" or
+"the most restrictive status." **BR3 does not decide which match
+"wins"** — that is a policy-layer decision (should the most restrictive
+status apply? should all matched systems' rules apply simultaneously?)
+squarely outside BR3's boundary (§4). BR3's job ends at reporting every
+intersection completely and accurately.
 
-**Renamed files — both sides checked, distinctly labeled:** for a
+**Renamed files — both sides checked, distinctly labeled via structured
+input (revised — corrects Round 1 review finding #4):** for a
 `DiffChange`/`WorkingTreeEntry` with `kind: "renamed"`/`staged_rename`,
-`matchProtectedPaths` is expected to be called by the caller with
-**both** `path` (new) and `oldPath` (old) included in its input `paths`
-array (BR3's pure matcher itself has no special "this is a rename" case —
-it just matches whatever paths it's given); the `matchedVia: "path" |
-"oldPath"` field on `ProtectedPathMatch` exists so a caller who does
-supply both can distinguish which side of a rename matched, since "a
-protected system's content moved out of protection" (old path matches,
-new path doesn't) and "previously-unprotected content moved into a
-protected path" (new path matches, old path doesn't) are both real,
-distinct, policy-relevant scenarios — reporting only one side would lose
-information a future policy layer needs. **This is BR3's own
-responsibility to document clearly to callers, since `matchProtectedPaths`
-itself is rename-agnostic** — the caller (whichever future BR2-policy or
-BR5-skill code eventually calls this) is responsible for constructing its
-`paths` input to include both `path` and `oldPath` for any rename entries
-it wants checked on both sides. This specification states the contract;
-it does not implement the caller.
+the caller constructs **two** `ProtectedPathCheckInput` entries — one
+`{ path: <new path>, origin: "current" }` and one
+`{ path: <old path>, origin: "old_side_of_rename" }` — and includes both
+in the `inputs` array passed to `matchProtectedPaths`. This structured
+`origin` field is precisely what makes `matchedVia` on any resulting
+`ProtectedPathMatch` a **derived fact, not a guess**: `origin: "current"`
+producing a match always reports `matchedVia: "path"`; `origin:
+"old_side_of_rename"` producing a match always reports `matchedVia:
+"oldPath"` — a flat `string[]` (the earlier, now-removed design) could
+never support this, since it has no way to know which of its strings
+represented a rename's old side versus its current side. Both "a
+protected system's content moved out of protection" (old-side input
+matches, current-side input doesn't) and "previously-unprotected content
+moved into a protected path" (current-side input matches, old-side
+doesn't) are real, distinct, policy-relevant scenarios — reporting only
+one side would lose information a future policy layer needs. **This is
+still, ultimately, the caller's responsibility to invoke correctly** —
+`matchProtectedPaths` itself has no special "this is a rename" logic; it
+simply matches whatever `ProtectedPathCheckInput` entries it's given,
+each independently, against `protectedSystems`. The caller (whichever
+future BR2-policy or BR5-skill code eventually calls this) is responsible
+for constructing two separate inputs, with the correct `origin` value
+each, for any rename entry it wants checked on both sides. This
+specification states the contract; it does not implement the caller.
 
-**Deleted paths:** matched the same as any other path — a deleted path
-that matches a protected pattern is reported exactly like any other
-match; whether "a protected file was deleted" is more or less concerning
-than "a protected file was modified" is, again, a policy question outside
-BR3's boundary. `matchProtectedPaths` has no `DiffChangeKind`/
-`WorkingTreeEntryKind` awareness at all — it only ever sees plain path
-strings.
+**Deleted paths:** matched the same as any other path (`origin:
+"current"`) — a deleted path that matches a protected pattern is
+reported exactly like any other match; whether "a protected file was
+deleted" is more or less concerning than "a protected file was modified"
+is, again, a policy question outside BR3's boundary. `matchProtectedPaths`
+has no `DiffChangeKind`/`WorkingTreeEntryKind` awareness at all — it only
+ever sees `ProtectedPathCheckInput` entries (a `path` plus the
+caller-supplied `origin`), never any richer change-kind context.
 
 **Untracked paths:** matched identically — an untracked path that happens
 to fall under a protected glob is reported the same as any tracked
@@ -777,33 +989,96 @@ to decide — BR3 supplies the fact.)
 invocation that could involve a path uses `-z` (NUL-delimited records)
 specifically to avoid the ambiguity of newline-delimited output when
 paths themselves could contain newlines, and to avoid any quoting/escaping
-ambiguity for paths containing spaces, tabs, quote characters, or
-non-ASCII/Unicode bytes (Git's default human-oriented path quoting —
-octal-escaping "unusual" characters inside double quotes — is exactly the
-kind of format this specification forbids parsing).
+ambiguity for paths containing spaces, tabs, or quote characters (Git's
+default human-oriented path quoting — octal-escaping "unusual" characters
+inside double quotes — is exactly the kind of format this specification
+forbids parsing).
+
+**Path byte semantics — explicit, deliberate decision (revised — corrects
+Round 1 review finding #7):** `-z` NUL-delimiting solves the *record/field
+boundary* ambiguity (knowing exactly where one path ends and the next
+byte sequence begins), but it does **not**, by itself, make arbitrary path
+*bytes* losslessly representable in the JS-string-based API this
+specification defines. A Git repository path is, at the filesystem/Git
+object level, an arbitrary byte sequence with no guaranteed encoding —
+but every BR3 field typed `string` (`path`, `oldPath` on
+`WorkingTreeEntry`/`DiffChange`) is a JavaScript/Node string, which is
+UTF-16 internally; decoding an arbitrary non-UTF-8 byte sequence as UTF-8
+(the only sound way to turn `-z`-delimited raw bytes into a JS string)
+either throws or silently substitutes U+FFFD replacement characters for
+invalid byte sequences, depending on the decoding API used — neither is
+"lossless."
+
+**BR3's actual, definitive contract:** paths that are valid UTF-8 (the
+overwhelming majority of real-world repositories, and the only case a
+previous draft of this specification implicitly assumed) are decoded and
+round-tripped **exactly** — this part of the earlier "not corrupted"
+claim is accurate and remains true. For a path that is genuinely **not**
+valid UTF-8, BR3 returns `MALFORMED_GIT_OUTPUT` (§17) for the *entire*
+containing operation (`inspectWorkingTree`/`inspectDiff`) rather than
+either (a) silently substituting replacement characters into a `path`
+field and presenting the corrupted result as if it were the real path, or
+(b) crashing with an uncaught decoding exception. This is a whole-operation
+failure, not a per-entry exclusion (unlike `matchProtectedPaths`'s
+`..`-rejection, §12/§17, which processes a batch and reports per-item —
+a working-tree/diff snapshot with one invalid-UTF-8 path among many valid
+ones is treated as a `MALFORMED_GIT_OUTPUT`-shaped anomaly for the whole
+call, since presenting a partial, silently-filtered working-tree/diff
+result to a caller could itself be a dangerous, misleading omission
+in a governance context — a change to a non-UTF-8-named file must never
+simply vanish from what BR3 reports). Implementation detects this by
+attempting a strict UTF-8 decode (Node's `Buffer.prototype.toString("utf-8")`
+does not throw on invalid sequences by default — implementation must use
+a strict-validating decode path, e.g. `TextDecoder("utf-8", { fatal: true
+})`, and catch the resulting `TypeError` to produce `MALFORMED_GIT_OUTPUT`
+rather than silently accepting `TextDecoder`'s own default lossy
+substitution behavior). A dedicated test case for this exact scenario is
+required (§20).
 
 **`inspectDiff(projectRoot, request: DiffRequest)`:**
 
-1. **Ref resolution, always first:** both `request.fromRef` and
-   `request.toRef` are independently resolved via
-   `git rev-parse --verify <ref>^{commit}` (the `^{commit}` suffix
-   ensures the resolution fails cleanly for a ref that doesn't point at a
-   commit, e.g. a blob SHA, rather than silently succeeding against the
-   wrong object type). If either fails to resolve: `REF_NOT_FOUND`, with
-   `details` naming which of the two refs failed. **This validation
-   happens before any diff command runs at all** — per §19's requirement
-   that caller-provided refs never become arbitrary Git options,
-   resolving-and-verifying first means a malformed or hostile `fromRef`/
-   `toRef` string is rejected by `rev-parse` itself (which treats its
-   argument as a revision specifier, never as a flag, when passed via
-   argv — see §19) before it could ever reach a `diff` invocation.
-2. **Resolved SHAs are always returned** (`DiffResult.fromSha`/`toSha`) —
-   a caller receives back exactly which commit each input ref resolved
-   to, not merely the caller's own original ref strings echoed back. This
-   matters because `fromRef`/`toRef` may be symbolic (branch names,
-   `HEAD~3`, etc.) and BR4's eventual evidence-binding concern (explicitly
-   out of BR3's scope, §23) will need the *exact* SHA, not a symbolic
-   reference that could resolve differently later.
+1. **Ref resolution, always first (revised — corrects Round 1 review
+   finding #3):** both `request.fromRef` and `request.toRef` are
+   independently resolved via
+   `git rev-parse --verify --end-of-options <ref>^{commit}` (the
+   `^{commit}` suffix ensures the resolution fails cleanly for a ref that
+   doesn't point at a commit, e.g. a blob SHA, rather than silently
+   succeeding against the wrong object type; `--end-of-options` — verified
+   working with the Git version this environment provides — tells Git's
+   own argument parser to treat every subsequent argv entry as a
+   positional revision specifier, never as a flag, closing the specific
+   gap the previous draft's bare `--verify <ref>^{commit}` (with no
+   end-of-options marker) left open). Verified directly:
+   ```
+   $ git rev-parse --verify --end-of-options main^{commit}
+   c350ff0f8469a4972e7626a239be55917aef4df3   # resolves normally
+   $ git rev-parse --verify --end-of-options -- '--upload-pack=x'^{commit}
+   fatal: Needed a single revision   # exit 128 — rejected, never
+                                       # reinterpreted as a flag
+   ```
+   If either fails to resolve: `REF_NOT_FOUND`, with `details` naming
+   which of the two refs failed. **This validation happens before any
+   diff command runs at all** — per §19's requirement that caller-provided
+   refs never become arbitrary Git options.
+2. **Resolved SHAs are always returned, and are the only thing the
+   subsequent `diff` invocation ever receives (made explicit — corrects
+   Round 1 review finding #3):** `DiffResult.fromSha`/`toSha` are the
+   40-hex-char commit SHAs `rev-parse --verify` in step 1 printed — a
+   caller receives back exactly which commit each input ref resolved to,
+   not merely the caller's own original ref strings echoed back. **The
+   `git diff` invocation in step 3 below is always constructed using
+   these two already-resolved SHA strings — never `request.fromRef` or
+   `request.toRef` directly, under any circumstance.** This is stated as
+   an explicit, unambiguous requirement, not merely implied by the two
+   steps running in sequence: even if step 1's resolution result were
+   somehow cached or reused, the specific string values passed as `diff`'s
+   final two positional arguments must always be the `fromSha`/`toSha`
+   values step 1 produced, never the caller's original request fields.
+   This matters both for the security reason above (a caller-supplied ref
+   string, once resolved, can never re-enter the argv construction path
+   as a flag-shaped string) and for BR4's eventual evidence-binding
+   concern (explicitly out of BR3's scope, §23), which needs the *exact*
+   SHA, not a symbolic reference that could resolve differently later.
 3. **The diff itself:**
    `git diff --no-color --no-ext-diff -z --name-status --find-renames=<threshold>
    <fromSha> <toSha>` (threshold per §14). `--name-status` (not the
@@ -968,16 +1243,57 @@ choose the one relevant to its own question.
   more tied to `node-glob`'s specific historical conventions than to the
   simple string-against-pattern matching BR3 actually needs.
 - **Exact supported semantics BR3 relies on:** `picomatch(pattern, {
-  dot: true, nocase: false, windows: false })` per input pattern — `dot:
-  true` disables the traditional shell-glob dotfile exclusion (§12),
-  `nocase: false` enforces case-sensitive matching (§12), `windows:
-  false` (the default; stated explicitly here for clarity) ensures `\`
-  is never treated as an alternate path separator, consistent with §12's
-  "separators: `/` only" decision. BR3 compiles each `ProtectedSystem`
-  path pattern into a `picomatch` matcher function once (memoized per
-  `matchProtectedPaths` call, or per `ProtectedSystem[]` array identity —
-  implementation's choice, not a caller-visible contract) rather than
-  recompiling per input path.
+  dot: true, nocase: false, windows: false, basename: false, nonegate: true,
+  noextglob: true })` per input pattern (**feature-grammar options added
+  — corrects Round 1 review finding #8**, see below) — `dot: true`
+  disables the traditional shell-glob dotfile exclusion (§12), `nocase:
+  false` enforces case-sensitive matching (§12), `windows: false` (the
+  default; stated explicitly here for clarity) ensures `\` is never
+  treated as an alternate path separator, consistent with §12's
+  "separators: `/` only" decision, `basename: false` (the default;
+  stated for clarity) ensures a pattern always matches against the full
+  repository-relative path, never merely a basename. BR3 compiles each
+  `ProtectedSystem` path pattern into a `picomatch` matcher function once
+  (memoized per `matchProtectedPaths` call, or per `ProtectedSystem[]`
+  array identity — implementation's choice, not a caller-visible
+  contract) rather than recompiling per input path.
+- **Protected-path pattern grammar — explicit decision (corrects Round 1
+  review finding #8, which found this previously unstated):** BR3's
+  declared-pattern grammar supports exactly `*` (single-segment
+  wildcard), `**` (cross-segment wildcard, §12), bracket/character-class
+  expressions (`[abc]`, `[a-z]`), and brace expansion (`{a,b}`, e.g.
+  `src/{auth,payments}/**`) — and explicitly **disables** negation
+  patterns (a leading `!`) and extglobs (`+(pattern)`, `@(pattern)`,
+  `?(pattern)`, etc.), via `picomatch`'s own `nonegate: true` and
+  `noextglob: true` options. **Rationale:** a *protected-path* matcher is
+  security-relevant in exactly the way `docs/PROTECTED_SYSTEMS.md`
+  describes (it exists so a change to a sensitive path is never silently
+  missed) — negation and extglob semantics are the two picomatch
+  features most likely to produce subtle, hard-to-audit behavior in this
+  specific context (e.g. a pattern author writing `!src/auth/legacy/**`
+  intending to narrow protection, but actually broadening what does *not*
+  match in a way that isn't obvious from reading the pattern alone).
+  Bracket expressions and brace expansion carry no comparable risk (they
+  only ever narrow or enumerate exact character/string alternatives, never
+  invert a match) and are plausibly useful for a `config.yml` author
+  (`docs/PROTECTED_SYSTEMS.md`'s own example, `src/auth/**`, doesn't need
+  them, but a multi-directory protected system like
+  `src/{auth,payments}/**` is a reasonable real-world pattern), so they
+  remain enabled. With `nonegate: true` set, `picomatch` itself rejects a
+  pattern beginning with `!` by treating it as a literal (non-negating)
+  character rather than special syntax — BR3 relies on this built-in
+  behavior rather than pre-scanning patterns for a leading `!` itself.
+- **TypeScript typings:** `picomatch` ships its own bundled `.d.ts`
+  declarations as of its current major version line (it does not require
+  a separate `@types/picomatch` package) — **implementation must confirm
+  this fact against the exact `picomatch` version actually resolved in
+  `package-lock.json` at install time** (per BR2's own "confirm generated
+  facts against the real thing, not the spec's assumption" precedent,
+  e.g. its Ajv-2020-export verification requirement), and add
+  `@types/picomatch` as an additional `devDependency` only if that
+  confirmation reveals it's genuinely needed. This specification does not
+  assert bundled-typings as an unconditional fact implementation may skip
+  verifying.
 - **Dependency added:** `picomatch` (pin an exact caret-range version at
   implementation time, per BR2's established "record the exact resolved
   version in `package-lock.json` at implementation time, not hard-coded
@@ -1001,8 +1317,7 @@ type GitErrorCode =
   | "HEAD_UNAVAILABLE"
   | "REF_NOT_FOUND"
   | "GIT_COMMAND_FAILED"
-  | "MALFORMED_GIT_OUTPUT"
-  | "INVALID_PATH_PATTERN";
+  | "MALFORMED_GIT_OUTPUT";
 
 interface GitError extends BuildRailError {
   code: GitErrorCode;
@@ -1011,57 +1326,46 @@ interface GitError extends BuildRailError {
 type GitResult<T> = { ok: true; value: T } | { ok: false; error: GitError };
 ```
 
+**`GitErrorCode` no longer includes `INVALID_PATH_PATTERN` (revised —
+corrects Round 1 review finding #4).** An earlier draft of this
+specification listed `INVALID_PATH_PATTERN` as a member of this union
+*and*, separately, described `matchProtectedPaths` as reporting the same
+condition through a dedicated result-channel field — meaning the code was
+never actually returned as a `GitError` by anything, an unused/dead union
+member. `matchProtectedPaths` is fully synchronous and pure (§7a); it
+never returns a `Promise` and never returns a `GitResult` at all (the
+`GitResult<T>` wrapper above only applies to the five async,
+I/O-performing functions: `resolveRepository`, `inspectHead`,
+`inspectWorkingTree`, `inspectDiff`, and the shared exec helper's own
+internal error translation). A `..`-containing input or declared pattern
+reaching `matchProtectedPaths` is instead excluded from matching and
+reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
+(§7a, §12) — a distinct, non-`GitError`-shaped mechanism, not a
+`GitErrorCode` value.
+
 | Code | Meaning | Expected vs. exceptional |
 |---|---|---|
 | `GIT_EXECUTABLE_UNAVAILABLE` | The `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call) | Expected — a real, anticipated environment condition (Git not installed / not on `PATH`); always a typed `GitResult` failure, never an uncaught exception |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
-| `NOT_A_GIT_REPOSITORY` | `projectRoot` (or any parent) is not inside a Git working tree, per `git rev-parse --show-toplevel`'s failure | Expected |
-| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) | Expected — `details` names the actual resolved toplevel |
-| `BARE_REPOSITORY_UNSUPPORTED` | `projectRoot` resolves to a bare repository (§8) | Expected |
-| `HEAD_UNAVAILABLE` | `rev-parse HEAD` fails for a reason other than "unborn branch" (e.g. a corrupted `.git` — genuinely unexpected repository damage) | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
-| `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
+| `NOT_A_GIT_REPOSITORY` | `projectRoot` (or any parent) is not inside a Git working tree, per `git rev-parse --is-bare-repository`/`--show-toplevel`'s failure (§8) | Expected |
+| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 4) | Expected — `details` names the actual resolved toplevel |
+| `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 3) | Expected |
+| `HEAD_UNAVAILABLE` | `rev-parse --verify -q HEAD` fails for a reason other than "unborn branch" (e.g. a corrupted `.git` — genuinely unexpected repository damage) | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
+| `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify --end-of-options <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
 | `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis |
-| `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line) | Exceptional — this should be unreachable against a conforming Git version; exists so a genuinely unexpected format change fails loudly and specifically rather than silently misparsing |
-| `INVALID_PATH_PATTERN` | A `..`-containing path or pattern reached `matchProtectedPaths` (§12) | Expected — this is a pure, synchronous, non-`Promise`-wrapped failure mode for `matchProtectedPaths` specifically (see below) |
+| `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line, or a path that is not valid UTF-8 — §13) | Exceptional — this should be unreachable against a conforming Git version and well-formed repository content; exists so a genuinely unexpected format change (or a non-UTF-8 path, §13) fails loudly and specifically rather than silently misparsing |
 
-**`matchProtectedPaths` is the one BR3 function that is fully
-synchronous and pure (§7a) — it does not return a `Promise`, and its
-error handling is correspondingly different from the five async,
-I/O-performing functions above.** Rather than returning a `GitResult`
-wrapper (which would suggest an I/O-shaped failure mode it doesn't have),
-`matchProtectedPaths` **filters out** any input path or pattern
-containing an `INVALID_PATH_PATTERN`-triggering `..` segment (§12),
-excluding it from matching entirely, and separately exposes *which*
-inputs were excluded via an optional second return channel:
-
-```ts
-interface ProtectedPathMatchResult {
-  matches: ProtectedPathMatch[];
-  invalidPaths: string[];      // input paths excluded for containing ".."
-  invalidPatterns: string[];    // pattern strings excluded for containing ".."
-}
-
-function matchProtectedPaths(
-  paths: string[],
-  protectedSystems: ProtectedSystem[]
-): ProtectedPathMatchResult;
-```
-
-(This supersedes the bare `ProtectedPathMatch[]`-returning signature
-sketched in §7a's first draft of the function — the type shown here, with
-`invalidPaths`/`invalidPatterns` reported explicitly rather than silently
-dropped or thrown, is `matchProtectedPaths`'s actual, final, authoritative
-signature. §7a's public API listing must be read together with this
-correction — implementation follows this section's shape.)
-
-Rationale: a pure function processing a batch of inputs, where some
-subset might be malformed, is better served by "process what's valid,
-report what wasn't" than by either (a) throwing on the first bad input
-(which would make one malformed path in a large batch abort matching
-for every other, valid path) or (b) silently dropping bad inputs with no
-signal at all (which would hide a genuine caller bug). This mirrors BR2's
-own established principle that thrown exceptions are reserved for
-genuinely exceptional conditions, not routine per-item validation
+**`matchProtectedPaths`'s own error-shaped handling (§7a is the single
+authoritative signature; restated here only for the rationale, not a
+second definition):** a pure function processing a batch of inputs,
+where some subset might be malformed, is better served by "process what's
+valid, report what wasn't" than by either (a) throwing on the first bad
+input (which would make one malformed path in a large batch abort
+matching for every other, valid input) or (b) silently dropping bad
+inputs with no signal at all (which would hide a genuine caller bug).
+This mirrors BR2's own established principle that thrown exceptions are
+reserved for genuinely exceptional conditions, not routine per-item
+validation
 outcomes within an otherwise-successful batch operation.
 
 ## 18. Process Execution Safety
@@ -1106,24 +1410,33 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
   never assembled via string concatenation/interpolation/template
   literals that mix fixed flags and caller data into one string later
   split or passed to a shell.
-- **Caller-provided refs never become arbitrary Git options:** because
-  `execFile`'s argv entries are passed to the `git` process directly
-  (never through a shell, and never re-parsed by Git as a single
-  space-delimited string), a caller-supplied ref string like
-  `--upload-pack=evil-command` passed as `request.fromRef` is received by
-  Git as a single, literal revision-specifier argument — Git's own
-  `rev-parse`/`diff` argument parsing does distinguish a leading `--` as
-  a flag *within a single argv position*, which is why §13 step 1
-  requires resolving-and-verifying every caller-supplied ref via
-  `rev-parse --verify <ref>^{commit}` **before** that ref is used in any
-  subsequent `diff` invocation — a string that `rev-parse --verify` does
-  not resolve to a real commit object is rejected as `REF_NOT_FOUND`
-  before it ever reaches `git diff`'s own argument parsing, closing off
-  any possibility of a ref-shaped string being reinterpreted as a `git
-  diff` flag downstream. (Using `--` as an explicit end-of-options
-  separator before any caller-supplied ref, in every invocation that
-  accepts one, is additionally required as defense in depth, even though
-  the `rev-parse --verify` pre-check above is the primary safeguard.)
+- **Caller-provided refs never become arbitrary Git options (revised —
+  corrects Round 1 review finding #3):** because `execFile`'s argv
+  entries are passed to the `git` process directly (never through a
+  shell, and never re-parsed by Git as a single space-delimited string),
+  a caller-supplied ref string like `--upload-pack=evil-command` passed
+  as `request.fromRef` is received by Git as a single, literal argv
+  entry — but Git's own argument parser can still, absent an explicit
+  end-of-options marker, interpret a leading-`--`-shaped *positional*
+  argument as a flag rather than a revision specifier. §13 step 1
+  therefore requires resolving-and-verifying every caller-supplied ref
+  via `git rev-parse --verify --end-of-options <ref>^{commit}` — the
+  `--end-of-options` flag (verified working against this environment's
+  Git version, §13) is the actual, confirmed-correct mechanism, not the
+  bare `--` separator a previous draft of this specification proposed as
+  an *additional* measure (verified, during this correction round, that
+  `--` does not work correctly in this exact positional slot for
+  `rev-parse --verify` — it produced `fatal: Needed a single revision`
+  even for a genuinely valid ref, so it is not used at all in the final
+  design; `--end-of-options` alone is the complete, sufficient safeguard).
+  A string that `rev-parse --verify --end-of-options` does not resolve to
+  a real commit object is rejected as `REF_NOT_FOUND` before it ever
+  reaches `git diff`'s own argument parsing, and — per §13's explicit
+  requirement — only the already-resolved SHA, never the original
+  caller-supplied ref string, is ever passed to the subsequent `diff`
+  invocation, closing off any possibility of a ref-shaped string
+  reaching `git diff`'s argument parsing at all, not merely being
+  rejected by it.
 - **Deterministic failure handling:** every `execFile` call site (via the
   shared helper) distinguishes exactly three outcomes: (1) success (exit
   0, expected output shape) → parsed and returned as `GitResult`
@@ -1148,11 +1461,19 @@ includes, unconditionally:
   system-level Git config from silently altering behavior in a way this
   specification cannot anticipate; `~/.gitconfig`-level `[user]`-style
   config is left alone, since it does not affect any of BR3's read-only
-  output formats). `LC_ALL`/`LANG: "C"` forces the POSIX/C locale,
-  eliminating any locale-dependent formatting from ever appearing in
-  output BR3 parses (this matters even for machine-readable formats,
-  since some diagnostic/error text Git emits on `stderr` is
-  locale-sensitive, and BR3's `GitError.details` may surface that text).
+  output formats). `LC_ALL`/`LANG: "C"` forces the POSIX/C locale, purely
+  for the **readability/determinism of diagnostic text** that might end
+  up in `GitError.details` for a genuinely unanticipated failure —
+  **stated explicitly (corrects Round 1 review finding #5): no BR3
+  control-flow branch is ever gated on inspecting that text's content.**
+  Every classification BR3 makes (unborn vs. has-commits, branch vs.
+  detached, bare vs. non-bare, upstream configured vs. not, tracking-ref
+  present vs. absent, ref resolves vs. not) is derived exclusively from
+  exit codes and/or separately-parsed machine-readable stdout (§9, §10,
+  §13) — `LC_ALL`/`LANG` exist only so that if a genuinely unanticipated
+  Git failure's message text is ever surfaced to a human via `details`,
+  that text is at least consistent across environments, not so BR3 itself
+  can read it to make a decision.
 - **`--no-pager`** (or, for commands where the subcommand itself doesn't
   accept it directly, the `GIT_PAGER=cat` env override above, which
   applies universally) — BR3 never allows Git to invoke an interactive
@@ -1166,12 +1487,18 @@ includes, unconditionally:
   `git diff`'s invoked *tool* entirely (though not `--name-status`'s own
   output format, this is included as defense-in-depth against unusual
   local configuration).
+- **`git status`'s exact flag set is `--porcelain=v2 -z --find-renames=50%
+  --untracked-files=all --ignore-submodules=none`, always together, never
+  a subset** (§11 — restated here so this section, §11, §20, and §27 all
+  name the identical command with no drift between them).
 - **No reliance on Git aliases:** every BR3 Git invocation uses a
   first-argument literal plumbing/porcelain subcommand name
-  (`status`, `diff`, `rev-parse`, `symbolic-ref`) that ships with Git
-  itself — never a user-configurable alias name — so a local
+  (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`) that ships
+  with Git itself — never a user-configurable alias name — so a local
   `~/.gitconfig`'s `[alias]` section can never redirect a BR3 invocation
-  to different, unexpected behavior.
+  to different, unexpected behavior. (`config` is used read-only, for
+  `--get branch.<branch>.remote`/`.merge` — §9/§10's upstream-identity
+  determination.)
 - **`GIT_TERMINAL_PROMPT=0`:** ensures Git never attempts an interactive
   credential/host-key prompt, which is doubly redundant with §6's "no
   network access" guarantee (none of BR3's commands ever contact a
@@ -1207,29 +1534,51 @@ approximation of what Git output "should" look like.
 
 Minimum required test categories (each bullet is a required test case):
 
-**Repository root (§8)**
+**Repository root (§8) — three distinct required cases added, corrects
+Round 1 review finding #1**
 - Valid repository root resolves successfully
 - Non-Git directory → `NOT_A_GIT_REPOSITORY`
 - Directory that is a subdirectory of a real Git repository, but not its
   root → `PROJECT_ROOT_MISMATCH`, with `details` naming the actual
   toplevel
-- Bare repository → `BARE_REPOSITORY_UNSUPPORTED`
-- Linked worktree → succeeds, `isWorktree: true`
-- `.git` as a file (worktree/submodule shape) → succeeds, `.git`-dir
-  correctly resolved via the pointer
+- **Bare repository** (created via `git init --bare`) →
+  `BARE_REPOSITORY_UNSUPPORTED`, detected via `--is-bare-repository`
+  reporting `true` — a genuinely distinct test fixture from the two
+  below, not merely asserted by claim
+- **Linked worktree** (created via `git worktree add` against a real
+  fixture repository with at least one commit) → succeeds,
+  `isWorktree: true`, and `gitDir !== gitCommonDir` in the returned
+  `RepositoryInfo`
+- **Submodule checkout** (created via `git submodule add` against a real
+  fixture superproject + a separate fixture submodule source repository)
+  → succeeds, **`isWorktree: false`** (the specific regression case this
+  correction round exists to fix — an earlier draft's algorithm would
+  have incorrectly reported `true` here), and `gitDir === gitCommonDir`
+  in the returned `RepositoryInfo`
 - Nonexistent `projectRoot` path → `PROJECT_ROOT_NOT_FOUND`
 
-**Branch + HEAD (§9, §10)**
+**Branch + HEAD (§9, §10) — determination method revised, corrects Round
+1 review findings #2 and #5**
 - Normal branch with commits → correct `branch`, `headSha`, `detached: false`, `unborn: false`
 - Detached HEAD (checked out to a SHA) → `branch: null`, `detached: true`, correct `headSha`
-- Unborn branch (fresh `git init`, zero commits) → `unborn: true`, `headSha: null`, correct pending `branch` name
-- No upstream configured → `upstream: null`
+- Unborn branch (fresh `git init`, zero commits) → `unborn: true`,
+  `headSha: null`, correct pending `branch` name — the specific
+  regression test proving this is derived from
+  `symbolic-ref -q HEAD`/`rev-parse --verify -q HEAD` exit codes alone
+  (§9), not from any stderr text
+- No upstream configured (`branch.<branch>.remote`/`.merge` config both
+  absent) → `upstream: null`
 - Upstream configured with a real local remote-tracking ref present
   (e.g. `git remote add`, `git fetch` against a local bare repository
   used purely as an in-test fixture "remote," or an equivalent local
   setup — never a real network fetch) → correct `remote`/`branch`/`ref`/`sha`
-- Upstream configured, remote-tracking ref absent locally → `sha: null`,
-  other fields populated
+- **Upstream configured (`branch.<branch>.remote`/`.merge` both present),
+  remote-tracking ref subsequently removed** (e.g. via
+  `git update-ref -d refs/remotes/<remote>/<branch>` in the fixture's own
+  setup — this exact scenario is what a previous, `@{upstream}`-based
+  design could not distinguish from "no upstream configured" at all) →
+  `sha: null`, `remote`/`branch`/`ref` still correctly populated from
+  config
 - No network operation occurs during any BR3 test (asserted structurally,
   e.g. by running in an environment with no network access, or by
   confirming no test ever configures a real, reachable remote URL)
@@ -1250,10 +1599,18 @@ Minimum required test categories (each bullet is a required test case):
 - Conflicted/unmerged path (constructed via a real merge conflict in the
   fixture repository)
 - Filename containing spaces
-- Filename containing Unicode characters
-- Filename containing other unusual-but-Git-legal characters (e.g. a
-  literal `"` or tab byte) — confirmed correctly decoded via `-z` output,
-  never corrupted/truncated
+- Filename containing Unicode characters (valid UTF-8) — confirmed
+  correctly, exactly decoded via `-z` output
+- Filename containing other unusual-but-Git-legal, UTF-8-valid characters
+  (e.g. a literal `"` or tab byte) — confirmed correctly decoded via `-z`
+  output, never corrupted/truncated
+- **Filename containing a byte sequence that is not valid UTF-8**
+  (constructed via Node's `Buffer`-based `fs` APIs, bypassing the shell —
+  practical on the Linux/macOS filesystems this test suite targets; §13's
+  final byte-semantics decision) → the defined typed outcome (§13) is
+  produced, never silent corruption, never a crash, never a JS string
+  containing Unicode replacement characters presented as if it were the
+  real path
 
 **Diff inspection (§13, §14, §15)**
 - Two valid refs/SHAs → correct `fromSha`/`toSha` and changed-path list
@@ -1270,27 +1627,46 @@ Minimum required test categories (each bullet is a required test case):
   `DiffChangeKind` value exists at all — confirmed by type-level
   exhaustiveness plus a runtime fixture)
 
-**Protected-path matching (§12, §16) — pure, no Git/filesystem fixture needed**
+**Protected-path matching (§12, §16, §17) — pure, no Git/filesystem
+fixture needed; test bullets updated for the final `ProtectedPathCheckInput`-based
+signature, corrects Round 1 review finding #4**
 - `OPEN` system match reported
 - `GUARDED` system match reported
 - `FROZEN` system match reported
 - `LOCKED` system match reported
-- Overlapping protected systems (one path matches two `ProtectedSystem`
-  entries) → two separate `ProtectedPathMatch` entries, one per system
-- A path that matches no protected system → absent from `matches`
-- Renamed-path protection on the **old** side only (`oldPath` matches,
-  `path` doesn't) → `matchedVia: "oldPath"` present, no `"path"` match
-  for that pair
-- Renamed-path protection on the **new** side only → `matchedVia: "path"`
-- A path or pattern containing `..` → excluded, reported in
-  `invalidPaths`/`invalidPatterns`, never silently matched, never thrown
+- Overlapping protected systems (one `{ path, origin: "current" }` input
+  matches two `ProtectedSystem` entries) → two separate
+  `ProtectedPathMatch` entries in `matches`, one per system
+- An input whose `path` matches no protected system → absent from
+  `matches`
+- A rename represented as **two** inputs — `{ path: <new>, origin:
+  "current" }` and `{ path: <old>, origin: "old_side_of_rename" }` —
+  where only the old-side input matches a protected pattern →
+  `matchedVia: "oldPath"` present in the result, no `"path"`-matched
+  entry for that pair
+- The same two-input rename shape where only the current-side input
+  matches → `matchedVia: "path"` present, no `"oldPath"`-matched entry
+- An input, or a declared `ProtectedSystem` path pattern, containing `..`
+  → excluded from matching, reported in
+  `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`, never
+  silently matched, never thrown
 - Leading `./`, absolute-leading-`/`, dotfile paths, `**` cross-segment
   matching — each a dedicated case exercising §12's normalization rules
+- A declared pattern beginning with `!` (negation) is matched **literally**
+  (i.e. as a normal character, not special syntax), per `nonegate: true`
+  (§16) — a dedicated regression test confirming negation is genuinely
+  disabled, not merely documented as disabled
+- A declared pattern using an extglob form (e.g. `+(a|b)`) is matched
+  **literally**, per `noextglob: true` (§16)
+- A declared pattern using brace expansion (`{a,b}`) and a declared
+  pattern using a bracket expression (`[a-z]`) both match as expected —
+  confirming these two features remain genuinely enabled, not
+  accidentally disabled alongside negation/extglobs
 - `matchProtectedPaths` is confirmed **pure**: calling it twice with the
-  same (deep-equal, but not reference-equal) inputs produces deep-equal
-  outputs, and neither input array/object is mutated (snapshot-before/
-  assert-unchanged-after, mirroring BR2's established purity-test
-  pattern)
+  same (deep-equal, but not reference-equal) `inputs`/`protectedSystems`
+  arguments produces deep-equal outputs, and neither input array/object
+  is mutated (snapshot-before/assert-unchanged-after, mirroring BR2's
+  established purity-test pattern)
 
 **Process/command safety (§18, §19)**
 - No BR3 test, across the entire suite, ever leaves a fixture repository
@@ -1305,6 +1681,151 @@ Minimum required test categories (each bullet is a required test case):
   temporarily manipulating `PATH` in the test's own subprocess
   environment so `git` cannot be found — not by uninstalling Git from
   the actual test-runner environment)
+
+## 20a. Acceptance Criteria
+
+**Added — corrects Round 1 review finding #9, which found no
+standalone, reviewer-ready checklist covering the complete BR3 contract
+(only §27's narrative Independent Review Requirements existed).**
+Numbered `20a` (mirroring §7a's precedent elsewhere in this document,
+which similarly inserts a section between two already-numbered sections
+without renumbering the rest of the document) and placed immediately
+after §20's Test Plan, since each criterion below is proven by that test
+plan. Mirrors BR2 specification §26's own lettered-checklist convention.
+
+- **A.** `resolveRepository` correctly distinguishes all of: a valid
+  repository root, a non-Git directory, a subdirectory of a real
+  repository that is not its root, a bare repository, a linked worktree,
+  and a submodule checkout — each as its own distinct, typed
+  `RepositoryInfo`/`GitError` outcome (§8), with `isWorktree` correctly
+  `true` only for a linked worktree and correctly `false` for both an
+  ordinary repository and a submodule checkout, proven by dedicated real
+  fixtures for each (§20).
+- **B.** `inspectHead` correctly reports all three branch/HEAD states
+  (normal, detached, unborn) and all three upstream states (not
+  configured, configured with tracking ref present, configured with
+  tracking ref absent), with every classification derived from exit
+  codes and/or machine-readable output only — never from inspecting
+  human-readable stderr text (§9, §10).
+- **C.** "Remote SHA" is precisely and only the local remote-tracking
+  ref's already-recorded SHA; no BR3 code path ever invokes `git fetch`
+  or otherwise contacts a network endpoint, proven by running the full
+  BR3 suite with network access disabled (§10, §20).
+- **D.** `inspectWorkingTree` returns a structured, per-path
+  `WorkingTreeEntry[]` — never a single boolean — correctly
+  distinguishing staged/unstaged/both-on-the-same-path/added/deleted/
+  renamed(above and below threshold)/untracked/conflicted/submodule
+  states, using the exact command `git status --porcelain=v2 -z
+  --find-renames=50% --untracked-files=all --ignore-submodules=none`
+  (§11), with §11/§19/§20/§27 all agreeing on that exact command.
+- **E.** `inspectDiff` correctly resolves both input refs via
+  `git rev-parse --verify --end-of-options <ref>^{commit}` before any
+  `diff` invocation runs, always constructs the subsequent `git diff`
+  call using only the resolved SHAs (never the caller's original ref
+  strings), and correctly classifies added/modified/deleted/renamed(above
+  threshold)/type-changed changes while confirming copy detection is
+  genuinely disabled (§13, §14, §15).
+- **F.** A flag-shaped ref string (e.g. `--upload-pack=x`) passed as
+  `DiffRequest.fromRef`/`.toRef` is genuinely rejected as `REF_NOT_FOUND`
+  — proven by an actual regression test constructing exactly this input,
+  not merely documented as rejected (§13, §18, §20).
+- **G.** `matchProtectedPaths` is genuinely pure (no Git access, no
+  filesystem access — confirmed by static inspection of its module's
+  imports, not only by behavioral testing), uses the single, final
+  `ProtectedPathCheckInput`-based signature consistently defined in §7a
+  (with no contradictory second signature anywhere in this document),
+  correctly derives `matchedVia` from each input's own `origin` field,
+  correctly reports `..`-containing inputs/patterns via
+  `invalidInputs`/`invalidPatterns` rather than throwing or silently
+  dropping them, and correctly implements the final picomatch feature
+  grammar (negation and extglobs disabled; brace expansion and bracket
+  expressions enabled) (§7a, §12, §16, §17).
+- **H.** Zero Git mutation occurs anywhere in the implementation — every
+  Git subcommand string used is one of `status`, `diff`, `rev-parse`,
+  `symbolic-ref`, `config` (read-only `--get` only), and no others (§5,
+  §6, §27).
+- **I.** Every Git subprocess is invoked via `execFile` with an argv
+  array — never a shell, never string concatenation — with the exact
+  determinism `env`/flags (§19) applied at exactly one shared call site
+  (§18).
+- **J.** A path that is not valid UTF-8 produces `MALFORMED_GIT_OUTPUT`
+  for the containing operation — never silent corruption, never an
+  uncaught decoding exception, and never a partial/filtered result
+  presented as complete (§13).
+- **K.** No dependency beyond `picomatch` was added (§16, §22); no
+  `ajv-formats`-style scope creep occurred.
+- **L.** BR3 adds no new `buildrail` CLI command and does not modify
+  `packages/cli/src/commands/status.ts` or any other existing CLI
+  command's behavior (§21).
+- **M.** `npm test`, `npm run typecheck`, `npm run build` all pass at the
+  repository root, covering `packages/cli` (BR1, unmodified),
+  `packages/core`'s existing BR2 suites (unmodified/unweakened), and
+  BR3's new test suite (§25).
+- **N.** None of §6's out-of-scope items (Git mutation, quality-gate
+  execution, evidence generation, agent skills, adapters, CI/network/
+  deployment integration) leaked into the implementation.
+
+## 20b. Implementation Plan
+
+**Added — corrects Round 1 review finding #10, which found no ordered
+implementation sequence (only §7's illustrative module tree existed).**
+
+**Module/file structure:** reuses §7's proposed tree
+(`packages/core/src/git/{index,errors,types,repository,head,workingTree,
+diff,protectedPaths}.ts` plus `internal/exec.ts`) without modification —
+see §7 for the full annotated listing.
+
+**Ordered implementation sequence**, derived from actual dependency
+relationships between the pieces (each step depends only on steps already
+listed above it):
+
+1. **`errors.ts` / `types.ts`** — the shared `GitErrorCode`/`GitError`/
+   `GitResult` shapes (§17) and the domain types (`RepositoryInfo`,
+   `HeadInfo`, `UpstreamInfo`, `WorkingTreeStatus`, `WorkingTreeEntry`,
+   `SubmoduleState`, `DiffRequest`, `DiffResult`, `DiffChange`,
+   `ProtectedPathCheckInput`, `ProtectedPathMatch`,
+   `ProtectedPathMatchResult` — §7a). These have no runtime logic and no
+   dependencies of their own; every other file depends on them.
+2. **`internal/exec.ts`** — the one shared safe-exec primitive (§18),
+   applying the determinism env/flags (§19) in one place. Depends only on
+   step 1's error types (to translate `child_process` failures into
+   `GitError` shapes) and Node's own `node:child_process`/`node:util`.
+   Every I/O-performing module below depends on this.
+3. **`repository.ts`** (`resolveRepository`) — depends on step 2 (exec
+   primitive) and step 1 (types/errors). Implemented before `head.ts`/
+   `workingTree.ts`/`diff.ts` because those three each call
+   `resolveRepository` as their own mandatory first step (§8) — building
+   it first, and testing it thoroughly in isolation (§20's repository-root
+   test category, including the bare/worktree/submodule distinction),
+   gives the other three modules a trustworthy foundation to build on
+   rather than a stub.
+4. **`head.ts`** (`inspectHead`) — depends on steps 1–3. No dependency on
+   `workingTree.ts`/`diff.ts`; can be implemented and tested in either
+   order relative to them.
+5. **`workingTree.ts`** (`inspectWorkingTree`) — depends on steps 1–3.
+   Independent of `head.ts`/`diff.ts`.
+6. **`diff.ts`** (`inspectDiff`) — depends on steps 1–3. Independent of
+   `head.ts`/`workingTree.ts`. (Steps 4–6 may be implemented in any
+   relative order, or in parallel, once step 3 is complete and tested —
+   listed sequentially here only for concreteness.)
+7. **`protectedPaths.ts`** (`matchProtectedPaths`) — depends only on step
+   1's types (`ProtectedPathCheckInput`/`ProtectedPathMatch`/
+   `ProtectedPathMatchResult`, and the already-existing, BR2-provided
+   `ProtectedSystem` type) and the `picomatch` dependency (§16) — has no
+   dependency on steps 2–6 at all, and could technically be implemented
+   first or in parallel with any of them, but is sequenced last here
+   because it is the "policy-adjacent" piece most naturally reviewed
+   alongside the other six modules' Git-fact-gathering behavior, not
+   because of a genuine build-order requirement.
+8. **`index.ts`** — the module's own internal barrel, and the specific
+   subset re-exported from `packages/core/src/index.ts` (the package's
+   public barrel, §7a) — depends on all of steps 1–7 existing.
+9. **Test suite** (§20) — while individual modules' own unit tests are
+   naturally written alongside steps 3–7 above (not deferred to the end),
+   the full required test-category checklist (§20) is only completable
+   once step 8's public barrel exists, since BR2's own established
+   testing convention (§3) has tests import from `@buildrail/core`'s
+   public surface, not from individual internal module files directly.
 
 ## 21. CLI Boundary
 
@@ -1471,7 +1992,8 @@ The independent reviewer must specifically examine, for BR3:
   confirmed by literally searching the implementation for every
   Git-subcommand string used, and cross-checking each one against the
   explicit read-only allowlist implied by §5's Scope and §6's Out-of-Scope
-  (i.e., `status`, `diff`, `rev-parse`, `symbolic-ref`, and no others)
+  (i.e., `status`, `diff`, `rev-parse`, `symbolic-ref`, `config`
+  (read-only `--get` only), and no others)
 - Whether `matchProtectedPaths` is genuinely pure — no Git access, no
   filesystem access, confirmed by a test asserting identical output for
   identical (deep-equal) input across repeated calls, and by static
@@ -1479,7 +2001,7 @@ The independent reviewer must specifically examine, for BR3:
   anything from `internal/exec.ts` or any Node `fs`/`child_process`
   module)
 - Whether the `..`-rejection in `matchProtectedPaths` (§12, §17) is
-  reachable and correctly reported via `invalidPaths`/`invalidPatterns`,
+  reachable and correctly reported via `invalidInputs`/`invalidPatterns`,
   not silently matched and not thrown
 - Whether copy detection is genuinely disabled (`--find-copies` never
   passed) — confirmed by a fixture proving a copy-shaped change is
@@ -1503,10 +2025,11 @@ The independent reviewer must specifically examine, for BR3:
   remote-tracking refs
 - Whether exactly the dependency proposed in §16/§22 (`picomatch`, and
   no other) was added
-- Whether `git status --porcelain=v2 -z` and `git diff --name-status -z`
-  (with the exact flags §13/§19 specify) are the actual commands
-  invoked — not `--porcelain` (v1) or a patch-format diff requiring
-  hunk-parsing
+- Whether `git status --porcelain=v2 -z --find-renames=50%
+  --untracked-files=all --ignore-submodules=none` (§11, §19) and
+  `git diff --name-status -z` (with the exact flags §13/§19 specify) are
+  the actual commands invoked — not `--porcelain` (v1), not a partial
+  flag set, and not a patch-format diff requiring hunk-parsing
 - Whether BR3 adds no new CLI command and does not modify
   `packages/cli/src/commands/status.ts` or any other existing CLI
   command's behavior (§21)
