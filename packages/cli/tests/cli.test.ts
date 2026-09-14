@@ -16,6 +16,7 @@ const moduleDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(moduleDir, "..", "..");
 const cliEntry = join(packageRoot, "dist", "index.js");
 const packageJsonPath = join(packageRoot, "package.json");
+const fixturesDir = join(packageRoot, "tests", "fixtures");
 const expectedVersion = (
   JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version: string }
 ).version;
@@ -95,10 +96,57 @@ test("buildrail init --help shows command help and exits 0", async () => {
   assert.match(result.stdout, /buildrail init/);
 });
 
-test("buildrail status reports it is unavailable and exits 1", async () => {
-  const result = await runCli(["status"]);
+test("buildrail status reports CONFIG_NOT_FOUND and exits 1 when no governance files are present", async () => {
+  const scratchDir = makeScratchDir();
+  try {
+    const result = await runCli(["status"], { cwd: scratchDir });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stdout, /CONFIG_NOT_FOUND/);
+    assert.doesNotMatch(result.stdout, /at Object\.|at Module\./);
+  } finally {
+    rmSync(scratchDir, { recursive: true, force: true });
+  }
+});
+
+test("buildrail status against a valid fixture project prints the required fields and exits 0", async () => {
+  const result = await runCli(["status"], { cwd: join(fixturesDir, "valid-project") });
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /Project: FixtureProject/);
+  assert.match(result.stdout, /Development phase: BR1/);
+  assert.match(result.stdout, /Lifecycle state: FROZEN/);
+  assert.match(result.stdout, /BR1 \/ CLI Skeleton — completed \(not active\)/);
+  assert.match(result.stdout, /Completed phases: BR0, BR1/);
+  assert.match(result.stdout, /BR0 → 04c93767510c51916fcc51f60b85b674c7d6f1cc \(frozen\)/);
+  assert.match(result.stdout, /Candidate: none/);
+  assert.match(result.stdout, /Governance documents: valid/);
+});
+
+test("buildrail status against a fixture with a populated candidate includes candidate fields", async () => {
+  const result = await runCli(["status"], { cwd: join(fixturesDir, "populated-candidate") });
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /branch: feature\/br3-git-inspection/);
+  assert.match(result.stdout, /base_sha: 1111111111111111111111111111111111111111/);
+  assert.match(result.stdout, /candidate_sha: 2222222222222222222222222222222222222222/);
+});
+
+test("buildrail status against a fixture with invalid config prints a deterministic error and exits 1", async () => {
+  const result = await runCli(["status"], { cwd: join(fixturesDir, "invalid-config") });
   assert.equal(result.exitCode, 1);
-  assert.match(result.stdout, /requires the governance engine/i);
+  assert.match(result.stdout, /CONFIG_SCHEMA_INVALID/);
+  assert.doesNotMatch(result.stdout, /at Object\.|at Module\./);
+});
+
+test("buildrail status against a fixture with valid config but invalid state prints a deterministic error and exits 1", async () => {
+  const result = await runCli(["status"], { cwd: join(fixturesDir, "invalid-state") });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /STATE_SCHEMA_INVALID/);
+  assert.doesNotMatch(result.stdout, /at Object\.|at Module\./);
+});
+
+test("buildrail status does not walk up parent directories to find .buildrail", async () => {
+  const result = await runCli(["status"], { cwd: join(fixturesDir, "parent-only", "child") });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /CONFIG_NOT_FOUND/);
 });
 
 test("buildrail status --help shows command help and exits 0", async () => {
@@ -153,7 +201,7 @@ test("buildrail status works without any BuildRail governance files present and 
 
     const result = await runCli(["status"], { cwd: scratchDir });
     assert.equal(result.exitCode, 1);
-    assert.match(result.stdout, /requires the governance engine/i);
+    assert.match(result.stdout, /CONFIG_NOT_FOUND/);
 
     const after = readdirSync(scratchDir);
     assert.deepEqual(after, [], "status must not create any files or directories");

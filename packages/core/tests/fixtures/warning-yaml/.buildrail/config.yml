@@ -1,0 +1,11 @@
+%TAG ! tag:example.com,2026:app/
+---
+schema_version: 1
+project:
+  name: !foo FixtureProject
+  default_branch: main
+git: {}
+change_control: {}
+review: {}
+human_qa: {}
+quality_gates: {}

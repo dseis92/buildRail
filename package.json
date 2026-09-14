@@ -7,10 +7,10 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace=@buildrail/cli",
-    "test": "npm run test --workspace=@buildrail/cli",
+    "build": "npm run build --workspace=@buildrail/core && npm run build --workspace=@buildrail/cli",
+    "test": "npm run test --workspace=@buildrail/core && npm run test --workspace=@buildrail/cli",
     "lint": "echo \"BuildRail linting not configured yet\"",
-    "typecheck": "npm run typecheck --workspace=@buildrail/cli"
+    "typecheck": "npm run build --workspace=@buildrail/core && npm run typecheck --workspace=@buildrail/core && npm run typecheck --workspace=@buildrail/cli"
   },
   "license": "Apache-2.0"
 }

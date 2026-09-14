@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: AUTHORIZED
+  lifecycle_state: MERGE_AUTHORIZED
   development_phase: BR2
 
 authorization:
@@ -21,8 +21,8 @@ authorization:
   granted_by: human
 
 candidate:
-  branch: null
-  base_sha: null
+  branch: feature/br2-governance-engine
+  base_sha: 2bc542e683d1d17b5f656329094f5bfa71160dcf
   candidate_sha: null
 
 # Immutable approved checkpoints for completed/frozen phases. Distinct from
@@ -43,10 +43,10 @@ baselines:
 
 # BR0 and BR1 have each been independently reviewed, approved, and frozen
 # at the SHAs recorded under `baselines`. BR1 established the first real,
-# executable BuildRail CLI (packages/cli) — governance/state/config
-# loading, Git inspection, and verification remain unimplemented until
-# BR2 and later phases are implemented (BR2 implementation has not yet
-# started as of this authorization; see `authorization` above).
+# executable BuildRail CLI (packages/cli). BR2 implementation
+# (candidate.branch above) has been independently reviewed, approved, and
+# passed Human QA, and its merge is now authorized — Git inspection and
+# verification-report generation remain unimplemented until BR3/BR4.
 completed_phases:
   - BR0
   - BR1

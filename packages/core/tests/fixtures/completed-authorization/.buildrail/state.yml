@@ -1,0 +1,27 @@
+schema_version: 1
+project:
+  name: FixtureProject
+current:
+  lifecycle_state: FROZEN
+  development_phase: BR9
+authorization:
+  id: BR9
+  type: feature
+  title: Fixture Phase
+  status: completed
+  specification: x.md
+  granted_by: human
+candidate:
+  branch: null
+  base_sha: null
+  candidate_sha: null
+baselines:
+  BR9:
+    approved_sha: cccccccccccccccccccccccccccccccccccccccc
+    status: frozen
+completed_phases:
+  - BR9
+planned_phases: []
+review:
+  independent_review: required
+  self_approval: forbidden

@@ -1,0 +1,22 @@
+schema_version: 1
+project:
+  name: FixtureProject
+current:
+  lifecycle_state: AUTHORIZED
+  development_phase: BR9
+authorization:
+  id: BR9
+  type: feature
+  title: Fixture Phase
+  status: revoked
+  specification: x.md
+  granted_by: human
+candidate:
+  branch: null
+  base_sha: null
+  candidate_sha: null
+completed_phases: []
+planned_phases: []
+review:
+  independent_review: required
+  self_approval: forbidden

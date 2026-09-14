@@ -1,0 +1,8 @@
+project:
+  name: FixtureProject
+  default_branch: main
+git: {}
+change_control: {}
+review: {}
+human_qa: {}
+quality_gates: {}
