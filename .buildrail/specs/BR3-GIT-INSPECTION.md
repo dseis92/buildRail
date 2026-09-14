@@ -311,12 +311,19 @@ interface HeadInfo {
 }
 
 interface UpstreamInfo {
-  remote: string;        // e.g. "origin"
-  ref: string;             // e.g. "refs/remotes/origin/main"
-  branch: string;           // e.g. "main" (the remote-side branch name)
-  sha: string | null;       // the local remote-tracking ref's SHA — see §10.
-                            // null only if the remote-tracking ref itself is
-                            // missing locally (§9's "configured but absent" case)
+  remote: string;   // e.g. "origin", or "." for a local-branch upstream (§9/§10)
+  ref: string;      // the symbolic full name @{upstream} itself resolves to, e.g.
+                    // "refs/remotes/origin/main", "refs/custom-ns/origin/main" (a
+                    // custom fetch refspec), or "refs/heads/main" (a local
+                    // upstream) — never a BR3-constructed path. If @{upstream}
+                    // fails to resolve (tracking ref absent locally), this falls
+                    // back to the conventional "refs/remotes/<remote>/<branch>"
+                    // path as a best-effort label only (§9/§10).
+  branch: string;   // e.g. "main" (the remote-side branch name, from
+                    // branch.<b>.merge)
+  sha: string | null; // resolved via @{upstream} — see §9/§10. null only if
+                      // @{upstream} itself fails to resolve locally (§9's
+                      // "configured but absent" case)
 }
 
 function inspectHead(projectRoot: string): Promise<GitResult<HeadInfo>>;
@@ -464,49 +471,67 @@ BR3 function (`inspectHead`, `inspectWorkingTree`, `inspectDiff`) calls
 internally before doing anything else — no other BR3 I/O function may
 skip this validation.
 
-**Validation algorithm (revised — corrects Round 1 review finding #1):**
-verified against real bare/worktree/submodule repositories before being
-written here (commands run against scratch fixtures during this
-correction round; exact output quoted below each step).
+**Validation algorithm (revised — corrects Round 2 review finding #1,
+which found that Round 1's `<projectRoot>/.git`-existence precheck,
+despite being documented as "non-authoritative," actually made
+`BARE_REPOSITORY_UNSUPPORTED` and `PROJECT_ROOT_MISMATCH` unreachable in
+practice):** verified against real bare/nested-subdirectory/worktree/
+submodule fixtures during this correction round; exact output quoted
+below each step.
+
+**Why the `.git`-child precheck was actively harmful, not just
+imprecise:** verified directly — a bare repository (`git init --bare`)
+has **no** `.git` subdirectory at all; the bare repository's own contents
+(`HEAD`, `objects/`, `refs/`, `config`) sit directly inside the bare
+repository's own directory, not nested one level down inside a `.git`.
+Likewise, an ordinary subdirectory of a real repository that is *not*
+that repository's root (the exact case `PROJECT_ROOT_MISMATCH` exists to
+catch) has **no** `.git` of its own — only the true root does. So the old
+step 2, checking whether `<projectRoot>/.git` exists, would **fail**
+(and return `NOT_A_GIT_REPOSITORY`) for both a real bare repository and a
+real nested subdirectory, before either the bare-repository check or the
+toplevel-comparison check ever ran — silently pre-empting the two most
+specific error codes this algorithm exists to produce. The corrected
+algorithm below removes this precheck entirely and asks Git itself,
+first, using only machine-readable facts:
 
 1. Confirm `projectRoot` exists and is a directory (`fs.stat` — no Git
    invocation needed yet). If not: `PROJECT_ROOT_NOT_FOUND`.
-2. Confirm `<projectRoot>/.git` exists, as **either** a directory (the
-   ordinary case) **or** a regular file (the linked-worktree / submodule
-   case, where `.git` is a text file containing a `gitdir: <path>`
-   pointer). If neither exists: `NOT_A_GIT_REPOSITORY`. This remains a
-   fast pre-check only — every subsequent step re-derives the same facts
-   from Git itself, so this step can never be the sole source of a
-   BR3 conclusion.
-3. **Bare-repository check FIRST, before anything that assumes a working
-   tree:** run `git rev-parse --is-bare-repository` with `cwd` set to
-   exactly `projectRoot`. This prints exactly `true` or `false` on stdout
-   — an unambiguous, machine-readable fact requiring no error-path
-   inference. Verified:
+2. **Bare-repository check FIRST, before any other Git call, and before
+   any assumption that a working tree exists:** run
+   `git rev-parse --is-bare-repository` with `cwd` set to exactly
+   `projectRoot`. This prints exactly `true` or `false` on stdout — an
+   unambiguous, machine-readable fact requiring no error-path inference.
+   Verified directly against three distinct fixtures:
    ```
-   $ git rev-parse --is-bare-repository   # run inside a real bare repo
+   $ git rev-parse --is-bare-repository   # inside a real bare repo
    true
-   $ git rev-parse --is-bare-repository   # run inside a real non-bare repo
+   exit=0
+   $ git rev-parse --is-bare-repository   # inside a real non-bare repo
    false
+   exit=0
+   $ git rev-parse --is-bare-repository   # in a plain, non-Git directory
+   fatal: not a git repository (or any of the parent directories): .git
+   exit=128
    ```
-   If the command itself fails to run at all (not inside any Git
-   repository): `NOT_A_GIT_REPOSITORY`. If it succeeds and prints `true`:
-   `BARE_REPOSITORY_UNSUPPORTED` immediately (§8's "Bare repositories"
-   decision below) — no further step runs, since every remaining step
-   assumes a working tree a bare repository does not have. This
-   **replaces** the previous design, which tried to infer "bare" from
-   `--show-toplevel`'s *failure* — verified that a bare repository's
-   `--show-toplevel` does fail (`fatal: this operation must be run in a
-   work tree`, exit 128), but that failure is indistinguishable, by exit
-   code alone, from "not a Git repository at all" without a further,
-   separate, fragile error-text check. `--is-bare-repository` avoids that
-   ambiguity entirely by asking Git the direct question.
-4. If step 3 reports `false` (has a working tree), run
-   `git rev-parse --show-toplevel` (same `cwd`).
-   - If this fails: `NOT_A_GIT_REPOSITORY` (this should not be reachable
-     if step 2's precheck passed and step 3 succeeded, but is retained as
-     a defensive, correctly-typed fallback for an edge case neither step
-     anticipates).
+   - If the command fails because `projectRoot` is not inside any Git
+     repository at all (the exit-128, fatal-message case above —
+     detected by the command's non-zero exit alone, never by its stderr
+     text, per §19/§9's determinism discipline): `NOT_A_GIT_REPOSITORY`.
+   - If it succeeds and prints `true`: `BARE_REPOSITORY_UNSUPPORTED`
+     immediately (§8's "Bare repositories" decision below) — no further
+     step runs, since every remaining step assumes a working tree a bare
+     repository does not have.
+   - If it succeeds and prints `false`: continue to step 3.
+3. Run `git rev-parse --show-toplevel` (same `cwd`). Verified: run from a
+   subdirectory nested two levels inside a real repository, this
+   correctly resolves to the true repository root, not the nested
+   subdirectory itself — confirming the comparison in step 4 below is
+   meaningful.
+   - If this fails: `NOT_A_GIT_REPOSITORY` (should not be reachable if
+     step 2 already succeeded with `false`, but retained as a defensive,
+     correctly-typed fallback for an edge case step 2 does not
+     anticipate).
    - If it succeeds, compare its stdout (the resolved toplevel path,
      normalized for trailing separators and symlink resolution via
      `fs.realpath` on both sides before comparison) against `projectRoot`
@@ -515,15 +540,18 @@ correction round; exact output quoted below each step).
      a subdirectory of a real Git repository but is **not** that
      repository's root: `PROJECT_ROOT_MISMATCH`, with `details` naming
      the actual resolved toplevel BR3 found. BR3 never silently operates
-     against the parent repository in this case.
-5. Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`
+     against the parent repository in this case. If they match, continue
+     to step 4.
+4. Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`
    (same `cwd`) to resolve both the per-checkout and the shared/common
    Git directory (this correctly resolves the `gitdir:` pointer for
-   worktrees/submodules from step 2's file case). Resolve each to an
-   absolute path relative to `projectRoot` if Git returns a relative one.
-6. **Determine `isWorktree` by comparing `--git-dir` against
-   `--git-common-dir` — corrects Round 1 review finding #1's submodule
-   misclassification.** Verified directly against real fixtures:
+   worktrees/submodules, whether `.git` at `projectRoot` is a directory or
+   a file). Resolve each to an absolute path relative to `projectRoot` if
+   Git returns a relative one.
+5. **Determine `isWorktree` by comparing `--git-dir` against
+   `--git-common-dir`** (unchanged from Round 1's already-correct
+   derivation — re-verified during this round). Verified directly against
+   real fixtures:
    ```
    # ordinary repository
    --git-dir:        .git
@@ -548,16 +576,26 @@ correction round; exact output quoted below each step).
    (`--git-common-dir`, pointing at the primary checkout) while having
    its own per-worktree HEAD/index/refs directory (`--git-dir`). BR3
    therefore sets `isWorktree: (gitDir !== gitCommonDir)` — this is
-   suffient on its own; no additional signal (such as
+   sufficient on its own; no additional signal (such as
    `--show-superproject-working-tree`) is needed to distinguish these
    three cases, since a submodule and an ordinary repository already
    share the "identical" bucket and correctly both report
    `isWorktree: false`.
-7. If the Git executable itself cannot be located/spawned at any point
-   in steps 3–6 (`ENOENT` from the underlying `child_process` call, or
+6. If the Git executable itself cannot be located/spawned at any point
+   in steps 2–5 (`ENOENT` from the underlying `child_process` call, or
    equivalent): `GIT_EXECUTABLE_UNAVAILABLE`. This is checked structurally
    by the shared exec helper (§18) and surfaces identically from every
    BR3 entry point, not just `resolveRepository`.
+
+**The `<projectRoot>/.git`-existence precheck from the previous draft is
+removed entirely, not merely demoted** — it added no information step 2
+doesn't already establish more precisely (via a real Git invocation
+rather than a filesystem guess), and its presence, even as a documented
+"non-authoritative fast pre-check," was concretely responsible for the
+unreachability bug this round corrects. `resolveRepository` now asks Git
+itself, via machine-readable facts, at every step — no step depends on
+BR3's own filesystem-shape assumptions about what a repository "should"
+look like.
 
 **Bare repositories: explicitly unsupported for BR3's initial scope.**
 BR3's entire model (working-tree inspection, checking out-free diffing
@@ -652,69 +690,126 @@ this correction round):**
   classification above is derived purely from exit codes and/or separate
   machine-readable stdout.**
 
-**Upstream determination — no network, ever (revised — corrects Round 1
-review finding #2):**
+**Upstream determination — no network, ever (revised — corrects Round 2
+review finding #2, which found that Round 1's fix, constructing the
+tracking-ref path as a hardcoded `refs/remotes/<remote>/<branch>` string,
+is itself wrong for any non-default fetch refspec or a local-branch
+upstream):**
 
-`upstream` is populated entirely from **Git config** for the *configured*
-identity, plus a **separate** `rev-parse --verify` check for whether the
-local remote-tracking ref actually exists — never via `@{upstream}`,
-which the previous draft incorrectly relied on:
+`upstream` is populated from **Git config**, for the *configured*
+identity, plus **`@{upstream}` itself** (not a hand-constructed path) for
+whether the tracking data actually resolves and to what SHA. Round 1
+correctly rejected using `@{upstream}` as the *sole* signal (it cannot
+distinguish "no upstream configured" from "configured but the tracking
+ref is absent," since both fail the same way) — that insight is
+unchanged. What Round 1 got wrong was the *replacement*: hardcoding
+`refs/remotes/<remote>/<branch>` assumes the default fetch refspec
+(`+refs/heads/*:refs/remotes/<remote>/*`) and assumes the tracking ref
+always lives under `refs/remotes/`, neither of which Git actually
+guarantees.
 
-**Why `@{upstream}` cannot be used:** `@{upstream}` is itself a *ref
-expression* that Git resolves by first locating the remote-tracking ref
-it names — if that tracking ref does not exist locally, resolving
-`@{upstream}` fails *entirely*, indistinguishable by exit code or output
-shape from "no upstream configured at all." Verified directly: with
-`branch.main.remote`/`branch.main.merge` genuinely configured but the
-corresponding `refs/remotes/origin/main` deleted,
-`git rev-parse --abbrev-ref --symbolic-full-name @{upstream}` fails with
-exit 128 — the exact same failure shape as when no upstream is configured
-at all. The previous draft's claim that this command could distinguish
-"no upstream configured" from "upstream configured, tracking ref absent"
-was false.
+**Why the hardcoded path is wrong:** `remote.<name>.fetch` is itself a
+configurable refspec — a repository can configure a custom fetch refspec
+that lands tracking refs anywhere (e.g. under a custom namespace instead
+of `refs/remotes/<remote>/`), and Git also allows `branch.<name>.remote`
+to be `.` (a literal dot), meaning "the upstream is a **local** branch in
+this same repository," in which case there is no remote-tracking ref
+under `refs/remotes/` at all — the upstream ref is a plain
+`refs/heads/<other-branch>`. A hardcoded `refs/remotes/<remote>/<branch>`
+construction silently produces the wrong path (or a path that happens
+not to exist) in both cases, even though the upstream is genuinely and
+correctly configured. `@{upstream}`, by contrast, is Git's own resolution
+of "whatever the configured upstream actually points to right now,"
+honoring both custom refspecs and the `remote="."` local-upstream case
+correctly by construction — because it goes through the same resolution
+logic Git itself uses for `git status`, `git push`, etc., rather than
+BR3 re-deriving that logic independently and incompletely.
+
+Verified directly, against three separate scratch fixtures, that
+`git rev-parse --verify -q @{upstream}` resolves correctly in every case
+where an upstream is genuinely configured, and fails cleanly (exit 1, no
+stderr) only when it is genuinely absent:
+```
+# ordinary upstream (remote=origin, merge=refs/heads/main)
+$ git rev-parse --verify -q @{upstream}
+<sha>
+exit=0
+
+# custom fetch refspec (remote.origin.fetch rewritten to
+# "+refs/heads/*:refs/custom-ns/origin/*" — no refs/remotes/origin/*
+# exists at all after fetching under this refspec)
+$ git rev-parse --verify -q @{upstream}
+<sha>                    # resolves correctly via refs/custom-ns/origin/main
+exit=0
+
+# local upstream (branch.feature.remote=".", branch.feature.merge=refs/heads/main —
+# set via: git branch --set-upstream-to=main feature)
+$ git rev-parse --verify -q @{upstream}
+<sha>                    # resolves correctly to refs/heads/main's own sha
+exit=0
+
+# upstream configured, tracking ref subsequently deleted
+# (git config still reports branch.main.remote/merge; refs/remotes/origin/main removed)
+$ git rev-parse --verify -q @{upstream}
+exit=1                   # clean failure, no stderr — genuinely absent
+```
+No valid Git upstream configuration was found, across these tested
+shapes, that `@{upstream}` fails to resolve correctly when the tracking
+data is actually present.
 
 **Corrected method:**
 
 1. **Configured identity, independent of the tracking ref's existence:**
    `git config --get branch.<branch>.remote` and
    `git config --get branch.<branch>.merge` (both genuinely read-only —
-   a bare `--get`, never `--set`/`--add`; added to §27's read-only
-   command allowlist). `<branch>` is the branch name from the
-   branch/detached determination above (this step is skipped entirely,
-   `upstream: null`, if HEAD is detached — a detached HEAD has no branch
-   name to look up config for).
+   a bare `--get`, never `--set`/`--add`; already on §27's read-only
+   command allowlist from Round 1). `<branch>` is the branch name from
+   the branch/detached determination above (this step is skipped
+   entirely, `upstream: null`, if HEAD is detached — a detached HEAD has
+   no branch name to look up config for). **Unchanged from Round 1** —
+   this remains the correct way to answer "is anything configured at
+   all," since it depends on nothing but the config keys' presence, not
+   on any ref actually resolving.
    - If either config key is absent (`git config --get` exits 1 with no
      stdout): `upstream: null`. **Not** an error — this is the ordinary
      "no upstream configured" case, determined by config-key absence, not
      by any ref resolution having been attempted at all.
    - If both are present, BR3 has the remote name (from
-     `branch.<branch>.remote`, e.g. `origin`) and the merge ref (from
-     `branch.<branch>.merge`, e.g. `refs/heads/main`) — from which the
-     remote-side branch name (`main`) and the full local tracking-ref
-     path (`refs/remotes/<remote>/<branch>`, e.g.
-     `refs/remotes/origin/main`) are constructed directly, with no
-     further Git call needed to know the *identity*.
-2. **Tracking-ref existence and SHA, checked separately:**
-   `git rev-parse --verify -q refs/remotes/<remote>/<branch>` (the exact
-   constructed path from step 1).
-   - If this succeeds (exit 0): `sha` is populated with the printed SHA.
-     **This is the entirety of what "remote SHA" means in BR3** — the SHA
-     the local repository's remote-tracking ref already records, as of
-     whenever it was last updated by an actual `git fetch` the *user*
-     (not BR3) ran. BR3 never runs `git fetch` itself, under any
-     circumstance.
-   - If this fails (exit 1, no stderr with `-q`): `sha` is `null` while
-     `remote`/`branch`/`ref` remain populated from step 1 — the explicit
-     "configured but remote-tracking ref unavailable locally" case,
+     `branch.<branch>.remote`, e.g. `origin` or `.`) and the merge ref
+     (from `branch.<branch>.merge`, e.g. `refs/heads/main`) — from which
+     the remote-side branch name (`main`) is known directly, with no
+     further Git call needed. The `ref` field reported to callers (§7a)
+     is the resolved tracking ref **as Git itself resolves it** — see
+     step 2, not a BR3-constructed path.
+2. **Tracking-ref resolution and SHA, via `@{upstream}` itself, resolved
+   in the context of `<branch>` (not whatever branch HEAD happens to
+   currently be, so this remains correct if that ever diverges):**
+   `git rev-parse --verify -q <branch>@{upstream}` for the SHA, and
+   `git rev-parse --verify -q --symbolic-full-name <branch>@{upstream}`
+   for the resolved ref name (both genuinely read-only; both added to
+   §27's read-only command allowlist).
+   - If both succeed (exit 0): `sha` is populated with the printed SHA,
+     and `ref` is populated with the printed symbolic full name (e.g.
+     `refs/remotes/origin/main`, `refs/custom-ns/origin/main`, or
+     `refs/heads/main` for a local upstream — whichever Git itself
+     reports, never a BR3 guess). **This is the entirety of what "remote
+     SHA" means in BR3** — the SHA the local repository's tracking ref
+     already records, as of whenever it was last updated by an actual
+     `git fetch` (or, for a local upstream, simply the other local
+     branch's current tip) the *user* (not BR3) established. BR3 never
+     runs `git fetch` itself, under any circumstance.
+   - If either fails (exit 1, no stderr with `-q`): `sha` is `null` and
+     `ref` falls back to the step-1-constructed conventional path
+     (`refs/remotes/<remote>/<branch>`) as a best-effort label only —
+     while `remote`/`branch` remain populated from step 1. This is the
+     explicit "configured but tracking ref unavailable locally" case,
      genuinely distinct from step 1's "no upstream configured" `null`
-     case, and now genuinely *reachable and distinguishable*, which the
-     previous `@{upstream}`-based design could not achieve. Verified
-     directly against a scratch repository with `branch.main.remote`/
-     `.merge` configured but `refs/remotes/origin/main` deleted: step 1
-     still reports the configured remote/branch (config keys are
-     unaffected by the tracking ref's deletion), and step 2's
-     `rev-parse --verify -q` on the now-absent ref fails cleanly with
-     exit 1 and no stderr.
+     case. Verified directly against a scratch repository with
+     `branch.main.remote`/`.merge` configured but
+     `refs/remotes/origin/main` deleted: step 1 still reports the
+     configured remote/branch (config keys are unaffected by the
+     tracking ref's deletion), and step 2's `@{upstream}` resolution on
+     the now-absent ref fails cleanly with exit 1 and no stderr.
 
 **"Remote SHA" is therefore precisely and only: the SHA currently
 recorded by the local remote-tracking ref for the current branch's
@@ -741,14 +836,28 @@ short section, since the task explicitly requires "remote SHA" to never
 be used ambiguously.)
 
 - **No upstream configured:** `upstream: null`. Not an error.
-- **Upstream configured, remote-tracking ref present locally:**
-  `upstream: { remote, ref, branch, sha: <40-hex SHA> }`.
-- **Upstream configured, remote-tracking ref absent locally:**
-  `upstream: { remote, ref, branch, sha: null }`.
+- **Upstream configured, tracking ref resolves via `@{upstream}`:**
+  `upstream: { remote, ref, branch, sha: <40-hex SHA> }`, where `ref` is
+  whatever symbolic full name `@{upstream}` itself resolves to (honoring
+  custom fetch refspecs and the `remote="."` local-upstream case — see
+  §9's corrected method) — never a BR3-constructed
+  `refs/remotes/<remote>/<branch>` guess.
+- **Upstream configured, `@{upstream}` fails to resolve (tracking ref
+  absent locally):** `upstream: { remote, ref, branch, sha: null }`,
+  where `ref` falls back to the conventional
+  `refs/remotes/<remote>/<branch>` path as a best-effort label only,
+  since Git itself has nothing to resolve in this case.
 - **Repository has no remotes at all:** indistinguishable, from BR3's
   point of view, from "no upstream configured" (case 1 above) — a branch
   cannot have a configured upstream if no remote exists to name. No
   separate error code is needed; `upstream: null` covers it.
+- **Upstream is a local branch (`branch.<name>.remote = "."`):** fully
+  supported, not a distinct case from BR3's caller's point of view —
+  `@{upstream}` resolves such a configuration correctly (verified in
+  §9), reporting `ref: refs/heads/<other-branch>` and `sha` from that
+  local branch's own current tip. `remote` is reported exactly as Git
+  config stores it (the literal string `.`), since BR3 reports facts as
+  Git records them rather than translating `.` into some other sentinel.
 - **HEAD is detached:** `upstream: null` unconditionally — detached HEAD
   has no branch, and only branches have configured upstreams.
 
@@ -1054,6 +1163,66 @@ rather than silently accepting `TextDecoder`'s own default lossy
 substitution behavior). A dedicated test case for this exact scenario is
 required (§20).
 
+**The byte-first parsing pipeline this actually requires (revised —
+corrects Round 2 review finding #3, which found that the strict-decode
+requirement above is unimplementable as previously written, since nothing
+in this specification established that *raw bytes*, rather than an
+already-lossily-decoded string, reach that decoding step):** Node's
+`child_process.execFile` (§18), when given no `encoding` option (or
+`encoding: "utf8"`, its default), decodes `stdout`/`stderr` from raw bytes
+to a JS string **itself**, internally, using a **lossy** UTF-8 decode —
+exactly the same lossy substitution behavior this section just ruled out,
+except happening silently one layer below where a `TextDecoder({fatal:
+true})` call could ever see or reject it. By the time `execFile`'s
+callback/Promise hands BR3 a `string`, any invalid byte sequence in that
+output has **already** been irreversibly replaced with U+FFFD — no
+strict decode performed afterward can recover the original bytes or
+detect that a replacement occurred, because the information is already
+gone. A strict `TextDecoder` call downstream of a default-`encoding`
+`execFile` call can therefore never actually fire on the invalid input it
+exists to catch.
+
+**The fix: request raw bytes from `execFile`, never pre-decoded strings,
+for every BR3 invocation that returns path data.** §18's shared exec
+helper must call `execFile` with `encoding: "buffer"` (equivalently,
+`encoding: null`) for `resolveRepository`'s plumbing calls that only ever
+return non-path data (SHAs, `true`/`false`, ref names — all guaranteed
+ASCII, so decoding them via a plain `Buffer.prototype.toString("utf-8")`
+afterward is always exact and lossless) *and*, critically, for every
+`inspectWorkingTree`/`inspectDiff` invocation, whose stdout contains
+actual repository paths. The resulting pipeline is:
+
+1. `execFile(..., { encoding: "buffer" })` returns `stdout` as a raw
+   Node `Buffer` — no decoding has happened yet at all.
+2. **Byte-level record/field splitting, not string splitting:** the `-z`
+   NUL-delimited output is split on byte value `0x00` using
+   `Buffer.prototype.indexOf(0x00)` / `.subarray(start, end)` in a loop —
+   never `buffer.toString().split("\0")`, which would force exactly the
+   lossy whole-buffer decode this section exists to avoid before any
+   strict, per-field check could run. Status letters and similarity
+   scores (§13 step 4, always plain ASCII) can be read directly off the
+   raw bytes (e.g. by comparing the first byte to the ASCII code for
+   `A`/`M`/`D`/`R`/`T`/`C`) without decoding at all.
+3. **Per-path-field strict decode, only once each field's exact byte
+   range is known:** each individual path's byte range (a `Buffer`
+   produced by `.subarray()` in step 2, never re-sliced from an
+   already-decoded string) is decoded independently via
+   `new TextDecoder("utf-8", { fatal: true }).decode(pathBytes)`.
+4. **Failure handling:** a `TypeError` thrown by step 3's strict decode
+   for any single path field aborts the *entire* containing operation
+   (`inspectWorkingTree`/`inspectDiff`) with `MALFORMED_GIT_OUTPUT` — per
+   the whole-operation-failure contract already stated above in this
+   section (this does not change; only the mechanism producing the
+   `TypeError` reliably is new).
+
+This pipeline is **byte-first, not string-first**, end to end: no BR3
+code path may call `.toString("utf-8")` (or rely on `execFile`'s default
+string decoding) on any buffer that could contain a repository path,
+because doing so performs the lossy decode this section forbids before
+the strict per-field check ever has a chance to run. §18, §20, §20a, and
+§20b are all written to agree with this buffer-first pipeline (not a
+string-first one) — see each section for its own restatement.
+
 **`inspectDiff(projectRoot, request: DiffRequest)`:**
 
 1. **Ref resolution, always first (revised — corrects Round 1 review
@@ -1302,22 +1471,28 @@ choose the one relevant to its own question.
   pattern beginning with `!` by treating it as a literal (non-negating)
   character rather than special syntax — BR3 relies on this built-in
   behavior rather than pre-scanning patterns for a leading `!` itself.
-- **TypeScript typings:** `picomatch` ships its own bundled `.d.ts`
-  declarations as of its current major version line (it does not require
-  a separate `@types/picomatch` package) — **implementation must confirm
-  this fact against the exact `picomatch` version actually resolved in
-  `package-lock.json` at install time** (per BR2's own "confirm generated
-  facts against the real thing, not the spec's assumption" precedent,
-  e.g. its Ajv-2020-export verification requirement), and add
-  `@types/picomatch` as an additional `devDependency` only if that
-  confirmation reveals it's genuinely needed. This specification does not
-  assert bundled-typings as an unconditional fact implementation may skip
-  verifying.
-- **Dependency added:** `picomatch` (pin an exact caret-range version at
-  implementation time, per BR2's established "record the exact resolved
-  version in `package-lock.json` at implementation time, not hard-coded
-  in the spec" convention). **This specification proposes this
-  dependency; it does not install it** (§18).
+- **TypeScript typings — final, unconditional decision (revised —
+  corrects Round 2 review finding #4, which found the previous
+  "implementation must confirm" hedge factually wrong, not merely
+  cautious):** `picomatch` does **not** ship its own bundled `.d.ts`
+  declarations. Verified directly: `npm view picomatch@4.0.7 --json`
+  shows both `types` and `typings` fields absent from the published
+  package manifest — there is no bundled-typings fact for implementation
+  to "confirm," since the premise was false. The separately-published
+  `@types/picomatch` package **does** exist and correctly declares
+  `picomatch`'s types (`npm view @types/picomatch@latest version` —>
+  `4.0.3`, `types: index.d.ts`). BR3's dependency decision is therefore
+  firm and non-deferred: add both `picomatch` (runtime) and
+  `@types/picomatch` (dev) — no implementation-time re-confirmation step
+  is needed or requested; this specification asserts the fact directly,
+  already verified.
+- **Dependencies added:** `picomatch` as a **runtime** dependency, and
+  `@types/picomatch` as a **development** dependency (pin exact
+  caret-range versions at implementation time, per BR2's established
+  "record the exact resolved version in `package-lock.json` at
+  implementation time, not hard-coded in the spec" convention). **This
+  specification proposes both dependencies; it does not install either**
+  (§18, §22).
 
 ## 17. Error Model
 
@@ -1366,10 +1541,10 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 |---|---|---|
 | `GIT_EXECUTABLE_UNAVAILABLE` | The `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call) | Expected — a real, anticipated environment condition (Git not installed / not on `PATH`); always a typed `GitResult` failure, never an uncaught exception |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
-| `NOT_A_GIT_REPOSITORY` | `projectRoot` (or any parent) is not inside a Git working tree, per `git rev-parse --is-bare-repository`/`--show-toplevel`'s failure (§8) | Expected |
-| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 4) | Expected — `details` names the actual resolved toplevel |
-| `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 3) | Expected |
-| `HEAD_UNAVAILABLE` | `rev-parse --verify -q HEAD` fails for a reason other than "unborn branch" (e.g. a corrupted `.git` — genuinely unexpected repository damage) | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
+| `NOT_A_GIT_REPOSITORY` | `git rev-parse --is-bare-repository` (§8 step 2) fails because `projectRoot` is not inside any Git repository at all, or `--show-toplevel` (§8 step 3) fails unexpectedly after step 2 already succeeded | Expected |
+| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) | Expected — `details` names the actual resolved toplevel |
+| `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 2) | Expected |
+| `HEAD_UNAVAILABLE` | `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal branch) or 1 (detached HEAD) — verified as exit 128 for genuine `.git/HEAD` corruption. This is the exact same trigger §9 defines for this determination; there is no second, independent mechanism. `git rev-parse --verify -q HEAD` (also used by §9, for the unborn/has-commits distinction) fails identically (exit 128, same underlying corruption) for this same case, but `symbolic-ref -q HEAD` always runs first in §9's control flow and classifies it as `HEAD_UNAVAILABLE` before `rev-parse --verify -q HEAD` is even reached — verified directly, no additional or undiscovered failure mode exists beyond what `symbolic-ref`'s exit code already catches | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
 | `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify --end-of-options <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
 | `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis |
 | `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line, or a path that is not valid UTF-8 — §13) | Exceptional — this should be unreachable against a conforming Git version and well-formed repository content; exists so a genuinely unexpected format change (or a non-UTF-8 path, §13) fails loudly and specifically rather than silently misparsing |
@@ -1421,6 +1596,26 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
   resolved against the Node process's own `process.cwd()`. This is the
   "project root supplied through cwd / equivalent safe mechanism"
   requirement, satisfied directly by `execFile`'s own `cwd` option.
+- **`encoding: "buffer"` (equivalently, `encoding: null`), explicitly set
+  on every `execFile` call — added per Round 2 review finding #3.**
+  `execFile`'s default (`encoding: "utf8"`, i.e. omitting the option)
+  makes Node decode `stdout`/`stderr` from raw bytes to a JS string
+  **internally, using a lossy UTF-8 decode that silently substitutes
+  U+FFFD for invalid byte sequences** — before BR3's own code ever sees
+  the output. This is exactly the kind of silent, irreversible data loss
+  §13's path-byte-semantics contract forbids, and it happens one layer
+  below where any downstream strict-decode check (`TextDecoder({fatal:
+  true})`) could ever detect or reject it. Every BR3 `execFile` call
+  therefore requests raw `Buffer` output unconditionally — including
+  calls whose output is guaranteed ASCII (SHAs, `true`/`false`,
+  `--is-bare-repository`'s output, etc.), where decoding the resulting
+  buffer via a plain, non-strict `Buffer.prototype.toString("utf-8")`
+  afterward is always exact and lossless (ASCII is a strict subset of
+  UTF-8) — for uniformity of the shared helper's contract, not because
+  those specific calls are at risk. Only the path-bearing calls
+  (`inspectWorkingTree`, `inspectDiff`) actually exercise the
+  strict-decode failure path (§13); see §13 for the full byte-first
+  parsing pipeline this option exists to enable.
 - **No command-string construction, ever, anywhere in `packages/core/src/git/`.**
   Every Git invocation is `execFile("git", [<literal subcommand>, <literal
   flags>, ...<validated arguments>], { cwd: projectRoot, ... })` — the
@@ -1553,31 +1748,45 @@ approximation of what Git output "should" look like.
 
 Minimum required test categories (each bullet is a required test case):
 
-**Repository root (§8) — three distinct required cases added, corrects
-Round 1 review finding #1**
+**Repository root (§8) — required cases below prove reachability under
+the corrected algorithm (Round 1 review finding #1's submodule
+regression, and Round 2 review finding #1's bare-repository/
+subdirectory-mismatch unreachability regression — both fixed in §8's
+current validation algorithm)**
 - Valid repository root resolves successfully
 - Non-Git directory → `NOT_A_GIT_REPOSITORY`
-- Directory that is a subdirectory of a real Git repository, but not its
-  root → `PROJECT_ROOT_MISMATCH`, with `details` naming the actual
-  toplevel
+- **Directory that is a subdirectory of a real Git repository, but not
+  its root** → `PROJECT_ROOT_MISMATCH`, with `details` naming the actual
+  toplevel — this specific case is the Round 2 regression test: under
+  the previous (removed) `<projectRoot>/.git`-existence precheck, this
+  fixture would have incorrectly produced `NOT_A_GIT_REPOSITORY` instead,
+  since a non-root subdirectory has no `.git` of its own; this test
+  proves `PROJECT_ROOT_MISMATCH` is genuinely reachable under the
+  corrected §8 algorithm
 - **Bare repository** (created via `git init --bare`) →
   `BARE_REPOSITORY_UNSUPPORTED`, detected via `--is-bare-repository`
-  reporting `true` — a genuinely distinct test fixture from the two
-  below, not merely asserted by claim
+  reporting `true` — also a Round 2 regression test: under the previous
+  (removed) precheck, a bare repository (which has no `.git` subdirectory
+  of its own — its own root directly contains `HEAD`/`objects`/`refs`)
+  would have incorrectly produced `NOT_A_GIT_REPOSITORY` instead of ever
+  reaching the bare-repository check at all; this test proves
+  `BARE_REPOSITORY_UNSUPPORTED` is genuinely reachable under the
+  corrected §8 algorithm
 - **Linked worktree** (created via `git worktree add` against a real
   fixture repository with at least one commit) → succeeds,
   `isWorktree: true`, and `gitDir !== gitCommonDir` in the returned
   `RepositoryInfo`
 - **Submodule checkout** (created via `git submodule add` against a real
   fixture superproject + a separate fixture submodule source repository)
-  → succeeds, **`isWorktree: false`** (the specific regression case this
-  correction round exists to fix — an earlier draft's algorithm would
-  have incorrectly reported `true` here), and `gitDir === gitCommonDir`
-  in the returned `RepositoryInfo`
+  → succeeds, **`isWorktree: false`** (the Round 1 regression case — an
+  earlier draft's algorithm would have incorrectly reported `true` here),
+  and `gitDir === gitCommonDir` in the returned `RepositoryInfo`
 - Nonexistent `projectRoot` path → `PROJECT_ROOT_NOT_FOUND`
 
 **Branch + HEAD (§9, §10) — determination method revised, corrects Round
-1 review findings #2 and #5**
+1 review findings #2 and #5, and Round 2 review finding #2 (upstream
+resolution redesigned again to use `@{upstream}` rather than a
+hand-constructed `refs/remotes/<remote>/<branch>` path)**
 - Normal branch with commits → correct `branch`, `headSha`, `detached: false`, `unborn: false`
 - Detached HEAD (checked out to a SHA) → `branch: null`, `detached: true`, correct `headSha`
 - Unborn branch (fresh `git init`, zero commits) → `unborn: true`,
@@ -1587,17 +1796,32 @@ Round 1 review finding #1**
   (§9), not from any stderr text
 - No upstream configured (`branch.<branch>.remote`/`.merge` config both
   absent) → `upstream: null`
-- Upstream configured with a real local remote-tracking ref present
-  (e.g. `git remote add`, `git fetch` against a local bare repository
-  used purely as an in-test fixture "remote," or an equivalent local
-  setup — never a real network fetch) → correct `remote`/`branch`/`ref`/`sha`
+- **Upstream configured with a real local remote-tracking ref present,
+  under Git's default fetch refspec** (e.g. `git remote add`, `git fetch`
+  against a local bare repository used purely as an in-test fixture
+  "remote," or an equivalent local setup — never a real network fetch) →
+  correct `remote`/`branch`/`ref`/`sha`, resolved via `@{upstream}` (§9)
+- **Upstream configured under a custom fetch refspec** (e.g.
+  `remote.origin.fetch` rewritten to land tracking refs under a
+  non-standard namespace instead of `refs/remotes/<remote>/`, then
+  fetched) → correct `sha`, with `ref` reflecting the actual custom
+  namespace `@{upstream}` resolves to, not a `refs/remotes/...` guess —
+  the specific Round 2 regression test proving the previous
+  hardcoded-path design is not used
+- **Upstream is a local branch** (`branch.<name>.remote` configured as
+  `"."`, via `git branch --set-upstream-to=<other-local-branch>`) →
+  correct `sha` (the other local branch's own tip) and `ref` reflecting
+  the resolved `refs/heads/<other-branch>` path — the second Round 2
+  regression test, proving the local-upstream case (which has no
+  `refs/remotes/` entry at all) is correctly supported
 - **Upstream configured (`branch.<branch>.remote`/`.merge` both present),
   remote-tracking ref subsequently removed** (e.g. via
   `git update-ref -d refs/remotes/<remote>/<branch>` in the fixture's own
-  setup — this exact scenario is what a previous, `@{upstream}`-based
-  design could not distinguish from "no upstream configured" at all) →
-  `sha: null`, `remote`/`branch`/`ref` still correctly populated from
-  config
+  setup — the exact scenario a naive `@{upstream}`-only design, with no
+  separate config check, could not distinguish from "no upstream
+  configured" at all) → `sha: null`, `remote`/`branch` still correctly
+  populated from config, `ref` falling back to the conventional
+  constructed path (§9/§10)
 - No network operation occurs during any BR3 test (asserted structurally,
   e.g. by running in an environment with no network access, or by
   confirming no test ever configures a real, reachable remote URL)
@@ -1626,10 +1850,16 @@ Round 1 review finding #1**
 - **Filename containing a byte sequence that is not valid UTF-8**
   (constructed via Node's `Buffer`-based `fs` APIs, bypassing the shell —
   practical on the Linux/macOS filesystems this test suite targets; §13's
-  final byte-semantics decision) → the defined typed outcome (§13) is
-  produced, never silent corruption, never a crash, never a JS string
-  containing Unicode replacement characters presented as if it were the
-  real path
+  final byte-semantics decision) → the defined typed outcome
+  (`MALFORMED_GIT_OUTPUT`, §13) is produced, never silent corruption,
+  never a crash, never a JS string containing Unicode replacement
+  characters presented as if it were the real path. This test is only
+  meaningful, and only reachable at all, because the shared exec helper
+  requests `encoding: "buffer"` (§18) — a regression test should also
+  confirm (e.g. via a focused unit test against the byte-splitting helper
+  itself, independent of a real Git invocation) that raw, undecoded
+  `Buffer` data reaches the strict per-path `TextDecoder` check, never an
+  already-lossily-decoded string (Round 2 review finding #3)
 
 **Diff inspection (§13, §14, §15)**
 - Two valid refs/SHAs → correct `fromSha`/`toSha` and changed-path list
@@ -1719,7 +1949,12 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   `RepositoryInfo`/`GitError` outcome (§8), with `isWorktree` correctly
   `true` only for a linked worktree and correctly `false` for both an
   ordinary repository and a submodule checkout, proven by dedicated real
-  fixtures for each (§20).
+  fixtures for each (§20). In particular, `BARE_REPOSITORY_UNSUPPORTED`
+  and `PROJECT_ROOT_MISMATCH` are each genuinely **reachable** — not
+  pre-empted by an earlier, less-specific `NOT_A_GIT_REPOSITORY` result —
+  under §8's algorithm, which asks Git itself (`--is-bare-repository`,
+  `--show-toplevel`) rather than relying on any BR3-side filesystem-shape
+  precheck (§8, Round 2 review finding #1).
 - **B.** `inspectHead` correctly reports all three branch/HEAD states
   (normal, detached, unborn) and all three upstream states (not
   configured, configured with tracking ref present, configured with
@@ -1771,7 +2006,10 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   for the containing operation — never silent corruption, never an
   uncaught decoding exception, and never a partial/filtered result
   presented as complete (§13).
-- **K.** No dependency beyond `picomatch` was added (§16, §22); no
+- **K.** No **runtime** dependency beyond `picomatch` was added, and no
+  **development** dependency beyond `@types/picomatch` was added (§16,
+  §22) — both were verified as genuinely required (picomatch ships no
+  bundled types) rather than deferred/hedged decisions; no
   `ajv-formats`-style scope creep occurred.
 - **L.** BR3 adds no new `buildrail` CLI command and does not modify
   `packages/cli/src/commands/status.ts` or any other existing CLI
@@ -1830,7 +2068,8 @@ listed above it):
 7. **`protectedPaths.ts`** (`matchProtectedPaths`) — depends only on step
    1's types (`ProtectedPathCheckInput`/`ProtectedPathMatch`/
    `ProtectedPathMatchResult`, and the already-existing, BR2-provided
-   `ProtectedSystem` type) and the `picomatch` dependency (§16) — has no
+   `ProtectedSystem` type) and the `picomatch` runtime dependency plus its
+   `@types/picomatch` dev-dependency typings (§16, §22) — has no
    dependency on steps 2–6 at all, and could technically be implemented
    first or in parallel with any of them, but is sequenced last here
    because it is the "policy-adjacent" piece most naturally reviewed
@@ -1868,16 +2107,23 @@ an implicit consequence of BR3 merely existing.
 
 ## 22. Dependency Policy
 
-**One new runtime dependency is proposed: `picomatch`** (§16), justified
-above. No other new runtime or development dependency is proposed.
-`@types/node` (already a `devDependency`) already covers
-`node:child_process`'s TypeScript types — no separate `@types/*` package
-is needed for `execFile`.
+**Runtime dependency:** exactly one new runtime dependency is proposed,
+`picomatch` (§16), justified above. No other new runtime dependency is
+proposed.
 
-**This specification proposes this dependency. It does not install it.**
-`npm install` for `picomatch` occurs only once BR3 implementation is
-separately authorized, exactly mirroring BR2's own "§20.3: No
-dependencies are installed by this specification" precedent.
+**Development dependency (revised — corrects Round 2 review finding #4,
+which found the previous "no other dependency" claim incomplete):**
+exactly one new development dependency is proposed, `@types/picomatch`
+(§16) — required because `picomatch` itself ships no bundled TypeScript
+declarations (verified directly, §16). `@types/node` (already a
+`devDependency`) already covers `node:child_process`'s TypeScript types —
+no separate `@types/*` package is needed for `execFile` itself.
+
+**This specification proposes both dependencies. It does not install
+either.** `npm install` for `picomatch` and `@types/picomatch` occurs
+only once BR3 implementation is separately authorized, exactly mirroring
+BR2's own "§20.3: No dependencies are installed by this specification"
+precedent.
 
 ## 23. Out-of-Scope / Phase Boundary (BR4)
 
@@ -2007,6 +2253,37 @@ The independent reviewer must specifically examine, for BR3:
   distinguishes "not a repository at all" from "inside a repository but
   not its root," with a real fixture directory structure proving the
   distinction, not merely a single collapsed test
+- Whether `resolveRepository`'s validation algorithm (§8) genuinely asks
+  Git itself at every step (`--is-bare-repository`, `--show-toplevel`,
+  `--git-dir`/`--git-common-dir`) with no BR3-side filesystem-shape
+  precheck (e.g. a `<projectRoot>/.git`-existence check) short-circuiting
+  ahead of those Git calls — and whether `BARE_REPOSITORY_UNSUPPORTED`
+  and `PROJECT_ROOT_MISMATCH` are each proven genuinely reachable by a
+  dedicated real fixture (a true bare repository; a true non-root
+  subdirectory), not merely asserted
+- Whether `inspectHead`'s upstream resolution (§9, §10) uses
+  `git rev-parse --verify -q @{upstream}` (and
+  `--symbolic-full-name @{upstream}`) for tracking-ref resolution — never
+  a hand-constructed `refs/remotes/<remote>/<branch>` path — proven by a
+  real fixture using a custom `remote.<name>.fetch` refspec and a second
+  real fixture using a local-branch upstream (`branch.<name>.remote =
+  "."`), both resolving correctly
+- Whether every `execFile` call site in `packages/core/src/git/`
+  (via the shared `internal/exec.ts` helper, §18) requests
+  `encoding: "buffer"` — never the default lossy string decoding — and
+  whether the working-tree/diff parsing pipeline (§13) genuinely operates
+  byte-first (NUL-splitting on raw `Buffer` data, strict per-path
+  `TextDecoder` decode only after byte-range isolation), never calling
+  `.toString("utf-8")` on a buffer that could contain a repository path
+  before that strict check runs
+- Whether exactly the two dependencies proposed in §16/§22 —
+  `picomatch` (runtime) and `@types/picomatch` (dev) — and no others,
+  were added; and whether `@types/picomatch` was genuinely needed (i.e.
+  `picomatch` itself ships no usable bundled `.d.ts`)
+- Whether §17's `HEAD_UNAVAILABLE` error-table row states the same exact
+  trigger §9 defines (`symbolic-ref -q HEAD` exiting with a code other
+  than 0 or 1) — not a stale reference to a different command or
+  mechanism
 - Whether zero Git mutation occurs anywhere in BR3's implementation —
   confirmed by literally searching the implementation for every
   Git-subcommand string used, and cross-checking each one against the
@@ -2042,8 +2319,6 @@ The independent reviewer must specifically examine, for BR3:
   access disabled (or an equivalent structural check) and confirming
   every upstream-SHA test still passes using only already-local
   remote-tracking refs
-- Whether exactly the dependency proposed in §16/§22 (`picomatch`, and
-  no other) was added
 - Whether `git status --porcelain=v2 -z --find-renames=50%
   --untracked-files=all --ignore-submodules=none` (§11, §19) and
   `git diff --name-status -z` (with the exact flags §13/§19 specify) are
