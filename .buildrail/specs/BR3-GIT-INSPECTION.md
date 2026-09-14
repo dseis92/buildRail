@@ -266,6 +266,35 @@ concrete threat model ever require it — this specification does not
 pretend the current detect-then-run sequence is race-free against a
 deliberately hostile, concurrently-mutating actor.
 
+**The identical concurrency boundary applies to the resolved Git
+executable itself, within one top-level operation — new, explicit,
+mandatory, Round 12 review finding #1C.** BR3 resolves `git` to one
+absolute, canonicalized path once per top-level operation (§8) and
+reuses that identical path for every Git invocation within that
+operation — this is what makes "resolve one Git binary via a filesystem
+path, then have a *different path resolution* silently select a
+different binary" structurally impossible within one operation (§8).
+**It does not, and cannot, mean the file occupying that resolved path is
+mechanically frozen against replacement for the duration of the
+operation** — a portable, path-string-based resolver operating within
+BR3's Node-only, shell-free process contract has no mechanism to pin an
+OS-level file identity (an inode, a content hash) across multiple,
+separate `execFile` invocations; it can only pin the *pathname* it
+invokes. **BR3 therefore assumes the resolved Git executable file is not
+replaced or mutated during one top-level BR3 operation** — the ordinary
+case, and the only case this specification's guarantees are scoped to.
+BR3 resolves the executable once, validates its version once, and uses
+that absolute path throughout the operation, but does not claim this
+creates an atomic, OS-level executable-identity snapshot against a
+concurrently, adversarially replacing actor operating specifically in
+the narrow window between BR3's own `--version` check and a later Git
+invocation within the same operation. Closing that stronger,
+adversarial-executable-replacement case would require an execution/image-identity
+mechanism (e.g. verifying a content hash or inode identity immediately
+before each invocation, or an OS-level file-locking primitive) outside
+BR3 v0.1's current portable Node contract — explicitly deferred to a
+future phase (§26), should a concrete threat model ever require it.
+
 ## 7. Proposed Module Structure
 
 ```
@@ -1046,15 +1075,20 @@ first, using only machine-readable facts:
       no BR3 public field can ever silently receive a 64-character value
       truncated, mistaken for, or otherwise confused with a 40-character
       SHA-1 value.
-    - This check runs once per `resolveRepository`-validated
-      `projectRoot`, after the worktree/submodule shape determination
-      (step 5) and before `resolveRepository` returns success — a
-      repository's object format is a fixed, per-repository property
-      that cannot meaningfully change between BR3 calls against the same
-      `projectRoot` within one process lifetime, so this is a
-      per-repository check, not a per-operation one (implementation may
-      cache it alongside the other `resolveRepository`-derived facts for
-      that `projectRoot`).
+    - **This check runs fresh on every top-level `resolveRepository`
+      call against `projectRoot`, after the worktree/submodule shape
+      determination (step 5) and before `resolveRepository` returns
+      success — never cached across separate top-level operations
+      merely because `projectRoot` is the same path string — corrected,
+      mandatory, Round 12 review finding #1B (the previous "cache
+      alongside other `resolveRepository`-derived facts for that
+      `projectRoot`" framing is withdrawn — see step 5b's identical
+      correction immediately below for the full rationale: `projectRoot`
+      is a filesystem path, not a repository identity, and the
+      repository actually occupying that path can change entirely
+      between two separate top-level operations).** This fact may be
+      computed once and shared *within* one top-level operation, but is
+      never persisted or reused across a subsequent, separate one.
 5b. **Ref storage format validation — new, Round 7 review finding #1,
     resolving Round 6's deferred question now.** BR3's chosen minimum
     Git version (≥2.45.0, §8's "Git Capability Floor" subsection) is at
@@ -1150,14 +1184,38 @@ first, using only machine-readable facts:
       never overrides or races against that earlier, distinct
       classification path, since this step is unreached whenever that
       earlier path has already determined the outcome.
-    - This check runs once per `resolveRepository`-validated
-      `projectRoot`, immediately after step 5a's object-format check
-      (the two share the same "positively-recognized, healthy repository,
+    - **This check runs fresh on every top-level `resolveRepository`
+      call against `projectRoot`, immediately after step 5a's
+      object-format check (the two share the same
+      "positively-recognized, healthy repository,
       narrow-v0.1-scope-decision" character and are naturally sequenced
-      together) and before `resolveRepository` returns success — a
-      repository's ref-storage format is a fixed, per-repository property,
-      so this is a per-repository check, not a per-operation one
-      (implementation may cache it alongside step 5a's result).
+      together) and before `resolveRepository` returns success — never
+      cached across separate top-level operations merely because
+      `projectRoot` is the same path string — corrected, mandatory,
+      Round 12 review finding #1B (an earlier draft of this bullet
+      permitted caching this result "per-repository," described as safe
+      because ref-storage format is "a fixed, per-repository property" —
+      that framing conflates the repository as a logical entity with
+      `projectRoot` as a mere filesystem path string, which are not the
+      same thing).** `projectRoot` names a filesystem location, not a
+      repository identity — the repository actually occupying that
+      location between two separate top-level BR3 operations can change
+      entirely (the `.git` directory deleted and reinitialized with a
+      different ref-storage backend, a different repository bind-mounted
+      or swapped into place at the identical path, etc.), and a
+      `projectRoot`-keyed cache would incorrectly reuse an earlier,
+      no-longer-applicable "supported" verdict for a repository BR3 has
+      never actually validated. **This check, like every other
+      `resolveRepository`-derived safety/capability fact (object format,
+      ref-storage format, the repository-root/bare/worktree/submodule
+      relationship itself, `gitDir`/`gitCommonDir`), is recomputed fresh
+      on every top-level operation** — it may be computed once and
+      shared *within* that one operation (§8's existing "share within
+      one call" principle, already established for the filter-attribute
+      scan, §6/§18), but never persisted or reused across a subsequent,
+      separate top-level call, regardless of how little wall-clock time
+      has elapsed or whether `projectRoot`'s own path string is
+      unchanged.
 6. If the Git executable itself cannot be located/spawned at any point
    in steps 2–5b (`ENOENT` from the underlying `child_process` call, or
    equivalent): `GIT_EXECUTABLE_UNAVAILABLE`. This is checked structurally
@@ -1317,13 +1375,17 @@ subsequent command in that operation actually invokes, not merely
        Node process's own, potentially different, environment).
     2. **Resolve `git` to one absolute executable path in process**,
        before any `execFile` call, walking the sanitized environment's
-       effective `PATH` entries in order and testing each candidate for
-       existence/executability (`fs.stat`/`fs.access` with the
-       appropriate execute-permission check on POSIX) — this is
-       ordinary, safe filesystem inspection, not a subprocess spawn, and
-       does not itself invoke `which`/`where`/a shell/any external
-       helper (BR3's subprocess boundary remains Git-only, per §18's
-       core discipline — resolution is pure Node code, not a delegated
+       effective `PATH` entries in order and testing each candidate
+       against the exact, platform-specific validity contract defined
+       below — corrected, mandatory, Round 12 review finding #2 (an
+       earlier draft's vague "`fs.stat`/`fs.access` with the appropriate
+       execute-permission check" left the candidate's required
+       *filesystem shape* undefined, which is a real gap, not an
+       implementation detail) — this is ordinary, safe filesystem
+       inspection, not a subprocess spawn, and does not itself invoke
+       `which`/`where`/a shell/any external helper (BR3's subprocess
+       boundary remains Git-only, per §18's core discipline — resolution
+       is pure Node code, not a delegated
        external lookup).
     3. **Resolution `cwd` — one single, explicit, fixed resolver `cwd`
        for the entire top-level operation, never a per-call `cwd` —
@@ -1441,9 +1503,15 @@ subsequent command in that operation actually invokes, not merely
           removing any remaining need to reason about whether a `.com`
           candidate is genuinely safe in a given installation.)
        6. **The first directory (in sanitized `PATH` order) containing a
-          literal `git.exe` file wins** — resolution stops there; later
-          `PATH` entries are not consulted once a valid candidate is
-          found.
+          *valid* `git.exe` candidate wins** — resolution stops there;
+          later `PATH` entries are not consulted once a genuinely valid
+          candidate is found. **"Valid" means both the exact-filename
+          match (step 5) and the filesystem-shape requirement (step 10,
+          below) are satisfied** — a directory entry merely *named*
+          `git.exe` that fails the shape requirement does not stop the
+          search; resolution continues to later `PATH` entries exactly
+          as it would for a directory containing no `git.exe`-named
+          entry at all.
        7. **The reason `.cmd`/`.bat`/any other indirect-execution format
           is categorically excluded, restated precisely:** BR3's entire
           process-execution contract (§18) is `execFile` with **no
@@ -1489,9 +1557,80 @@ subsequent command in that operation actually invokes, not merely
           reason — resolution either finds a directly-executable
           `git.exe` candidate via the exact steps above, or it fails
           with `GIT_EXECUTABLE_UNAVAILABLE`; there is no third path.
-       - **(c)** — POSIX resolution: the resolved candidate is genuinely
-         executable in the POSIX sense (an execute-permission check),
-         unchanged from the existing POSIX resolution steps above.
+       10. **Exact Windows candidate filesystem-shape requirement — new,
+           mandatory, Round 12 review finding #2 (step 5's "literal
+           `git.exe` filename" rule defined the required *name* but not
+           the required filesystem *shape*, a real, distinct gap).** A
+           directory entry literally named `git.exe` is **not**, by
+           that name alone, a valid candidate — the entry must
+           additionally resolve, after ordinary Windows symlink/junction
+           resolution, to a **non-directory, regular-file executable
+           target suitable for direct, shell-free `execFile` use.** At
+           minimum: a **directory** named `git.exe` is never a valid
+           candidate (a directory can share a name with what would
+           otherwise be an executable file, and a naive existence check
+           alone cannot distinguish them); a **broken link** (a
+           reparse point/junction whose target does not exist, or which
+           cannot be resolved) is never a valid candidate; any other
+           filesystem object that is not, after resolution, an ordinary,
+           directly-executable regular file is never a valid candidate.
+           **If the entry at a given `PATH` directory named `git.exe` is
+           invalid under this shape requirement, resolution does not
+           stop and fail there — it continues searching subsequent
+           `PATH` entries in order**, exactly as an invalid/absent entry
+           at any other step already causes the search to continue
+           (never converting one directory's invalid candidate into the
+           final, overall resolution failure while a later, valid
+           candidate exists further down `PATH`).
+       - **(c)** — POSIX resolution, exact candidate filesystem-shape
+         requirement — corrected, mandatory, Round 12 review finding #2
+         (an earlier draft's "an execute-permission check" alone left
+         the required filesystem *shape* undefined — POSIX execute/search
+         permission can legitimately exist on a **directory** as well as
+         a file, which a permission-only check cannot distinguish).**
+         For each `PATH` directory, in order, the candidate is
+         `<dir>/git`. This candidate is usable **only if all three**
+         hold:
+         1. **It exists.**
+         2. **After ordinary symlink resolution (POSIX `stat`, not
+            `lstat`, semantics — a symlink is followed to its ultimate
+            target before this check), the resolved target is a
+            **regular file** — never a directory, a FIFO, a socket, a
+            device node (block or character special), or any other
+            non-regular filesystem object.** A symlink itself is
+            therefore permitted as a `PATH`-directory entry, but only
+            when — and exactly because — its *resolved target* is
+            itself a regular, executable file; the symlink's mere
+            presence is never sufficient on its own.
+         3. **It passes the appropriate POSIX executable-permission
+            check** for the current process's effective user/group (the
+            existing execute-permission check this specification already
+            required, now explicitly conditioned on step 2's regular-file
+            requirement having already been confirmed, not evaluated
+            independently of it).
+         **A broken symlink** (resolving to a target that does not
+         exist) **fails step 1** and is rejected. **A directory named
+         `git`** (a real, concrete hazard: an earlier `PATH` entry
+         containing a subdirectory literally named `git`, which — under
+         ordinary POSIX permission bits — can legitimately carry
+         execute/search permission, since that is exactly the
+         permission bit that makes a directory *traversable*, and is
+         therefore trivially, and incorrectly, mistaken for
+         "executable" by a permission-only check that skips the
+         regular-file test) **fails step 2** and is rejected — this is
+         precisely the case a naive `fs.access(candidate, X_OK)`-only
+         implementation would incorrectly accept, since a directory's
+         own execute bit governs traversal permission, not "can this
+         path be spawned as a program." **A non-executable regular
+         file** fails step 3 and is rejected. **In every rejection
+         case, resolution continues searching later `PATH` entries in
+         order** — it never stops at, and never converts into the
+         overall resolution outcome, an invalid candidate merely
+         because it was the first `PATH` entry examined; a later,
+         genuinely valid `git` executable further down `PATH` is still
+         found and selected. **If no candidate anywhere in the
+         effective POSIX search path satisfies all three conditions:
+         `GIT_EXECUTABLE_UNAVAILABLE`.**
     5. **Canonicalize the selected executable** (`fs.realpath`, resolving
        any symlink in the resolved path itself) where the platform
        supports it, so two `PATH` entries that resolve to the same
@@ -1510,31 +1649,82 @@ subsequent command in that operation actually invokes, not merely
        submodule's own path, etc. — resolution's own fixed resolver
        `cwd` from step 3 is entirely independent of, and never
        conflated with, each individual Git command's own targeting
-       `cwd`). This is what makes "validate one Git binary, execute a
-       different one" structurally impossible — there is no second,
-       independent resolution step for any later call to diverge
-       through; every later `execFile` call's first argv element **is**
-       the already-resolved absolute path, not a fresh `"git"` string
-       for Node to resolve again — **no BR3 code path anywhere
-       constructs an `execFile("git", ...)` call with the bare, literal
-       string `"git"` once resolution has succeeded for a given
-       top-level operation; every actual `execFile` call site uses the
-       resolved path exclusively** (corrected, Round 9 review finding
-       #3D — a stale, literal `execFile("git", [...])` example
-       elsewhere in this document, predating this mechanism, is removed
-       — see §18).
-    7. **Capability-result caching, if retained, is keyed by this
-       resolved, canonicalized executable path** — exactly Round 7's
-       intent, now grounded in a value BR3 itself actually computes and
-       controls (step 2's own resolution output) rather than a value
-       Round 7 incorrectly assumed `execFile` would expose. A subsequent
-       top-level BR3 operation **re-resolves** the executable (step 2)
-       before deciding whether a cached capability result applies —
-       resolution itself is cheap, in-process filesystem inspection, not
-       a subprocess spawn, so re-running it per top-level operation is
-       not a meaningful cost; only the *capability check itself*
-       (`git --version`, an actual subprocess spawn) is worth caching,
-       and only against the freshly-resolved path.
+       `cwd`). **This is what makes "resolve one Git binary via one
+       filesystem path string, then have a *different* filesystem-path
+       resolution silently select a different binary" structurally
+       impossible within one top-level operation — corrected, mandatory,
+       Round 12 review finding #1C (an earlier draft overclaimed this
+       as making "validate one Git binary, execute a different one"
+       structurally impossible in the absolute sense, which is too
+       strong).** There is no second, independent *resolution* step for
+       any later call within the same operation to diverge through —
+       every later `execFile` call's first argv element **is** the
+       already-resolved absolute path, not a fresh `"git"` string for
+       Node to resolve again. **This does not, however, mean the
+       underlying file at that resolved path is mechanically frozen for
+       the duration of the operation.** A portable, path-string-based
+       resolver — the only mechanism available within BR3's Node-only,
+       shell-free process contract — cannot, on its own, prevent a
+       separate, concurrent process from replacing or overwriting the
+       file at that exact resolved pathname between BR3's own
+       `--version` check and a later Git invocation within the same
+       operation (a genuinely narrow race, structurally identical in
+       kind to §6's already-stated `check-attr`-then-`status`
+       concurrency boundary — see below for the parallel, explicit
+       scope statement this specification makes for exactly this case).
+       **No BR3 code path anywhere constructs an `execFile("git", ...)`
+       call with the bare, literal string `"git"` once resolution has
+       succeeded for a given top-level operation; every actual
+       `execFile` call site uses the resolved path exclusively**
+       (corrected, Round 9 review finding #3D — a stale, literal
+       `execFile("git", [...])` example elsewhere in this document,
+       predating this mechanism, is removed — see §18).
+    7. **No cross-top-level-operation caching of the capability result —
+       corrected, mandatory, Round 12 review finding #1A (Round 7/8's
+       "cache by resolved path, reuse across operations" permission is
+       withdrawn entirely — it is not a safe implementation choice).**
+       An earlier draft of this step permitted the capability-check
+       result (`git --version`'s outcome) to be cached, keyed by the
+       resolved, canonicalized executable path, and reused by a
+       **later, separate top-level BR3 operation** whenever resolution
+       against that later operation happened to produce the identical
+       path string — describing this as safe because "resolution itself
+       is cheap... only the capability check itself is worth caching."
+       **This is unsafe: a canonical filesystem path is not proof that
+       the file occupying it is still the same binary.** Verified
+       reasoning: a binary at an exact path can be replaced, upgraded,
+       downgraded, or overwritten between two separate top-level BR3
+       operations (a package-manager upgrade, a version-manager switch,
+       a deliberately hostile actor) with no change to the path string
+       itself — a later operation's resolver would produce the
+       identical canonical path, and a path-keyed cache would then
+       incorrectly reuse the *earlier* operation's "supported" verdict
+       for a *now different*, potentially below-floor binary — silently
+       skipping the fresh `--version` check this specification's
+       capability floor exists to enforce, and, since BR3's `GIT_NO_LAZY_FETCH`/
+       network-suppression guarantee depends on running at or above that
+       floor (§8's Capability Floor subsection), this is not merely a
+       stale-version-reporting defect — it can silently invalidate the
+       no-network guarantee itself. **The corrected, mandatory v0.1
+       contract: the capability-check result is never cached across
+       separate top-level BR3 operations, under any keying scheme.**
+       Every top-level BR3 operation, independently: (i) builds/sanitizes
+       its own environment; (ii) resolves `git` to one canonical
+       absolute path (steps 1–5); (iii) runs `git --version` against
+       that freshly-resolved path; (iv) verifies the result is ≥2.45.0;
+       (v) reuses that validated path — and only that path's already-
+       obtained, already-fresh capability verdict — for every nested
+       call *within that same top-level operation* (`resolveRepository`,
+       `inspectHead`, `inspectWorkingTree`, `inspectDiff`, submodule
+       enumeration, `check-attr`, `ls-files`). **The capability result
+       expires the moment that top-level operation ends; the next
+       top-level call always starts fresh**, with no shortcut available
+       merely because a previous operation's resolved path string
+       happens to match. This is not a meaningful performance
+       regression — resolution and the version check both remain cheap
+       relative to the substantive Git operations BR3 performs — and it
+       is the only contract that actually upholds the capability floor's
+       own security/correctness purpose.
 - **BR3 features reviewed against the chosen 2.45.0 floor** (every
   version-dependent mechanism this specification relies on, confirmed
   available at or before this floor):
@@ -3245,7 +3435,7 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 
 | Code | Meaning | Expected vs. exceptional |
 |---|---|---|
-| `GIT_EXECUTABLE_UNAVAILABLE` | Either (a) the `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call), or (b) — corrected, Round 11 review finding #2 — BR3's own in-process executable-resolution mechanism (§8) found no usable `git` candidate at all before ever attempting to spawn one: on POSIX, no executable file named `git` anywhere in the effective search path (`PATH`'s value when present; `/usr/bin:/bin` when `PATH` is absent — Round 11 review finding #1); on Windows, no file literally named `git.exe` anywhere in the sanitized `PATH` (a `.cmd`/`.bat`-only match does not count, §8) — this is the single, exact typed outcome for "no usable Git executable," never an alternative, implementation-chosen code | Expected — a real, anticipated environment condition (Git not installed / not resolvable under the applicable search path); always a typed `GitResult` failure, never an uncaught exception |
+| `GIT_EXECUTABLE_UNAVAILABLE` | Either (a) the `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call), or (b) — corrected, Round 11 review finding #2, candidate validity made exact Round 12 review finding #2 — BR3's own in-process executable-resolution mechanism (§8) found no valid `git` candidate at all before ever attempting to spawn one: on POSIX, no candidate anywhere in the effective search path (`PATH`'s value when present; `/usr/bin:/bin` when `PATH` is absent — Round 11 review finding #1) that is simultaneously (i) present, (ii) a regular file after symlink resolution — never a directory, FIFO, socket, device node, or broken symlink, and (iii) executable; on Windows, no candidate anywhere in the sanitized `PATH` that is simultaneously (i) literally named `git.exe` (never `.cmd`/`.bat`/`.com`/any other name) and (ii) a non-directory, regular-file executable target after resolution — never a directory or broken link — with an invalid candidate at one `PATH` entry never terminating the search while a later, valid candidate exists further down `PATH` — this is the single, exact typed outcome for "no usable Git executable," never an alternative, implementation-chosen code | Expected — a real, anticipated environment condition (Git not installed / not resolvable under the applicable search path); always a typed `GitResult` failure, never an uncaught exception |
 | `GIT_VERSION_UNSUPPORTED` | **New — Round 6 review finding #3.** The installed `git` binary spawns successfully but reports a version below BR3's supported floor (2.45.0), or `git --version`'s output does not match the expected `git version X.Y.Z` prefix shape at all (§8's "Git Capability Floor" subsection) — checked before any other `resolveRepository` step | Expected — distinct from `GIT_EXECUTABLE_UNAVAILABLE` (binary not found at all vs. found and run, but too old/unrecognized); `details` names the actual reported version string |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
 | `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4, further revised — corrects Round 5 review finding #4 and Round 6 review findings #5 and #7.** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms **neither** candidate repository shape is present — `<projectRoot>/.git` does not exist (non-bare shape) **and** `projectRoot` itself lacks the `HEAD`+`objects/`+(`refs/` or `reftable/tables.list`) bare-repository-root shape (bare shape, either ref backend) — i.e. `projectRoot` is genuinely not inside any Git repository, bare or non-bare, under either ref backend. A `--is-bare-repository` failure where **either** shape **is** present (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8. **`--show-toplevel` (§8 step 3) failing after step 2 already succeeded with `false` is no longer classified here at all — corrected, Round 6 review finding #7:** step 2 having already, positively, successfully established that Git recognizes `projectRoot` as a non-bare repository makes "no repository exists here" truthfully unreachable at that point; an unexpected step-3 failure is instead classified as `GIT_COMMAND_FAILED` (see that row) | Expected |
@@ -4983,6 +5173,44 @@ current validation algorithm)**
     enforced, not merely re-run-but-still-trusting-the-old-result.
   - **Capability gets revalidated, not merely re-cached** — confirmed by
     the two cases directly above; no separate test needed beyond them.
+  - **Same executable path, different binary between top-level
+    operations — mandatory, new, Round 12 review finding #1A** (a
+    test-controlled, single, fixed `PATH` entry whose resolved candidate
+    pathname does not change between calls): top-level call 1 resolves
+    the executable at that pathname, the executable reports a
+    genuinely-supported Git version, and the call succeeds; **between**
+    call 1 and call 2, the file at that **exact same pathname** is
+    replaced with a below-floor (or malformed-version-string) stand-in,
+    with the `PATH` value and resolved candidate pathname themselves
+    completely unchanged; top-level call 2 resolves to the identical
+    canonical pathname as call 1 → asserts call 2 genuinely re-runs
+    `--version` against the file now occupying that pathname (via a
+    call-count/invocation assertion on the version-check subprocess
+    itself, not merely the semantic result) and correctly rejects it as
+    `GIT_VERSION_UNSUPPORTED` — proving same-pathname replacement
+    between top-level operations can never silently hit a stale,
+    path-keyed capability cache, closing the gap the identical-path
+    `PATH`-unchanged case (distinct from the already-covered
+    `PATH`-changes-between-calls case above) would otherwise leave open.
+  - **Same `projectRoot`, different repository between top-level
+    operations — mandatory, new, Round 12 review finding #1B** (a fixed
+    `projectRoot` path used across two top-level calls): call 1 against
+    a genuinely supported SHA-1, `files`-ref-backend repository at that
+    path → `resolveRepository` succeeds; **between** call 1 and call 2,
+    the repository metadata at that **exact same `projectRoot`** is
+    replaced/reinitialized — one subcase reinitialized as a SHA-256
+    repository, a second, separate subcase reinitialized with the
+    `reftable` ref-storage backend; call 2 against the identical
+    `projectRoot` path string → the SHA-256 subcase produces
+    `UNSUPPORTED_OBJECT_FORMAT`, the `reftable` subcase produces
+    `UNSUPPORTED_REF_FORMAT` — proving `projectRoot`-keyed reuse of an
+    earlier operation's "supported" verdict never occurs, and that every
+    `resolveRepository`-derived safety/capability fact (object format,
+    ref-storage format, and, by the same principle, the repository-root/
+    bare/worktree/submodule relationship and `gitDir`/`gitCommonDir`
+    themselves) is genuinely recomputed fresh on every top-level
+    operation, never cached merely because the `projectRoot` path
+    string is unchanged.
   - **Relative `PATH` entries resolve against one fixed resolver `cwd`,
     never per-call `cwd` — corrected, mandatory, Round 9 review finding
     #3A (supersedes the previous, internally contradictory "resolved
@@ -5067,6 +5295,25 @@ current validation algorithm)**
       establish (Round 8/9's executable-identity binding), confirming
       the Windows-specific resolver composes correctly with that
       existing, platform-independent guarantee.
+    - **(H) A directory named `git.exe` is skipped, not selected —
+      mandatory, new, Round 12 review finding #2** (a fixture `PATH`
+      with two entries, in order: the first containing a **directory**
+      literally named `git.exe` (not a file), the second containing a
+      genuine `git.exe` file) → resolution skips the first entry's
+      directory (it satisfies the exact-filename match but fails the
+      required non-directory, regular-file shape) and selects the
+      second entry's genuine executable — proving the resolver's
+      filesystem-shape check, not merely its filename check, is
+      genuinely enforced, and that an invalid-shape candidate does not
+      terminate the search.
+    - **(I) Only invalid candidates present anywhere on `PATH` →
+      exactly `GIT_EXECUTABLE_UNAVAILABLE`** (a fixture `PATH` whose
+      every entry contains only invalid-shape `git.exe`-named candidates
+      — directories, broken links, or otherwise — with no genuinely
+      valid candidate anywhere) → resolution fails with exactly
+      `GIT_EXECUTABLE_UNAVAILABLE`, proving the shape-validation
+      correction does not introduce a different, alternative failure
+      outcome for this case.
     - **BR3 never falls back to `cmd.exe`/PowerShell/shell execution
       under any circumstance** — confirmed by static inspection of the
       resolution/exec implementation (no `shell: true`, no
@@ -5148,6 +5395,39 @@ current validation algorithm)**
       exclusively to the separate, `PATH`-**absent** case; it does not
       alter how a *present* `PATH` value (relative entries included) is
       searched.
+  - **POSIX exact candidate filesystem-shape validation — mandatory,
+    new, Round 12 review finding #2:**
+    - **(A) A directory named `git` is skipped in favor of a later,
+      genuine executable** (a two-entry `PATH`: `dirA/git` is a real
+      directory — created with search/execute permission set, exactly
+      the permission bit that legitimately makes a directory
+      traversable and that a naive `fs.access(candidate, X_OK)`-only
+      check would incorrectly accept as "executable" — and `dirB/git` is
+      a real, valid executable) → resolution skips `dirA/git` (fails the
+      required regular-file shape, despite passing a permission-only
+      check) and selects `dirB/git` — proving the shape check, not
+      merely the permission check, is genuinely, independently enforced.
+    - **(B) A non-executable regular file is skipped in favor of a
+      later, genuine executable** (a two-entry `PATH`: `dirA/git` is a
+      real, regular file with no execute permission set; `dirB/git` is a
+      real, valid executable) → resolution skips `dirA/git` and selects
+      `dirB/git`.
+    - **(C) A broken symlink is skipped** (a `PATH` entry whose `git`
+      candidate is a symlink resolving to a nonexistent target, followed
+      by an entry with a genuine executable) → resolution skips the
+      broken symlink and selects the later, valid candidate.
+    - **(D) A valid symlink to a genuine executable is accepted** (a
+      `PATH` entry whose `git` candidate is a symlink resolving to a
+      real, executable regular file elsewhere on disk) → resolution
+      accepts it, proving symlinks are permitted exactly when, and only
+      when, their resolved target satisfies the regular-file-and-executable
+      requirement — not rejected outright merely for being a symlink.
+    - **(E) Only invalid candidates present anywhere on `PATH` → exactly
+      `GIT_EXECUTABLE_UNAVAILABLE`** (a `PATH` whose every entry
+      contains only invalid-shape `git` candidates — directories,
+      non-executable files, or broken symlinks, with no genuinely valid
+      candidate anywhere) → resolution fails with exactly
+      `GIT_EXECUTABLE_UNAVAILABLE`.
   - **Windows environment-key casing during resolution, where testable**
     (on a Windows test runner, or via a focused unit test against the
     resolution function's own Windows-specific branch, independent of
@@ -6209,7 +6489,19 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   rev-parse --show-object-format` is confirmed `sha1`, before any other
   `resolveRepository` work proceeds — `GIT_VERSION_UNSUPPORTED`/
   `UNSUPPORTED_OBJECT_FORMAT` are each genuinely reachable and correctly
-  typed (§8, Round 6 review findings #3 and #4).
+  typed (§8, Round 6 review findings #3 and #4). **Every
+  `resolveRepository`-derived safety/capability fact — the root/bare/
+  worktree/submodule relationship, `gitDir`/`gitCommonDir`, object
+  format, ref-storage format — is genuinely recomputed fresh on every
+  top-level `resolveRepository` call, never cached across separate
+  top-level operations merely because `projectRoot`'s path string is
+  unchanged** — corrected, mandatory, Round 12 review finding #1B —
+  proven by the dedicated fixture (§20) where the repository metadata at
+  one fixed `projectRoot` is replaced/reinitialized between two
+  top-level calls (SHA-256 and `reftable` subcases), with the second
+  call correctly producing `UNSUPPORTED_OBJECT_FORMAT`/
+  `UNSUPPORTED_REF_FORMAT` rather than reusing the first call's
+  "supported" verdict.
 - **B.** `inspectHead` correctly reports all three branch/HEAD states
   (normal, detached, unborn) and all upstream states — not configured,
   configured and resolving (both the remote-tracking and the
@@ -6414,7 +6706,16 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   unparseable `--version` string, is rejected as `GIT_VERSION_UNSUPPORTED`
   before any other `resolveRepository` work proceeds, distinctly from
   `GIT_EXECUTABLE_UNAVAILABLE`, with zero repository mutation during the
-  check (§8, §20). **(ii)** A repository whose object format is not
+  check (§8, §20). **The capability-check result is never cached across
+  separate top-level BR3 operations, under any keying scheme — including
+  keying by the resolved, canonicalized executable path** — corrected,
+  mandatory, Round 12 review finding #1A: a binary can be replaced at an
+  unchanged pathname between two top-level operations, and reusing an
+  earlier "supported" verdict for that unchanged path would silently
+  bypass the fresh version check the capability floor exists to enforce
+  — proven by the dedicated same-pathname-different-binary fixture (§20)
+  showing a below-floor replacement at the identical resolved pathname is
+  genuinely re-detected and rejected on the next top-level call. **(ii)** A repository whose object format is not
   `sha1` (e.g. `git init --object-format=sha256`) is rejected as
   `UNSUPPORTED_OBJECT_FORMAT` at `resolveRepository` time, before any
   SHA-producing BR3 function can be reached against it, and
@@ -6444,7 +6745,16 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   via the existing, ref-backend-aware post-Git-failure secondary
   classifier (§8), never conflated with the new, distinct
   `UNSUPPORTED_REF_FORMAT` code reserved for a healthy repository
-  reporting an unsupported format (§8, §20).
+  reporting an unsupported format (§8, §20). **This decision is
+  recomputed fresh on every top-level `resolveRepository` call against
+  `projectRoot`, never cached across separate top-level operations
+  merely because `projectRoot`'s path string is unchanged** — corrected,
+  mandatory, Round 12 review finding #1B — proven by the dedicated
+  fixture (§20) where the repository at one fixed `projectRoot` is
+  reinitialized with the `reftable` backend between two top-level
+  calls, with the second call correctly producing
+  `UNSUPPORTED_REF_FORMAT` rather than reusing the first call's
+  `files`-backend "supported" verdict.
 - **R.** — new, Round 7 review finding #2. `unstaged_rename` is genuinely
   reachable only via the verified construction (a plain filesystem rename
   plus `git add -N` intent-to-add against the new path — test/fixture
@@ -6492,7 +6802,28 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   stale `execFile("git", ...)` example); a subsequent top-level
   operation re-resolves and revalidates rather than trusting a
   capability result cached against a since-changed `PATH`/resolution
-  outcome (§8, §18, §20).
+  outcome (§8, §18, §20). **(v)** — new, Round 12 review finding #1.
+  The capability result is never cached across separate top-level
+  operations under any keying scheme, including by resolved executable
+  path — a binary replaced at an unchanged pathname between two
+  top-level calls is genuinely re-detected and revalidated, never
+  silently trusted merely because the path string is unchanged; and
+  this specification explicitly states that reusing one resolved path
+  within an operation does not create a mechanically-enforced,
+  OS-level executable-identity snapshot against a concurrently
+  replacing actor — only an assumption of stability during one
+  operation, exactly mirroring §6's identical, explicit
+  `check-attr`-then-`status` concurrency boundary. **(vi)** — new,
+  Round 12 review finding #2. Each `PATH`-directory candidate is
+  validated against an exact filesystem-shape requirement, not merely a
+  permission/existence check: on POSIX, a candidate must be a regular
+  file (after symlink resolution) with execute permission — a directory
+  (even one with execute/search permission set), a non-regular
+  filesystem object, or a broken symlink is rejected and the search
+  continues to later `PATH` entries; on Windows, a `git.exe`-named
+  candidate must resolve to a non-directory, regular-file executable
+  target — a directory or broken link named `git.exe` is rejected and
+  the search likewise continues (§8, §20).
 - **T.** — new, Round 7 review finding #4, scope narrowed to
   `inspectWorkingTree` only Round 9 review finding #5. BR3's
   external-filter detection genuinely determines repository-*effective*
@@ -7294,6 +7625,54 @@ The independent reviewer must specifically examine, for BR3:
     own observed behavior under the identical `env`) and the dedicated
     Windows fixture (three differently-cased `PATH` keys collapsing to
     the documented ordinally-first winner).
+  - **(3E) No cross-top-level-operation caching of capability or
+    repository-validation facts — new, mandatory, Round 12 review
+    finding #1:** whether the `git --version` capability result is
+    genuinely re-obtained on **every** top-level BR3 operation — never
+    cached across separate operations under any keying scheme, including
+    keying by the resolved, canonicalized executable path (a binary can
+    be replaced at an unchanged pathname between two operations, with no
+    change to the path string a naive cache might key on) — proven by
+    the dedicated same-pathname-different-binary fixture (§20), where a
+    below-floor replacement at the identical resolved pathname is
+    genuinely re-detected and rejected on the next top-level call, not
+    silently accepted via a stale cached verdict; **and** whether every
+    `resolveRepository`-derived safety/capability fact (object format,
+    ref-storage format, and the repository-root/bare/worktree/submodule
+    relationship and `gitDir`/`gitCommonDir` themselves) is likewise
+    genuinely recomputed fresh on every top-level `resolveRepository`
+    call, never cached merely because `projectRoot`'s path string is
+    unchanged — `projectRoot` names a filesystem location, not a
+    repository identity, and the repository actually occupying that
+    location can change entirely between two separate top-level
+    operations — proven by the dedicated same-`projectRoot`-different-repository
+    fixture (§20, SHA-256 and `reftable` subcases); **and** whether this
+    specification explicitly, correctly states that reusing one resolved
+    executable path *within* a single top-level operation does not
+    create a mechanically-enforced, OS-level executable-identity
+    snapshot against a concurrently, adversarially replacing actor
+    (§6) — an honest scope statement, not an overclaim that one resolved
+    path makes "validate one binary, execute a different one"
+    unconditionally, absolutely impossible.
+  - **(3F) Exact executable-candidate filesystem-shape validity — new,
+    mandatory, Round 12 review finding #2:** whether POSIX candidate
+    validation genuinely requires, independently, (i) existence, (ii) a
+    regular-file shape after symlink resolution — rejecting a directory
+    (even one with execute/search permission, which a permission-only
+    check cannot distinguish from a genuinely executable file), a FIFO,
+    a socket, a device node, or a broken symlink — and (iii) execute
+    permission, with an invalid candidate at one `PATH` entry never
+    terminating the search while a valid candidate exists further down
+    `PATH`; and whether Windows candidate validation genuinely requires,
+    independently of the exact-`git.exe`-filename match, that the
+    candidate resolve to a non-directory, regular-file executable target
+    — rejecting a directory or broken link literally named `git.exe`,
+    with the search likewise continuing to later `PATH` entries — proven
+    by the dedicated fixtures (§20): a directory named `git`/`git.exe`
+    skipped in favor of a later genuine executable; a non-executable
+    regular file skipped; a broken symlink skipped; a valid symlink to a
+    genuine executable accepted; and an all-invalid-candidates `PATH`
+    producing exactly `GIT_EXECUTABLE_UNAVAILABLE`.
 - **Object format / SHA width — new, Round 6 review finding #4:**
   whether `resolveRepository` genuinely checks `git rev-parse
   --show-object-format` and rejects anything other than `sha1` as
