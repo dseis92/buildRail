@@ -1371,58 +1371,127 @@ subsequent command in that operation actually invokes, not merely
        determines *which executable*, the probe's own `cwd` is merely
        where that already-resolved executable happens to run from,
        exactly as for any other already-resolved call.
-    4. **Windows-specific correctness — corrected, mandatory, Round 9
-       review finding #3B (a `.cmd`/`.bat` PATHEXT match is not a valid
-       `execFile`-compatible target, and the previous draft did not
-       exclude it):** on Windows, resolution must correctly account for
-       (a) the `PATH`/`Path`/`path` environment-key **casing** ambiguity
-       (Windows environment variable names are case-insensitive;
-       resolution reads whichever casing is actually present, never
-       assuming a single canonical spelling — see §19's Windows-casing
-       correction below, which this depends on); (b) `PATHEXT`-based
-       candidate enumeration — Windows resolves a bare `git` command by
-       trying each extension in `PATHEXT` in order (conventionally
-       `.COM;.EXE;.BAT;.CMD;...`) — **but BR3's resolution must restrict
-       the set of *acceptable* resolved candidates to directly,
-       shell-free-executable binaries — in practice, `git.exe` — and
-       must never select a `.cmd`/`.bat` match as a usable candidate.**
-       **The reason this restriction is mandatory, not merely a
-       preference:** BR3's entire process-execution contract (§18) is
-       `execFile` with **no shell** (`shell: false`, the `execFile`
-       default) — Node's `execFile` spawns the named executable
-       directly, via the OS's own process-creation API, with no command
-       interpreter in the invocation path at all. A `.cmd`/`.bat` file
-       is not itself a binary the OS can directly execute — running one
-       requires a command interpreter (`cmd.exe`) to parse and execute
-       its script contents, which is exactly the shell-execution path
-       BR3's `shell: false`/no-shell discipline (§18) forbids
-       categorically, for the identical injection-surface reasons that
-       discipline exists in the first place. A resolver that selected
-       `git.cmd` (some Git-for-Windows installations, or wrapper
-       tooling, may place a `.cmd` shim on `PATH`) and then handed it to
-       shell-free `execFile` would either fail outright or — worse,
-       depending on the Node version and OS `execFile` internals for
-       `.cmd`/`.bat` specifically — silently and implicitly invoke a
-       shell-like interpreter path Node reserves special-cased handling
-       for, reintroducing exactly the interpretation/injection surface
-       §18's no-shell contract exists to close. **The corrected Windows
-       candidate set: only extensions that name a directly, natively
-       executable binary format are acceptable resolution targets** — in
-       practice `.exe` (the normal, intended Git-for-Windows target,
-       `git.exe`) and `.com`, if genuinely present and applicable; `.bat`
-       and `.cmd` are **never** accepted as a resolved candidate, even
-       when `PATHEXT` lists them and a matching file exists on `PATH` —
-       resolution continues searching subsequent `PATH` entries instead
-       of accepting a `.cmd`/`.bat` match, and if no directly-executable
-       candidate is found anywhere on the normalized `PATH` list,
-       resolution fails with the same typed outcome as `git` being
-       entirely absent (`GIT_EXECUTABLE_UNAVAILABLE`, §17 — a deliberate
-       choice: from BR3's perspective, a `git` that is only reachable via
-       a shell-requiring wrapper is not usable at all, not merely
-       "usable via a different code path"). (c) that the resolved
-       candidate is genuinely executable in the platform-appropriate
-       sense — the corrected extension-allowlist above on Windows; an
-       execute-permission check on POSIX.
+    4. **Windows-specific resolution — a deliberate, stricter,
+       BR3-specific resolver, not a claimed mirror of Node/libuv's own
+       bare-command lookup — corrected, mandatory, Round 11 review
+       finding #2 (the previous draft's PATHEXT-based model is factually
+       wrong about how shell-free `execFile` actually resolves a bare
+       command on Windows, and is replaced entirely, not merely
+       amended).** An earlier draft of this step claimed Windows
+       resolves a bare `git` command by walking `PATHEXT` in order
+       (conventionally `.COM;.EXE;.BAT;.CMD;...`), with BR3's resolver
+       filtering `.cmd`/`.bat` out of that walk. **This is not the
+       lookup model shell-free Node/libuv `execFile` actually uses**:
+       libuv's Windows process-spawning implementation does **not**
+       consult `PATHEXT` for its own executable search at all — its
+       native, shell-free lookup handles candidate resolution through
+       its own mechanism, entirely independent of the `PATHEXT`
+       environment variable. Continuing to describe BR3's resolver as
+       "mirroring Node/libuv's own lookup, filtered to exclude
+       `.cmd`/`.bat`" is therefore not just imprecise, it is describing a
+       lookup model that does not exist in the runtime BR3 actually
+       depends on. **BR3 does not attempt to replicate whatever Node/
+       libuv's actual internal Windows lookup does** (which is, in any
+       case, not the concern — BR3 does not rely on a bare `"git"`
+       command ever reaching `execFile` at all, per step 6 below); BR3
+       instead defines its **own**, explicit, simpler, and deliberately
+       stricter resolver, stated as such:
+       - **BR3's Windows resolver is intentionally stricter than
+         whatever Node/libuv's own bare-command lookup would do, and
+         this is a deliberate, explicit v0.1 design choice, not an
+         approximation of Node's behavior.** This is safe precisely
+         *because* BR3 always resolves to one absolute path itself and
+         then invokes that absolute path directly (step 6) — Node/libuv's
+         own bare-command lookup is therefore never actually exercised
+         by BR3 for `git` at all, on any platform, so there is no
+         "matching Node's behavior" obligation to satisfy in the first
+         place; BR3's resolver only needs to be correct and safe on its
+         own terms.
+       1. Construct/sanitize the effective Windows `PATH` key first,
+          using the already-established Windows-only, case-insensitive,
+          ordinally-first-wins key-selection rule (§19) — this is
+          unchanged from the existing Windows `PATH`-key-selection
+          correction and applies identically here.
+       2. **Search only the directories named in that sanitized `PATH`
+          value, in `PATH` order** — nothing else. In particular:
+       3. **No implicit current-working-directory search** — BR3's
+          resolver never checks the resolver `cwd` itself (or any other
+          directory not explicitly listed in the sanitized `PATH`
+          value) as an implicit candidate location, regardless of
+          whatever behavior an ordinary Windows command-line shell
+          might otherwise exhibit for a bare command.
+       4. **`PATHEXT` is not consulted at all, for any purpose.** BR3's
+          resolver does not read the `PATHEXT` environment variable, does
+          not walk any extension list it might contain, and is
+          structurally unaffected by its presence, absence, or content
+          (an unusual or reordered `PATHEXT` value has zero effect on
+          BR3's resolution — see the dedicated test below).
+       5. **Exactly one accepted candidate filename: `git.exe`.** For
+          each directory in the sanitized `PATH`, in order, BR3 checks
+          only for a file literally named `git.exe` (case-insensitive
+          filename match, per ordinary Windows filesystem semantics).
+          **No other candidate name or extension is ever accepted** —
+          not `git.cmd`, not `git.bat`, not `git.com`, not `git` with no
+          extension, not any other `PATHEXT`-style variant. This is a
+          narrow, explicit allowlist of exactly one filename, not an
+          extension-preference ordering. (This is narrower than Round
+          9/10's earlier "`.exe`/`.com` both acceptable" framing — Round
+          11 narrows further, to `git.exe` alone, as the one, simplest,
+          unambiguous, universally-applicable Git-for-Windows target,
+          removing any remaining need to reason about whether a `.com`
+          candidate is genuinely safe in a given installation.)
+       6. **The first directory (in sanitized `PATH` order) containing a
+          literal `git.exe` file wins** — resolution stops there; later
+          `PATH` entries are not consulted once a valid candidate is
+          found.
+       7. **The reason `.cmd`/`.bat`/any other indirect-execution format
+          is categorically excluded, restated precisely:** BR3's entire
+          process-execution contract (§18) is `execFile` with **no
+          shell** (`shell: false`, the `execFile` default) — Node's
+          `execFile` spawns the named executable directly, via the OS's
+          own process-creation API, with no command interpreter in the
+          invocation path at all. A `.cmd`/`.bat` file is not itself a
+          binary the OS can directly execute — running one requires a
+          command interpreter (`cmd.exe`) to parse and execute its
+          script contents, which is exactly the shell-execution path
+          BR3's `shell: false`/no-shell discipline (§18) forbids
+          categorically, for the identical injection-surface reasons
+          that discipline exists in the first place. A resolver that
+          selected `git.cmd` (some Git-for-Windows installations, or
+          wrapper tooling, may place a `.cmd` shim on `PATH`) and then
+          handed it to shell-free `execFile` would either fail outright
+          or — worse, depending on the Node version and OS `execFile`
+          internals for `.cmd`/`.bat` specifically — silently and
+          implicitly invoke a shell-like interpreter path, reintroducing
+          exactly the interpretation/injection surface §18's no-shell
+          contract exists to close. BR3 v0.1's resolver therefore never
+          considers `.cmd`/`.bat` (or any extension other than the
+          literal `git.exe` filename) a candidate at all — not "filtered
+          out after being found," but never checked for in the first
+          place, per step 5's narrow allowlist.
+       8. **If no `git.exe` is found in any sanitized `PATH` directory:
+          exactly `GIT_EXECUTABLE_UNAVAILABLE` (§17) — one exact result,
+          no alternative.** An earlier draft of this section described
+          this outcome as "`GIT_EXECUTABLE_UNAVAILABLE` (or a deliberate,
+          equally distinct resolution-failure typed outcome —
+          implementation's choice of exact code)." **That
+          "implementation's choice" framing is removed — there is
+          exactly one typed result for this case, `GIT_EXECUTABLE_UNAVAILABLE`,
+          identical to the outcome for `git` being entirely absent from
+          the system.** From BR3's perspective, a `git` that is only
+          reachable via a shell-requiring wrapper (or not reachable at
+          all under this resolver's narrow allowlist) is not usable,
+          full stop — there is no second, softer typed outcome for "found
+          something, but it wasn't acceptable."
+       9. **Never falls back to** `cmd.exe`, PowerShell, `shell: true`,
+          `exec()`, `spawn` with `shell: true`, or any `PATHEXT`-style
+          wrapper-execution mechanism, under any circumstance, for any
+          reason — resolution either finds a directly-executable
+          `git.exe` candidate via the exact steps above, or it fails
+          with `GIT_EXECUTABLE_UNAVAILABLE`; there is no third path.
+       - **(c)** — POSIX resolution: the resolved candidate is genuinely
+         executable in the POSIX sense (an execute-permission check),
+         unchanged from the existing POSIX resolution steps above.
     5. **Canonicalize the selected executable** (`fs.realpath`, resolving
        any symlink in the resolved path itself) where the platform
        supports it, so two `PATH` entries that resolve to the same
@@ -3176,7 +3245,7 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 
 | Code | Meaning | Expected vs. exceptional |
 |---|---|---|
-| `GIT_EXECUTABLE_UNAVAILABLE` | The `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call) | Expected — a real, anticipated environment condition (Git not installed / not on `PATH`); always a typed `GitResult` failure, never an uncaught exception |
+| `GIT_EXECUTABLE_UNAVAILABLE` | Either (a) the `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call), or (b) — corrected, Round 11 review finding #2 — BR3's own in-process executable-resolution mechanism (§8) found no usable `git` candidate at all before ever attempting to spawn one: on POSIX, no executable file named `git` anywhere in the effective search path (`PATH`'s value when present; `/usr/bin:/bin` when `PATH` is absent — Round 11 review finding #1); on Windows, no file literally named `git.exe` anywhere in the sanitized `PATH` (a `.cmd`/`.bat`-only match does not count, §8) — this is the single, exact typed outcome for "no usable Git executable," never an alternative, implementation-chosen code | Expected — a real, anticipated environment condition (Git not installed / not resolvable under the applicable search path); always a typed `GitResult` failure, never an uncaught exception |
 | `GIT_VERSION_UNSUPPORTED` | **New — Round 6 review finding #3.** The installed `git` binary spawns successfully but reports a version below BR3's supported floor (2.45.0), or `git --version`'s output does not match the expected `git version X.Y.Z` prefix shape at all (§8's "Git Capability Floor" subsection) — checked before any other `resolveRepository` step | Expected — distinct from `GIT_EXECUTABLE_UNAVAILABLE` (binary not found at all vs. found and run, but too old/unrecognized); `details` names the actual reported version string |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
 | `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4, further revised — corrects Round 5 review finding #4 and Round 6 review findings #5 and #7.** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms **neither** candidate repository shape is present — `<projectRoot>/.git` does not exist (non-bare shape) **and** `projectRoot` itself lacks the `HEAD`+`objects/`+(`refs/` or `reftable/tables.list`) bare-repository-root shape (bare shape, either ref backend) — i.e. `projectRoot` is genuinely not inside any Git repository, bare or non-bare, under either ref backend. A `--is-bare-repository` failure where **either** shape **is** present (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8. **`--show-toplevel` (§8 step 3) failing after step 2 already succeeded with `false` is no longer classified here at all — corrected, Round 6 review finding #7:** step 2 having already, positively, successfully established that Git recognizes `projectRoot` as a non-bare repository makes "no repository exists here" truthfully unreachable at that point; an unexpected step-3 failure is instead classified as `GIT_COMMAND_FAILED` (see that row) | Expected |
@@ -4209,19 +4278,59 @@ includes, unconditionally:
        unrelated environment variable — **never** promoted into, merged
        with, or treated as an alternate spelling of `PATH`. If `PATH`
        (that exact key) is present, its value is used, verbatim, as the
-       effective search path. **If `PATH` is absent entirely** (the
-       `/tmp/fake` reproduction's actual precondition), BR3's resolution
-       mirrors Node/POSIX's own documented behavior for an `env` object
-       lacking `PATH` — **an absent `PATH` is not silently treated as
-       equivalent to an empty search path BR3 invents its own default
-       for**; resolution fails to find any candidate (since there is
-       nothing to search) and produces `GIT_EXECUTABLE_UNAVAILABLE`,
-       exactly mirroring what the real `execFile` call itself would
-       encounter under the identical, `PATH`-absent environment — BR3
-       does not attempt to invent a different, more permissive search
-       behavior than the child process it is about to spawn would
-       itself exhibit. No other key is ever considered "the" `PATH` on
-       POSIX, regardless of case.
+       effective search path.
+       - **If `PATH` is absent entirely — corrected, mandatory, Round 11
+         review finding #1 (the previous draft's own normative rule
+         directly contradicted the verified reproduction stated two
+         paragraphs above it, in the same section):** an earlier draft
+         of this rule claimed a `PATH`-absent environment gives BR3
+         "nothing to search" and therefore produces
+         `GIT_EXECUTABLE_UNAVAILABLE`, describing this as "mirroring
+         what the real `execFile` call itself would encounter." **This
+         is false, and directly contradicts this same section's own,
+         already-verified reproduction just above it**: with `PATH`
+         absent and `Path=/tmp/fake` present, a real
+         `execFile("git", ..., { env })` call does **not** fail to find
+         any executable — it successfully finds and runs the *real
+         system* `git`, never `/tmp/fake/git`. Node's own documented
+         `child_process` behavior for a supplied `env` lacking `PATH` is
+         **not** "search nothing" — on Unix, Node/libuv fall back to a
+         fixed, documented default command-search path,
+         **`/usr/bin:/bin`**, for command lookup when the effective
+         environment has no `PATH` key at all (Windows instead falls
+         back to the current process's own inherited `PATH` for lookup
+         purposes — a Windows-specific behavior, not this POSIX branch's
+         concern). **The corrected contract:** when `PATH` (the exact
+         key) is absent from the sanitized environment, BR3's in-process
+         resolution uses the identical fixed default,
+         **`/usr/bin:/bin`**, as its effective search path — **never**
+         "nothing to search," and never a differently-cased `Path`/`path`
+         value promoted in as a substitute (that remains forbidden,
+         unchanged from the rule above). `GIT_EXECUTABLE_UNAVAILABLE` is
+         produced only when `git` cannot actually be found within
+         whichever effective search path applies — the explicit `PATH`
+         value when `PATH` is present, or `/usr/bin:/bin` when it is
+         absent — never merely because `PATH` itself happens to be
+         absent.
+       - **Distinguish the effective *lookup* path (used only to
+         resolve the one, absolute Git executable) from the environment
+         subsequently passed to that already-resolved executable —
+         clarified, Round 11 review finding #1F.** `/usr/bin:/bin`
+         (the POSIX-`PATH`-absent default above) governs *resolution*
+         only — it is not itself injected into the constructed `env`
+         object as a synthetic `PATH` value, and it creates no
+         obligation for BR3 to fabricate a `PATH` key where the
+         sanitized environment genuinely has none. Once resolution
+         succeeds, every subsequent Git invocation in that same
+         top-level operation uses the one, already-resolved, absolute,
+         canonicalized executable path directly as `execFile`'s
+         `command` argument (§18) — that invocation performs no further
+         `PATH`-based lookup of its own at all (an absolute path bypasses
+         `PATH` search entirely, on every platform), so whether or not a
+         `PATH` key is present in the environment actually handed to
+         `execFile` has no bearing on which binary runs, once resolution
+         has already picked it. No other key is ever considered "the"
+         `PATH` on POSIX, regardless of case.
      - **On Windows** (`os.platform() === "win32"`): environment
        variable names are genuinely case-insensitive at the OS level —
        `PATH`/`Path`/`path` **are** the identical logical variable, and
@@ -4896,38 +5005,76 @@ current validation algorithm)**
     changes which binary it invokes merely because a later command's own
     targeting `cwd` (e.g. a different `projectRoot`, or a submodule path)
     differs from the resolver `cwd`.
-  - **`.cmd`/`.bat` candidates are never accepted as a usable, shell-free
-    Git executable — new, mandatory, Round 9 review finding #3B:**
-    - **`git.exe` candidate succeeds** — a fixture `PATH` entry
-      containing only a `git.exe`-named (real or stand-in, on a
-      Windows test runner; or a focused unit test against the
-      resolution function's Windows-specific branch, independent of the
-      actual test-runner OS) executable → resolution succeeds, selecting
-      it as the usable candidate.
-    - **A `PATH` location containing only `git.cmd` is NOT accepted** — a
-      fixture `PATH` entry where the *only* `git`-matching candidate
-      Windows' own `PATHEXT` resolution would find is a `.cmd` file (no
-      `.exe`/`.com` candidate present anywhere on `PATH`) → resolution
-      does **not** select it; the overall resolution fails with
-      `GIT_EXECUTABLE_UNAVAILABLE` (or a deliberate, equally distinct
-      resolution-failure typed outcome — implementation's choice of
-      exact code, but it must not be conflated with `GIT_VERSION_UNSUPPORTED`,
-      which requires a binary to have actually run) — proving a
-      `.cmd`/`.bat` match is structurally excluded from the accepted
-      candidate set, never merely deprioritized.
-    - **BR3 never falls back to `cmd.exe`/shell execution** — confirmed
-      by static inspection of the resolution/exec implementation (no
-      `shell: true`, no `cmd.exe`/`cmd /c`-shaped invocation anywhere in
-      `packages/core/src/git/`) in addition to the behavioral fixture
-      above — proving the "reject `.cmd`/`.bat`, fail outright" behavior
-      is not silently replaced by a shell-based execution path as an
+  - **BR3's deliberate, stricter, BR3-specific Windows resolver — new
+    resolver design, mandatory, corrected, Round 11 review finding #2
+    (supersedes Round 9/10's PATHEXT-based model, which incorrectly
+    claimed to mirror Node/libuv's own bare-command lookup):**
+    - **(A) `git.exe` present in a sanitized `PATH` directory resolves
+      successfully** — a fixture `PATH` entry containing a literal
+      `git.exe`-named (real or stand-in, on a Windows test runner; or a
+      focused unit test against the resolution function's Windows-specific
+      branch, independent of the actual test-runner OS) executable →
+      resolution succeeds, selecting it as the usable candidate.
+    - **(B) An earlier `PATH` entry containing only `git.cmd`, with a
+      later entry containing `git.exe`, resolves to the later `git.exe`
+      — the earlier `git.cmd` is skipped entirely, not merely
+      deprioritized** — a fixture `PATH` with two entries, in order:
+      the first containing only a `git.cmd` file (no `git.exe`), the
+      second containing a genuine `git.exe` → resolution skips the
+      first entry's `git.cmd` (never considers it a candidate at all,
+      per the resolver's exact-filename allowlist) and selects the
+      second entry's `git.exe` — proving the resolver's per-directory
+      search genuinely continues past a directory containing only a
+      rejected candidate name, rather than stopping (successfully or
+      not) at the first `PATH` entry that contains *anything*
+      `git`-named.
+    - **(C) A `PATH` containing only `git.cmd`/`git.bat` anywhere (no
+      `git.exe` at all) → exactly `GIT_EXECUTABLE_UNAVAILABLE`, no
+      alternative typed outcome** — a fixture `PATH` where the only
+      `git`-matching candidates anywhere are `.cmd`/`.bat` files → 
+      resolution fails with exactly `GIT_EXECUTABLE_UNAVAILABLE` — **not**
+      "`GIT_EXECUTABLE_UNAVAILABLE` or a deliberate alternative,
+      implementation's choice of code" (that framing is removed this
+      round) — proving there is exactly one typed outcome for "no usable
+      Git executable found," identical to the outcome for `git` being
+      entirely absent from every `PATH` directory.
+    - **(D) `PATHEXT` has zero effect on resolution, regardless of
+      content or ordering** — a fixture with an unusual, reordered, or
+      `.cmd`/`.bat`-prioritized `PATHEXT` value (e.g.
+      `PATHEXT=.CMD;.BAT;.EXE`) alongside a `PATH` containing both a
+      `git.cmd` and a `git.exe` in the same directory → resolution
+      still selects `git.exe`, proving `PATHEXT` is never consulted by
+      BR3's resolver at all — not read, not walked, not used to
+      prioritize one candidate extension over another.
+    - **(E) No implicit current-working-directory search** — a fixture
+      where the resolver's own fixed resolver `cwd` (§8) contains a
+      `git.exe`-named file, but that directory is **not** itself listed
+      in the sanitized `PATH` value → resolution does **not** select
+      the `cwd`-local file — proving BR3's resolver never implicitly
+      searches the resolver `cwd` (or any other unlisted directory) the
+      way an interactive shell prompt might.
+    - **(F) `PATH`/`Path`/`path` duplicate-key fixture still applies the
+      Windows-only deterministic selection rule** — re-asserting, under
+      this corrected resolver design, the existing Windows
+      case-insensitive-key-collapse test (§19) composes correctly:
+      the sanitized `PATH` value the resolver searches is exactly the
+      one Windows-rule-selected value, not a value read independently
+      by this resolver from a different source.
+    - **(G) The selected absolute executable identity is the exact path
+      subsequently passed to `execFile` for every Git command** —
+      re-asserting, under this corrected Windows resolver, the same
+      single-resolution-reused-everywhere guarantee §8/§18 already
+      establish (Round 8/9's executable-identity binding), confirming
+      the Windows-specific resolver composes correctly with that
+      existing, platform-independent guarantee.
+    - **BR3 never falls back to `cmd.exe`/PowerShell/shell execution
+      under any circumstance** — confirmed by static inspection of the
+      resolution/exec implementation (no `shell: true`, no
+      `cmd.exe`/`cmd /c`/PowerShell-shaped invocation anywhere in
+      `packages/core/src/git/`) in addition to fixtures (C) above —
+      proving the "no usable `git.exe` found, fail outright" behavior is
+      never silently replaced by a shell-based execution path as an
       alternative.
-    - **Executable-unavailable outcome remains exact and deliberate** —
-      the `.cmd`-only fixture above and a genuinely-no-`git`-anywhere-on-`PATH`
-      fixture both produce the identical, documented typed outcome,
-      proving the `.cmd`/`.bat`-rejection path is a deliberate case of
-      the same "no usable Git executable" contract, not an
-      undifferentiated crash or a silently-different error shape.
   - **PATH key selection is exact, deterministic, AND platform-specific
     — corrected, mandatory, Round 10 review finding #2 (Round 9's
     uniform-on-every-platform rule was itself wrong on POSIX):**
@@ -4941,16 +5088,37 @@ current validation algorithm)**
       never promoted into the canonical `PATH` key — proving `Path` is
       treated as an ordinary, unrelated environment variable on POSIX,
       not a case variant.
-    - **(B) POSIX: an absent `PATH` is not filled in from a differently-cased
-      variable** (`PATH` genuinely absent from `process.env`;
-      `Path=<a fake Git directory>` present) → asserts BR3's resolution
-      does **not** promote `Path`'s value into `PATH` and does **not**
-      resolve the fake executable at that fake directory — first
-      confirmed, in the test's own setup (mirroring the reviewer's own
-      verified reproduction), that a real `execFile("git", ..., { env
-      })` call under this exact `env` object does not execute the fake
-      `/tmp/fake/git` either, establishing BR3's resolution must match
-      that real, observed behavior, not invent a more permissive one.
+    - **(B) POSIX, absent `PATH`, system Git available under
+      `/usr/bin`/`/bin`: fake `Path` is ignored, system Git resolves
+      successfully — corrected, mandatory, Round 11 review finding #1**
+      (`PATH` genuinely absent from `process.env`; `Path=<a fake Git
+      directory>` present; a real, genuine `git` available at its
+      ordinary system location under `/usr/bin` or `/bin`) → asserts
+      BR3's resolution does **not** promote `Path`'s value into `PATH`,
+      does **not** resolve the fake executable at that fake directory,
+      and **does** successfully resolve the real system `git` via the
+      `/usr/bin:/bin` default lookup path — the result is **not**
+      `GIT_EXECUTABLE_UNAVAILABLE` — first confirmed, in the test's own
+      setup (mirroring the reviewer's own verified reproduction), that a
+      real `execFile("git", ..., { env })` call under this exact `env`
+      object does not execute the fake `/tmp/fake/git` and instead
+      successfully runs the real system `git`, establishing BR3's
+      resolution must match that real, observed behavior — an earlier
+      draft of this specification incorrectly asserted this case
+      produces `GIT_EXECUTABLE_UNAVAILABLE` ("nothing to search"), which
+      directly contradicted this exact, already-recorded reproduction;
+      that assertion is corrected here.
+    - **(B2) POSIX, absent `PATH`, no Git available anywhere under
+      `/usr/bin`/`/bin` — mandatory, new, Round 11 review finding #1**
+      (`PATH` genuinely absent; `Path=<a fake Git directory>` present;
+      no real `git` executable present at `/usr/bin/git` or `/bin/git`
+      in the test environment — constructed via a sandboxed/simulated
+      filesystem view for the resolution function under test, not by
+      actually removing Git from the real test-runner system) →
+      resolution correctly fails with `GIT_EXECUTABLE_UNAVAILABLE` —
+      proving the `/usr/bin:/bin` default is a genuine search path
+      Git must actually be found within, not an unconditional
+      "always succeeds" assumption.
     - **(C) Windows: `PATH`/`Path`/`path` variants collapse per the
       exact documented rule** (a test-constructed `process.env`-shaped
       object with three case variants, each a genuinely different
@@ -4970,6 +5138,16 @@ current validation algorithm)**
       §8/§18 already establish (Round 8/9's executable-identity
       binding) — proving the PATH-selection correction composes
       correctly with, and does not regress, that existing guarantee.
+    - **(E) Relative/empty `PATH`-entry behavior remains explicitly
+      defined for the `PATH`-present case, unchanged by this round's
+      `PATH`-absent correction** — re-asserting the existing relative-
+      `PATH`-entry-resolves-against-the-fixed-resolver-`cwd` test above
+      continues to apply identically whenever `PATH` (the exact key) is
+      genuinely present, however it is populated (including a relative
+      or empty entry within it) — this round's correction is scoped
+      exclusively to the separate, `PATH`-**absent** case; it does not
+      alter how a *present* `PATH` value (relative entries included) is
+      searched.
   - **Windows environment-key casing during resolution, where testable**
     (on a Windows test runner, or via a focused unit test against the
     resolution function's own Windows-specific branch, independent of
@@ -6171,7 +6349,9 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   global `core.excludesFile`; Round 8 review finding #4: inherited
   lowercase `git_dir`, inherited mixed-case `Git_Index_File`; Round 10
   review finding #2: POSIX `PATH`-vs-`Path` exactness, POSIX
-  absent-`PATH`-not-filled-from-`Path`, and Windows
+  absent-`PATH`-never-filled-from-`Path`; Round 11 review finding #1:
+  POSIX absent-`PATH` correctly falls back to the documented
+  `/usr/bin:/bin` default, never "nothing to search"; and Windows
   duplicate-cased-`PATH` collapsing — none of which may alter BR3's
   result or produce an ambiguous effective
   `PATH`); **and** an inherited `XDG_CONFIG_HOME`/`$HOME`-fallback-based
@@ -6274,32 +6454,43 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   document any longer implies an ordinary filesystem rename alone
   reliably produces porcelain v2's `2 .R` record (§11, §14, §20).
 - **S.** — new, Round 7 review finding #3, mechanism corrected Round 8
-  review finding #2, finalized Round 9 review finding #3. BR3 resolves
-  the `git` executable itself, in process (never by inspecting anything
-  `execFile` exposes, which does not surface the resolved path — Node's
-  `spawnfile`/`spawnargs` report only the literal, unresolved command
-  string), to one absolute, canonicalized path **before** invoking it,
-  using the identical sanitized child environment/`PATH` every
-  subsequent Git command will use. **(i)** Resolution uses exactly **one**
-  fixed resolver `cwd` (`process.cwd()`) for the entire top-level
-  operation — never a per-call `cwd` — with every `PATH` entry
-  (relative, absolute, or empty) normalized against that single resolver
-  `cwd` before being searched, resolving the Round 9 contradiction
-  between "resolve per-call" and "reuse one path across all calls" (§8).
-  **(ii)** On Windows, only directly, natively executable candidates
-  (`.exe`/`.com`) are accepted — a `.cmd`/`.bat` match is never selected
-  as a usable candidate, since BR3's `shell: false`/no-shell `execFile`
-  discipline (§18) cannot execute one directly, and BR3 never falls back
-  to `cmd.exe`/shell execution to work around this (§8, §18). **(iii)**
+  review finding #2, finalized Round 9 review finding #3, `PATH`-absent
+  and Windows-resolver corrected Round 11 review findings #1/#2. BR3
+  resolves the `git` executable itself, in process (never by inspecting
+  anything `execFile` exposes, which does not surface the resolved path
+  — Node's `spawnfile`/`spawnargs` report only the literal, unresolved
+  command string), to one absolute, canonicalized path **before**
+  invoking it, using the identical sanitized child environment/`PATH`
+  every subsequent Git command will use. **(i)** Resolution uses exactly
+  **one** fixed resolver `cwd` (`process.cwd()`) for the entire
+  top-level operation — never a per-call `cwd` — with every `PATH`
+  entry (relative, absolute, or empty) normalized against that single
+  resolver `cwd` before being searched, resolving the Round 9
+  contradiction between "resolve per-call" and "reuse one path across
+  all calls" (§8). **(ii)** On POSIX, only the exact key `PATH` is ever
+  consulted; when `PATH` is genuinely absent, resolution uses the
+  documented Node/libuv default, `/usr/bin:/bin` — never "nothing to
+  search," and never a promoted, differently-cased `Path`/`path` value
+  (§8, §19, Round 11 review finding #1). **(iii)** On Windows, BR3
+  deliberately implements its own, stricter resolver — not a claimed
+  mirror of Node/libuv's own bare-command lookup, which does not consult
+  `PATHEXT` at all — searching only the already-sanitized `PATH`
+  directories, in order, for a literal `git.exe` filename exclusively;
+  `.cmd`/`.bat`/any other extension is never accepted as a candidate,
+  `PATHEXT` is never consulted, and no implicit current-working-directory
+  search occurs; a `PATH` with no usable `git.exe` produces exactly
+  `GIT_EXECUTABLE_UNAVAILABLE`, never an "implementation's choice"
+  alternative code (§8, §18, Round 11 review finding #2). **(iv)**
   Ambiguous multi-cased `PATH`-family keys are resolved via one exact,
-  documented selection rule (ordinally-first matching key name), never
-  "implementation's choice" (§19). Every Git command in one top-level BR3
-  operation — the capability check itself, `resolveRepository`,
-  `inspectHead`, `inspectWorkingTree`, `inspectDiff`, `ls-files`,
-  `check-attr`, and every nested submodule call — is invoked with that
-  identical resolved path, never the bare literal `"git"` again (§18 no
-  longer contains a stale `execFile("git", ...)` example); a subsequent
-  top-level operation re-resolves and revalidates rather than trusting a
+  documented selection rule (ordinally-first matching key name),
+  **Windows-only** — never on POSIX, and never "implementation's
+  choice" (§19). Every Git command in one top-level BR3 operation — the
+  capability check itself, `resolveRepository`, `inspectHead`,
+  `inspectWorkingTree`, `inspectDiff`, `ls-files`, `check-attr`, and
+  every nested submodule call — is invoked with that identical resolved
+  path, never the bare literal `"git"` again (§18 no longer contains a
+  stale `execFile("git", ...)` example); a subsequent top-level
+  operation re-resolves and revalidates rather than trusting a
   capability result cached against a since-changed `PATH`/resolution
   outcome (§8, §18, §20).
 - **T.** — new, Round 7 review finding #4, scope narrowed to
@@ -6389,18 +6580,26 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   `sha1`/`sha256`, status letters) remain validated against their own
   exact, fixed ASCII grammar, a genuinely distinct mechanism from the
   Category 2 strict decode (§13, §20).
-- **Z.** — new, Round 10 review finding #2. The `PATH`-key-normalization
+- **Z.** — new, Round 10 review finding #2, `PATH`-absent behavior
+  corrected Round 11 review finding #1. The `PATH`-key-normalization
   algorithm (§19) is genuinely platform-specific: on POSIX, only the
   exact key `PATH` is the process search path — a differently-cased
   `Path`/`path` key is an unrelated, untouched variable, never promoted
-  into `PATH`, and an absent `PATH` is never filled in from one; only on
-  Windows are multiple case-insensitive `PATH`-family keys collapsed to
-  one deterministic value via one exact, documented rule. This corrects
-  Round 9's own, itself-incorrect uniform-case-insensitive-on-every-platform
-  rule, verified to silently promote an unrelated POSIX `Path` variable
-  into the executable search path, contradicting a real `execFile`
-  call's own observed behavior under the identical environment (§8, §19,
-  §20).
+  into `PATH` under any circumstance, including when `PATH` itself is
+  absent; only on Windows are multiple case-insensitive `PATH`-family
+  keys collapsed to one deterministic value via one exact, documented
+  rule. This corrects Round 9's own, itself-incorrect
+  uniform-case-insensitive-on-every-platform rule, verified to silently
+  promote an unrelated POSIX `Path` variable into the executable search
+  path, contradicting a real `execFile` call's own observed behavior
+  under the identical environment. **When `PATH` is genuinely absent on
+  POSIX, resolution uses the fixed `/usr/bin:/bin` default — the
+  documented Node/libuv fallback — never "nothing to search"** (Round
+  11 review finding #1, correcting a direct self-contradiction: an
+  earlier draft's own recorded reproduction already showed the real
+  system `git` resolving successfully under exactly this condition,
+  while its normative rule claimed `GIT_EXECUTABLE_UNAVAILABLE`
+  instead) (§8, §19, §20).
 - **AA.** — new, Round 10 review finding #3. The effective-filter-attribute
   scan is owned by `inspectWorkingTree` exclusively — `resolveRepository`
   and `inspectHead` never perform it and never return
@@ -6466,8 +6665,11 @@ listed above it):
    inspection (`fs.stat`/`fs.access`/`fs.realpath`), path manipulation
    (`path.join`/`path.delimiter` for splitting `PATH` entries), and
    platform detection (`os.platform()` for the POSIX-vs-Windows
-   `PATHEXT`/casing branches, §19's Windows-casing correction) — none of
-   which `node:child_process`/`node:util` alone provide). Every
+   resolution-rule branches — the exact-`git.exe`-filename Windows
+   resolver, §8, Round 11 review finding #2, and §19's Windows-casing
+   correction; `PATHEXT` is never consulted, per §8's corrected Windows
+   resolver) — none of which `node:child_process`/`node:util` alone
+   provide). Every
    I/O-performing module below depends on this.
 3. **`repository.ts`** (`resolveRepository`) — depends on step 2 (exec
    primitive) and step 1 (types/errors). Implemented before `head.ts`/
@@ -7016,18 +7218,63 @@ The independent reviewer must specifically examine, for BR3:
     BR3 deterministically selects one executable per the documented rule
     and never silently changes which binary it invokes as later
     commands' own targeting `cwd` varies.
-  - **(3B) No `.cmd`/`.bat` execution:** whether Windows executable
-    resolution genuinely restricts accepted candidates to directly,
-    natively executable formats (`.exe`/`.com`), never selecting a
-    `.cmd`/`.bat` `PATHEXT` match as usable — since BR3's `execFile`
-    contract is shell-free (§18) and cannot directly execute a
-    `.cmd`/`.bat` file — proven by the dedicated fixture where the only
-    `git`-matching candidate on `PATH` is a `.cmd` file, confirming
-    resolution fails with a deliberate, typed outcome rather than
-    accepting the `.cmd` candidate and either failing unpredictably or
-    silently invoking a shell-like execution path; and confirmed by
-    static inspection that no `shell: true`/`cmd.exe`-shaped invocation
-    exists anywhere in the implementation as a fallback.
+  - **(3B) BR3's deliberate, stricter, BR3-specific Windows resolver —
+    corrected, Round 11 review finding #2 (Round 9/10's PATHEXT-based
+    model is factually wrong about shell-free `execFile`'s actual
+    Windows lookup behavior and is fully replaced, not merely
+    amended):** whether §8's Windows resolution mechanism is now
+    correctly, explicitly described as BR3's own **deliberate, stricter
+    resolver** — never as "mirroring Node/libuv's own bare-command
+    lookup, filtered to exclude `.cmd`/`.bat`," since libuv's actual
+    Windows process-spawning implementation does not consult `PATHEXT`
+    for its own search at all, making the previous "mirrors Node,
+    filtered" framing simply inaccurate about the runtime BR3 depends
+    on; whether the corrected resolver genuinely (i) searches only the
+    already-sanitized `PATH` directories, in order, with no implicit
+    current-working-directory search; (ii) never reads or is affected by
+    `PATHEXT` in any way; (iii) accepts only a literal `git.exe` filename
+    as a candidate — never `.cmd`/`.bat`/`.com`/any other extension; and
+    (iv) produces exactly `GIT_EXECUTABLE_UNAVAILABLE` — never an
+    "implementation's choice of alternative code" — when no `git.exe` is
+    found anywhere in the sanitized `PATH` — proven by the dedicated
+    fixtures (§20, cases A–G): a `git.exe` present resolves; an earlier
+    `PATH` entry containing only `git.cmd` is skipped in favor of a
+    later entry's genuine `git.exe`; a `PATH` containing only
+    `.cmd`/`.bat` candidates fails with exactly
+    `GIT_EXECUTABLE_UNAVAILABLE`; an unusual/reordered `PATHEXT` value
+    has zero effect on the outcome; a `git.exe` present only in the
+    resolver's own `cwd` (not listed in `PATH`) is not selected; and
+    confirmed by static inspection that no `shell: true`/`cmd.exe`/
+    PowerShell-shaped invocation exists anywhere in the implementation as
+    a fallback.
+  - **(3B2) POSIX `PATH`-absent resolution uses Node/libuv's own
+    documented `/usr/bin:/bin` default, never "nothing to search" —
+    new, mandatory, Round 11 review finding #1 (corrects a direct,
+    internal contradiction in the previous draft — its own recorded,
+    verified reproduction already showed the real system `git`
+    successfully resolving under this exact condition, while its
+    normative rule claimed the opposite):** whether `resolveRepository`'s
+    in-process resolution, when `PATH` (the exact key) is genuinely
+    absent from the sanitized environment on POSIX, uses the fixed
+    `/usr/bin:/bin` default search path — the same default Node/libuv
+    themselves document and exhibit — rather than concluding "no `PATH`,
+    nothing to search, `GIT_EXECUTABLE_UNAVAILABLE`"; and whether a
+    differently-cased `Path`/`path` variable is still never promoted
+    into this search regardless of `PATH`'s absence (the POSIX
+    exactness rule from Round 10 remains unchanged, composing correctly
+    with this correction) — proven by the dedicated fixtures (§20, cases
+    B and B2): `PATH` absent, `Path` pointing at a fake Git location,
+    with a genuine system `git` present under `/usr/bin`/`/bin` →
+    resolves the real system `git`, never the fake one, and never
+    `GIT_EXECUTABLE_UNAVAILABLE`; the identical setup with no Git present
+    anywhere under `/usr/bin`/`/bin` either → correctly fails with
+    `GIT_EXECUTABLE_UNAVAILABLE`; **and** whether this specification
+    correctly distinguishes the effective *lookup* path (used only to
+    resolve the one absolute executable — `/usr/bin:/bin` when `PATH` is
+    absent) from the environment subsequently handed to that
+    already-resolved executable (which needs no synthetic `PATH`
+    injected, since an absolute path bypasses `PATH` search entirely for
+    every later invocation).
   - **(3C) Exact, deterministic, PLATFORM-SPECIFIC `PATH`-key selection
     — corrected again, Round 10 review finding #2:** whether §19's
     `PATH`-key-normalization algorithm is genuinely **platform-specific**
