@@ -311,19 +311,35 @@ interface HeadInfo {
 }
 
 interface UpstreamInfo {
-  remote: string;   // e.g. "origin", or "." for a local-branch upstream (§9/§10)
-  ref: string;      // the symbolic full name @{upstream} itself resolves to, e.g.
-                    // "refs/remotes/origin/main", "refs/custom-ns/origin/main" (a
-                    // custom fetch refspec), or "refs/heads/main" (a local
-                    // upstream) — never a BR3-constructed path. If @{upstream}
-                    // fails to resolve (tracking ref absent locally), this falls
-                    // back to the conventional "refs/remotes/<remote>/<branch>"
-                    // path as a best-effort label only (§9/§10).
+  remote: string;   // e.g. "origin", or "." for a local-branch upstream (§9/§10),
+                    // populated directly from branch.<b>.remote config —
+                    // independent of whether the upstream actually resolves
+  ref: string | null; // the symbolic full name @{upstream} itself resolves to,
+                      // e.g. "refs/remotes/origin/main" (an ordinary
+                      // remote-tracking upstream), "refs/custom-ns/origin/main"
+                      // (a custom-refspec remote-tracking upstream), or
+                      // "refs/heads/main" (a local-branch upstream) — always
+                      // exactly what Git itself resolves @{upstream} to, never
+                      // a BR3-constructed path (revised — corrects Round 3
+                      // review finding #3: an earlier draft of this
+                      // specification fell back to a hand-constructed
+                      // "refs/remotes/<remote>/<branch>" guess when @{upstream}
+                      // failed to resolve; that guess is factually wrong for a
+                      // custom-refspec or local (remote=".") upstream, whose
+                      // real target never lives under refs/remotes/ at all —
+                      // see §9/§10). null if @{upstream} itself fails to
+                      // resolve locally (§9's "configured but unresolvable"
+                      // case) — a truthful "the upstream is configured but
+                      // BR3 cannot tell you where its data lives" state, never
+                      // a guess presented as fact.
   branch: string;   // e.g. "main" (the remote-side branch name, from
-                    // branch.<b>.merge)
-  sha: string | null; // resolved via @{upstream} — see §9/§10. null only if
-                      // @{upstream} itself fails to resolve locally (§9's
-                      // "configured but absent" case)
+                    // branch.<b>.merge), populated directly from config —
+                    // independent of whether the upstream actually resolves
+  sha: string | null; // resolved via @{upstream} — see §9/§10. null exactly
+                      // when ref is null: whenever @{upstream} itself fails
+                      // to resolve locally (§9's "configured but unresolvable"
+                      // case) — ref and sha are null/non-null together, never
+                      // independently
 }
 
 function inspectHead(projectRoot: string): Promise<GitResult<HeadInfo>>;
@@ -781,44 +797,85 @@ data is actually present.
      further Git call needed. The `ref` field reported to callers (§7a)
      is the resolved tracking ref **as Git itself resolves it** — see
      step 2, not a BR3-constructed path.
-2. **Tracking-ref resolution and SHA, via `@{upstream}` itself, resolved
+2. **Upstream-SHA resolution, via `@{upstream}` itself, resolved
    in the context of `<branch>` (not whatever branch HEAD happens to
-   currently be, so this remains correct if that ever diverges):**
+   currently be, so this remains correct if that ever diverges) — this
+   step's result is called "upstream SHA" throughout this specification,
+   an umbrella term covering two distinct subcases (revised — corrects
+   Round 3 review finding #3, which found the previous uniform
+   "remote-tracking ref SHA"/"remote SHA" terminology misleading for the
+   local-upstream subcase below, whose SHA comes from a plain local
+   branch ref under `refs/heads/`, never from anything under
+   `refs/remotes/`):**
    `git rev-parse --verify -q <branch>@{upstream}` for the SHA, and
    `git rev-parse --verify -q --symbolic-full-name <branch>@{upstream}`
    for the resolved ref name (both genuinely read-only; both added to
    §27's read-only command allowlist).
    - If both succeed (exit 0): `sha` is populated with the printed SHA,
-     and `ref` is populated with the printed symbolic full name (e.g.
-     `refs/remotes/origin/main`, `refs/custom-ns/origin/main`, or
-     `refs/heads/main` for a local upstream — whichever Git itself
-     reports, never a BR3 guess). **This is the entirety of what "remote
-     SHA" means in BR3** — the SHA the local repository's tracking ref
-     already records, as of whenever it was last updated by an actual
-     `git fetch` (or, for a local upstream, simply the other local
-     branch's current tip) the *user* (not BR3) established. BR3 never
-     runs `git fetch` itself, under any circumstance.
-   - If either fails (exit 1, no stderr with `-q`): `sha` is `null` and
-     `ref` falls back to the step-1-constructed conventional path
-     (`refs/remotes/<remote>/<branch>`) as a best-effort label only —
-     while `remote`/`branch` remain populated from step 1. This is the
-     explicit "configured but tracking ref unavailable locally" case,
-     genuinely distinct from step 1's "no upstream configured" `null`
-     case. Verified directly against a scratch repository with
-     `branch.main.remote`/`.merge` configured but
-     `refs/remotes/origin/main` deleted: step 1 still reports the
-     configured remote/branch (config keys are unaffected by the
-     tracking ref's deletion), and step 2's `@{upstream}` resolution on
-     the now-absent ref fails cleanly with exit 1 and no stderr.
+     and `ref` is populated with the printed symbolic full name — always
+     exactly what Git itself reports, never a BR3 guess. Two subcases,
+     both fully supported and both reachable in practice:
+     - **Remote-tracking upstream** (the ordinary case, and the
+       custom-fetch-refspec case): `ref` is something under `refs/remotes/`
+       — e.g. `refs/remotes/origin/main` under Git's default fetch
+       refspec, or `refs/custom-ns/origin/main` under a custom
+       `remote.<name>.fetch` rewrite — and `sha` is that remote-tracking
+       ref's own already-recorded SHA.
+     - **Local-branch upstream** (`branch.<name>.remote` configured as
+       the literal string `"."`, via `git branch
+       --set-upstream-to=<other-local-branch>`): `ref` is
+       `refs/heads/<other-branch>` — a plain local branch ref, never
+       anything under `refs/remotes/` — and `sha` is that other local
+       branch's own current tip.
 
-**"Remote SHA" is therefore precisely and only: the SHA currently
-recorded by the local remote-tracking ref for the current branch's
-configured upstream, if any, as already present in the local repository —
-never a live query to an actual remote server, never triggering a
-fetch.** If a caller wants a truly up-to-date remote SHA, running
-`git fetch` themselves (outside BR3, which never mutates anything) before
-calling `inspectHead` is the only way to get one — this is stated
-explicitly so no caller misreads `upstream.sha` as always-current.
+     **This is the entirety of what "upstream SHA" means in BR3, for
+     either subcase** — the SHA `@{upstream}`'s own already-resolved
+     target already records locally, never a live query to an actual
+     remote server. For a remote-tracking upstream specifically, that SHA
+     is exactly as fresh as whenever the *user* (not BR3) last ran an
+     actual `git fetch`; for a local-branch upstream, it is simply the
+     other local branch's current tip. BR3 never runs `git fetch` itself,
+     under any circumstance, for either subcase.
+   - If either fails (exit 1, no stderr with `-q`): **both `sha` and `ref`
+     are `null`** (revised — corrects Round 3 review finding #3: an
+     earlier draft of this specification had `ref` fall back to a
+     BR3-constructed conventional path,
+     `refs/remotes/<remote>/<branch>`, described as a "best-effort
+     label" — that fallback is removed entirely, since it is simply
+     wrong whenever the unresolvable upstream is a custom-refspec or
+     local-branch upstream, neither of which has any real target under
+     `refs/remotes/<remote>/<branch>` at all; presenting a fabricated
+     path as if it were a real, Git-resolved fact is worse than reporting
+     nothing) — while `remote`/`branch` (populated directly from
+     `branch.<b>.remote`/`.merge` config in step 1, independent of
+     whether `@{upstream}` resolves) remain populated. This is the
+     explicit "configured but unresolvable" case: BR3 truthfully reports
+     "an upstream is configured, and its identity is `remote`/`branch`,
+     but I cannot tell you where its data lives" rather than guessing —
+     genuinely distinct from step 1's "no upstream configured" `null`
+     case, where the entire `upstream` value is `null`. Verified directly
+     against a scratch repository with `branch.main.remote`/`.merge`
+     configured but `refs/remotes/origin/main` deleted: step 1 still
+     reports the configured remote/branch (config keys are unaffected by
+     the tracking ref's deletion), and step 2's `@{upstream}` resolution
+     on the now-absent ref fails cleanly with exit 1 and no stderr.
+
+**"Upstream SHA" is therefore precisely and only: the SHA already
+recorded, locally, by whatever `@{upstream}` itself resolves to for the
+current branch's configured upstream, if any — for the ordinary
+remote-tracking-upstream subcase, the local remote-tracking ref's
+already-recorded SHA; for the local-branch-upstream subcase, the other
+local branch's own current tip — never a live query to an actual remote
+server, never triggering a fetch, for either subcase** (revised —
+"Remote SHA" is retired as the umbrella term, since it misdescribes the
+local-branch-upstream subcase, whose SHA comes from a plain
+`refs/heads/` ref, not anything under `refs/remotes/`; "remote-tracking
+ref"/"remote SHA" remain the correct, precise terms for the ordinary
+majority-case subcase specifically — see step 2 above). If a caller wants
+a truly up-to-date remote-tracking-upstream SHA, running `git fetch`
+themselves (outside BR3, which never mutates anything) before calling
+`inspectHead` is the only way to get one — this is stated explicitly so
+no caller misreads `upstream.sha` as always-current.
 
 **Ahead/behind: explicitly excluded from BR3.** Commit-count-based
 ahead/behind reporting (`git rev-list --left-right --count`) is a
@@ -835,29 +892,53 @@ speculative scope. This is a **deferred item** (§26), not an oversight.
 short section, since the task explicitly requires "remote SHA" to never
 be used ambiguously.)
 
-- **No upstream configured:** `upstream: null`. Not an error.
-- **Upstream configured, tracking ref resolves via `@{upstream}`:**
-  `upstream: { remote, ref, branch, sha: <40-hex SHA> }`, where `ref` is
-  whatever symbolic full name `@{upstream}` itself resolves to (honoring
-  custom fetch refspecs and the `remote="."` local-upstream case — see
-  §9's corrected method) — never a BR3-constructed
-  `refs/remotes/<remote>/<branch>` guess.
-- **Upstream configured, `@{upstream}` fails to resolve (tracking ref
-  absent locally):** `upstream: { remote, ref, branch, sha: null }`,
-  where `ref` falls back to the conventional
-  `refs/remotes/<remote>/<branch>` path as a best-effort label only,
-  since Git itself has nothing to resolve in this case.
-- **Repository has no remotes at all:** indistinguishable, from BR3's
-  point of view, from "no upstream configured" (case 1 above) — a branch
-  cannot have a configured upstream if no remote exists to name. No
-  separate error code is needed; `upstream: null` covers it.
-- **Upstream is a local branch (`branch.<name>.remote = "."`):** fully
+**Whether a branch has a configured upstream is purely a function of
+`branch.<b>.remote`/`.merge` config-key presence (revised — corrects
+Round 3 review finding #3, which found the previous "no remotes means no
+upstream" bullet below a false blanket rule, not merely a restatement of
+"no upstream configured"):** both keys present → upstream configured;
+either or both absent → `upstream: null`. "No remotes configured at all"
+is simply **one way** those keys can end up absent (with no remote
+defined, there is usually nothing to point `branch.<b>.remote` at) — it
+is not an independent, overriding rule, and it does **not** generalize to
+"no remotes implies no upstream" as a blanket claim, because
+`branch.<b>.remote` can legitimately be set to the literal string `"."`
+(a local-branch upstream, below) with **zero** remotes configured in the
+repository at all — a genuinely configured upstream that has nothing to
+do with any remote. BR3 never special-cases "how many remotes exist" as
+its own signal; it only ever reads the two `branch.<b>.*` config keys.
+
+- **No upstream configured** (`branch.<b>.remote`/`.merge` config keys
+  both absent — including, as one way this can happen, a repository with
+  no remotes defined at all): `upstream: null`. Not an error.
+- **Upstream configured, `@{upstream}` resolves:** `upstream: { remote,
+  ref, branch, sha: <40-hex SHA> }`, where `ref` is whatever symbolic
+  full name `@{upstream}` itself resolves to (honoring custom fetch
+  refspecs and the `remote="."` local-upstream case — see §9's corrected
+  method) — never a BR3-constructed `refs/remotes/<remote>/<branch>`
+  guess.
+- **Upstream configured, `@{upstream}` fails to resolve (revised —
+  corrects Round 3 review finding #3):** `upstream: { remote, ref: null,
+  branch, sha: null }` — `remote`/`branch` remain populated (config-key
+  presence, independent of resolvability), but `ref` is `null`, **not** a
+  fallback-constructed `refs/remotes/<remote>/<branch>` guess (an earlier
+  draft of this specification used exactly that guess as a "best-effort
+  label"; it is removed because it is simply false whenever the
+  unresolvable upstream is a custom-refspec or local-branch upstream,
+  neither of which has a real target anywhere under
+  `refs/remotes/<remote>/<branch>`) — since Git itself has nothing to
+  resolve in this case, BR3 reports that truthfully as `null` rather than
+  presenting a guess as fact.
+- **Upstream is a local branch** (`branch.<name>.remote = "."`): fully
   supported, not a distinct case from BR3's caller's point of view —
   `@{upstream}` resolves such a configuration correctly (verified in
-  §9), reporting `ref: refs/heads/<other-branch>` and `sha` from that
-  local branch's own current tip. `remote` is reported exactly as Git
-  config stores it (the literal string `.`), since BR3 reports facts as
-  Git records them rather than translating `.` into some other sentinel.
+  §9), reporting `ref: refs/heads/<other-branch>` (a **local-branch
+  upstream**, per §9's terminology — this SHA is a plain local branch
+  ref's tip, never a remote-tracking ref, and this case requires no
+  remote to be configured at all) and `sha` from that local branch's own
+  current tip. `remote` is reported exactly as Git config stores it (the
+  literal string `.`), since BR3 reports facts as Git records them rather
+  than translating `.` into some other sentinel.
 - **HEAD is detached:** `upstream: null` unconditionally — detached HEAD
   has no branch, and only branches have configured upstreams.
 
@@ -1007,9 +1088,22 @@ and each `protectedSystems[].paths` glob pattern before matching:**
   `docs/PROTECTED_SYSTEMS.md` example, `src/auth/**`). No `\`-to-`/`
   conversion is performed — Windows-style separators in a declared
   pattern are a configuration authoring error, not something BR3 silently
-  repairs; a pattern containing `\` simply will not match anything
-  (documented, not treated as a distinct error code, since it's a
-  config-authoring concern, not a BR3-runtime one).
+  repairs. **`\` is never treated as an alternate path separator, but it
+  is not inert either (revised — corrects Round 3 review finding #4,
+  which found the previous "a pattern containing `\` simply will not
+  match anything" claim factually wrong, and directly contradicted by
+  §16's own documented `picomatch` grammar): `\` is standard glob
+  backslash-escape syntax** — `\X` matches a literal `X`, consuming both
+  characters as one unit, exactly as `picomatch` (and glob syntax
+  generally) always treats it, independent of any of `picomatch`'s
+  toggleable options (`nonegate`, `noextglob`, etc. — backslash-escaping
+  is baseline grammar, not a feature `picomatch` allows disabling). A
+  pattern author who writes a literal `\` intending it as a Windows-style
+  separator gets escape semantics instead (e.g. `src\auth\**` is parsed
+  as `srcauth` followed by `**`, each `\`-prefixed character consumed as
+  an escaped literal) — a config-authoring error worth documenting
+  clearly, but not "matches nothing." See §16 for the complete grammar
+  this pattern-normalization rule feeds into.
 - **Leading `./`:** stripped from both input paths and patterns before
   matching (`./src/foo.ts` normalizes to `src/foo.ts`) — Git itself never
   emits a leading `./`, but a hand-authored pattern in `config.yml` might.
@@ -1053,6 +1147,14 @@ and each `protectedSystems[].paths` glob pattern before matching:**
   `src/auth/login.ts` and `src/auth/oauth/token.ts` alike. This is
   standard glob semantics (§13's chosen library, §13, implements exactly
   this).
+- **`?` (single-character wildcard) — added explicitly (Round 3 review
+  finding #4, Option A):** `?` matches exactly one character, and — like
+  `*` — never crosses a `/`; `src/auth/?.ts` matches `src/auth/a.ts` but
+  not `src/auth/ab.ts` or `src/auth/oauth/a.ts`. This is `picomatch`'s
+  baseline grammar (not gated by any of the toggleable options this
+  specification sets — see §16), and is now explicitly documented as part
+  of BR3's supported pattern grammar, alongside `*`/`**`/brackets/braces
+  (negation and extglobs remain disabled, §16).
 
 **Duplicate matches / overlapping protected systems:** if one input's
 `path` matches patterns from **multiple** `ProtectedSystem` entries (e.g.
@@ -1445,31 +1547,72 @@ choose the one relevant to its own question.
   (memoized per `matchProtectedPaths` call, or per `ProtectedSystem[]`
   array identity — implementation's choice, not a caller-visible
   contract) rather than recompiling per input path.
-- **Protected-path pattern grammar — explicit decision (corrects Round 1
-  review finding #8, which found this previously unstated):** BR3's
-  declared-pattern grammar supports exactly `*` (single-segment
-  wildcard), `**` (cross-segment wildcard, §12), bracket/character-class
-  expressions (`[abc]`, `[a-z]`), and brace expansion (`{a,b}`, e.g.
-  `src/{auth,payments}/**`) — and explicitly **disables** negation
-  patterns (a leading `!`) and extglobs (`+(pattern)`, `@(pattern)`,
-  `?(pattern)`, etc.), via `picomatch`'s own `nonegate: true` and
-  `noextglob: true` options. **Rationale:** a *protected-path* matcher is
-  security-relevant in exactly the way `docs/PROTECTED_SYSTEMS.md`
-  describes (it exists so a change to a sensitive path is never silently
-  missed) — negation and extglob semantics are the two picomatch
-  features most likely to produce subtle, hard-to-audit behavior in this
-  specific context (e.g. a pattern author writing `!src/auth/legacy/**`
-  intending to narrow protection, but actually broadening what does *not*
-  match in a way that isn't obvious from reading the pattern alone).
-  Bracket expressions and brace expansion carry no comparable risk (they
-  only ever narrow or enumerate exact character/string alternatives, never
-  invert a match) and are plausibly useful for a `config.yml` author
-  (`docs/PROTECTED_SYSTEMS.md`'s own example, `src/auth/**`, doesn't need
-  them, but a multi-directory protected system like
-  `src/{auth,payments}/**` is a reasonable real-world pattern), so they
-  remain enabled. With `nonegate: true` set, `picomatch` itself rejects a
-  pattern beginning with `!` by treating it as a literal (non-negating)
-  character rather than special syntax — BR3 relies on this built-in
+- **Protected-path pattern grammar — explicit, complete, gap-free
+  decision (corrects Round 1 review finding #8, which found this
+  previously unstated; revised again — corrects Round 3 review finding
+  #4, which found the grammar as stated through Round 2 still
+  incomplete: it did not account for `picomatch`'s default-active `?`
+  single-character wildcard or its standard backslash-escape semantics,
+  and directly contradicted §12's then-current, since-corrected claim
+  that a pattern containing `\` "simply will not match anything"):** BR3
+  chose, deliberately, to **document and support** `?` and
+  backslash-escaping as genuine grammar (Option A of the two choices
+  Round 3's review raised, over Option B's alternative of pre-rejecting
+  any pattern containing `?` or an unescaped `\` via
+  `invalidPatterns`) — see the rationale paragraph below the complete
+  grammar. BR3's declared-pattern grammar therefore supports **exactly**:
+  - `*` — single-segment wildcard (never crosses `/`)
+  - `**` — cross-segment wildcard (§12)
+  - `?` — single-character wildcard (never crosses `/`) — **added
+    explicitly, Round 3 review finding #4**; baseline `picomatch` grammar,
+    not gated by any option this specification sets (§12 documents its
+    exact matching behavior)
+  - backslash-escaping (`\X` matches a literal `X`) — **added explicitly,
+    Round 3 review finding #4**; likewise baseline `picomatch` grammar,
+    not independently toggleable the way `nonegate`/`noextglob` are (§12
+    documents its exact behavior, including the "authored as a Windows
+    path separator" config-authoring-error case)
+  - bracket/character-class expressions (`[abc]`, `[a-z]`)
+  - brace expansion (`{a,b}`, e.g. `src/{auth,payments}/**`)
+
+  and explicitly **disables**:
+  - negation patterns (a leading `!`)
+  - extglobs (`+(pattern)`, `@(pattern)`, `?(pattern)`, etc.)
+
+  — the latter two via `picomatch`'s own `nonegate: true` and
+  `noextglob: true` options. **Rationale for what's disabled:** a
+  *protected-path* matcher is security-relevant in exactly the way
+  `docs/PROTECTED_SYSTEMS.md` describes (it exists so a change to a
+  sensitive path is never silently missed) — negation and extglob
+  semantics are the two picomatch features most likely to produce subtle,
+  hard-to-audit behavior in this specific context (e.g. a pattern author
+  writing `!src/auth/legacy/**` intending to narrow protection, but
+  actually broadening what does *not* match in a way that isn't obvious
+  from reading the pattern alone). **Rationale for what's kept, including
+  `?`/backslash-escape:** bracket expressions and brace expansion carry no
+  comparable risk (they only ever narrow or enumerate exact
+  character/string alternatives, never invert a match) and are plausibly
+  useful for a `config.yml` author (`docs/PROTECTED_SYSTEMS.md`'s own
+  example, `src/auth/**`, doesn't need them, but a multi-directory
+  protected system like `src/{auth,payments}/**` is a reasonable
+  real-world pattern), so they remain enabled. `?` carries the same
+  narrow-only character as brackets/braces — it can only ever narrow what
+  matches (one more required character), never broaden or invert a
+  match — so it presents no comparable audit risk either, and excluding
+  it (Option B) would mean adding a bespoke pre-validation step and
+  rejecting patterns for a feature that poses no actual security concern,
+  purely because it happened to be previously undocumented; documenting
+  it accurately (Option A) is the more direct fix. Backslash-escaping is
+  not a *feature* a pattern author opts into so much as unavoidable
+  baseline glob syntax `picomatch` always applies — `picomatch` provides
+  no option to disable it, so Option B's alternative (rejecting patterns
+  containing an unescaped `\`) would require BR3 to hand-roll a
+  detection pass ahead of `picomatch` for no corresponding safety gain,
+  since an escaped literal character is, if anything, more precise (and
+  more auditable) than the unescaped character alone would be. With
+  `nonegate: true` set, `picomatch` itself rejects a pattern beginning
+  with `!` by treating it as a literal (non-negating) character rather
+  than special syntax — BR3 relies on this built-in
   behavior rather than pre-scanning patterns for a leading `!` itself.
 - **TypeScript typings — final, unconditional decision (revised —
   corrects Round 2 review finding #4, which found the previous
@@ -1667,15 +1810,177 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
 Every `execFile` invocation (via the shared internal helper, §18)
 includes, unconditionally:
 
-- **`env` override**, not the inherited `process.env` verbatim:
-  `{ ...process.env, LC_ALL: "C", LANG: "C", GIT_PAGER: "cat",
-  GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1" }` (the last —
-  `GIT_CONFIG_NOSYSTEM`, not strictly required for output-format
-  determinism but included since it prevents an unusual machine-wide
-  system-level Git config from silently altering behavior in a way this
-  specification cannot anticipate; `~/.gitconfig`-level `[user]`-style
-  config is left alone, since it does not affect any of BR3's read-only
-  output formats). `LC_ALL`/`LANG: "C"` forces the POSIX/C locale, purely
+- **`env` construction — genuinely sanitized, not `{ ...process.env, ... }`
+  spread verbatim (revised — corrects Round 3 review finding #2, which
+  found the previous `{ ...process.env, LC_ALL: "C", ... }` design a real
+  vulnerability: any inherited `GIT_*`-prefixed environment variable —
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_GLOBAL`, the
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`
+  config-injection mechanism, etc. — passes straight through a
+  `process.env` spread into every BR3-invoked Git subprocess, silently
+  overriding §8's already-validated `projectRoot`/`cwd`.** Verified
+  directly, in a real two-repository fixture (`repoA`, a commit
+  `172d99c...`; `repoB`, an unrelated repo with commit `7d9fc77...`), with
+  `cwd` set to `repoA`:
+  ```
+  $ cd repoA && GIT_DIR=<repoB>/.git git rev-parse HEAD
+  7d9fc77c574039219d3e2c66ff8b7ce8cecabade
+  exit=0
+  ```
+  This is `repoB`'s HEAD, not `repoA`'s — a bare inherited `GIT_DIR`
+  silently redirects every Git command BR3 issues to an entirely
+  different repository than the one `projectRoot`/`cwd` names, undermining
+  every root-validation (§8) and read-only guarantee this specification
+  makes, since the redirected repository is never validated by §8 at all.
+  A separately-verified inherited `GIT_INDEX_FILE` pointed at a second
+  repository's index produces an immediate, confusing `fatal: unable to
+  read <object>` failure when the two repositories' object stores don't
+  overlap (verified directly) — and would silently read the wrong index
+  entirely if they did — neither outcome is acceptable for a tool whose
+  entire purpose is trustworthy repository inspection. The construction
+  algorithm is therefore, unconditionally, in this exact order:
+  1. **Start from `process.env`.**
+  2. **Strip every inherited environment variable whose name begins with
+     the literal prefix `GIT_`**, via a genuine prefix-based filter (e.g.
+     `Object.fromEntries(Object.entries(process.env).filter(([k]) =>
+     !k.startsWith("GIT_")))`) — **not** an enumerated blocklist of
+     specific variable names. `GIT_DIR`, `GIT_WORK_TREE`,
+     `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`,
+     `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CEILING_DIRECTORIES`,
+     `GIT_DISCOVERY_ACROSS_FILESYSTEM`, `GIT_CONFIG`,
+     `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/
+     `GIT_CONFIG_VALUE_*`, `GIT_CONFIG_GLOBAL`, and `GIT_CONFIG_SYSTEM`
+     are the specific threats this section verifies below, but they are
+     **illustrative of the threat class, not an exhaustive list this
+     filter enumerates** — Git adds new `GIT_*`-prefixed environment
+     variables across releases, and a name-by-name blocklist would need
+     updating every time one is added; a blanket prefix strip has no such
+     maintenance burden and no such gap.
+  3. **Explicitly re-add only the specific `GIT_*` variables BR3 itself
+     sets and controls**, listed individually below — never restoring any
+     of the stripped, inherited values.
+  4. **Add the non-`GIT_*` determinism variables** (`LC_ALL`, `LANG`)
+     listed below.
+
+  The final, explicit set of `GIT_*` variables BR3 re-adds after the strip
+  (step 3 above) is:
+  - **`GIT_PAGER: "cat"`** — see the no-pager bullet below.
+  - **`GIT_TERMINAL_PROMPT: "0"`** — see the credential-prompt bullet
+    below.
+  - **`GIT_OPTIONAL_LOCKS: "0"`** — **new (Round 3 review finding #1)**;
+    see the "Read-only guarantee" bullet immediately below for the exact
+    mechanism and verified evidence.
+  - **`GIT_CONFIG_NOSYSTEM: "1"`** — prevents an unusual machine-wide
+    system-level Git config from silently altering behavior in a way this
+    specification cannot anticipate.
+  - **`GIT_CONFIG_GLOBAL: <a platform-appropriate null device, i.e.
+    Node's `os.devNull`>`** — **new (Round 3 review finding #2)**; see the
+    "Global Git config neutralization" bullet below for the exact
+    mechanism and verified evidence.
+
+  Together, steps 1–4 mean the final `env` passed to every BR3 `execFile`
+  call is `process.env` **minus every `GIT_*`-prefixed key, unconditionally**,
+  **plus** exactly the five `GIT_*` keys named above **plus** `LC_ALL`/
+  `LANG` — never a wholesale `{ ...process.env }` spread with ad-hoc
+  additions layered on top. This is constructed once, in the one shared
+  `internal/exec.ts` helper (§18) — not per call site — so there is
+  exactly one place in the codebase this sanitization could regress.
+
+- **Read-only guarantee — the actual enforcement mechanism, named
+  explicitly (revised — corrects Round 3 review finding #1, which found
+  that BR3's "read-only" claim was previously aspirational/architectural
+  only — restricting *which* Git subcommands are invoked — with no
+  mechanism actually preventing one of those permitted subcommands,
+  `status`, from silently mutating `.git/index` as an ordinary,
+  documented Git side effect):** `git status` (and, more generally, any
+  Git command that performs an "index refresh," updating the cached stat
+  information — mtime, size — for tracked files whose content is
+  unchanged but whose filesystem metadata has changed since the index was
+  last written) rewrites `.git/index` on disk **even though no ref,
+  working-tree content, or user-visible state changes** — Git's own
+  well-known, documented opportunistic-write behavior, not a bug. Left
+  unaddressed, this would make BR3's own read-only guarantee false for
+  `inspectWorkingTree` specifically, in a way invisible to any
+  semantic-output-based test (the *reported* `WorkingTreeStatus` is
+  identical either way — only the raw index bytes on disk change).
+  **Verified directly**, against a real fixture repository with one
+  committed, unchanged file whose mtime is touched (content untouched)
+  between each step:
+  ```
+  $ shasum -a 256 .git/index                     # baseline, after priming
+  64703ebd...
+  $ touch file.txt                                 # mtime only, content unchanged
+  $ git status --porcelain=v2 -z >/dev/null        # no GIT_OPTIONAL_LOCKS override
+  $ shasum -a 256 .git/index
+  f7c99e90...                                       # CHANGED — index was rewritten
+  $ touch file.txt                                 # mtime only, again
+  $ GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 -z >/dev/null
+  $ shasum -a 256 .git/index
+  f7c99e90...                                       # UNCHANGED — no further rewrite
+  ```
+  **`GIT_OPTIONAL_LOCKS=0`** (re-added after the `GIT_*` strip above, per
+  step 3) is the confirmed, sufficient mechanism: it instructs Git to skip
+  every opportunistic lock-and-write it would otherwise perform
+  automatically during operations like `status`, including the index
+  refresh above. This is BR3's actual, mechanical read-only guarantee for
+  `inspectWorkingTree` (and, defensively, every other BR3 Git
+  invocation) — not merely "BR3 only calls read-oriented subcommands," but
+  "every BR3 Git invocation is additionally instructed, at the process
+  level, never to write anything to `.git/` as a side effect of running."
+  A dedicated regression test detecting actual index-byte mutation (not
+  merely semantic-result stability) is required (§20).
+- **Global Git config neutralization — new (Round 3 review finding #2),
+  while repository-local config remains honored:** stripping inherited
+  `GIT_*` variables (above) closes the environment-injection surface, but
+  a **file-based** `~/.gitconfig`/XDG global config is a separate,
+  filesystem-resident source Git consults regardless of environment
+  variables, and an unusual or malicious global config (e.g. a
+  `core.excludesFile` entry) can silently alter BR3's own output (e.g.
+  which paths `inspectWorkingTree` reports as untracked) in a way this
+  specification's determinism guarantee (below) exists to rule out. The
+  mechanism: **`GIT_CONFIG_GLOBAL` set to a platform-appropriate null
+  device (Node's `os.devNull` — `/dev/null` on POSIX, `\\.\NUL` on
+  Windows)** — this tells Git to read its "global" config layer from a
+  location guaranteed to contain nothing, while leaving the
+  repository-local `.git/config` layer (and any `-c`/environment-injected
+  config BR3 does not itself use) completely untouched, since
+  `GIT_CONFIG_GLOBAL` only ever substitutes for the global layer, never
+  the local one. **Verified directly**, with a fixture "global" config
+  containing a distinctive marker and a repo-local `user.email` override:
+  ```
+  $ GIT_CONFIG_GLOBAL=<fake-global-gitconfig> git config --get distinctive.marker
+  FROM_FAKE_GLOBAL                                  # sanity check: the override IS read by default
+  exit=0
+  $ git config user.email local-repo-email@example.com   # set repo-local config
+  $ GIT_CONFIG_GLOBAL=<fake-global-gitconfig> git config --get user.email
+  local-repo-email@example.com                      # repo-local config still visible/wins
+  $ GIT_CONFIG_GLOBAL=/dev/null git config --get distinctive.marker
+  exit=1                                             # nothing printed — global config neutralized
+  $ GIT_CONFIG_GLOBAL=/dev/null git config --get user.email
+  local-repo-email@example.com                      # repo-local config STILL visible — unaffected
+  ```
+  and, specifically for the `core.excludesFile` scenario Round 3 review
+  finding #2 names:
+  ```
+  $ echo "ignored-by-global.txt" > file.txt && git status --porcelain=v2 --untracked-files=all
+  ? ignored-by-global.txt                            # untracked file correctly reported
+  $ GIT_CONFIG_GLOBAL=<fake-global-config-declaring-core.excludesFile> \
+      git status --porcelain=v2 --untracked-files=all
+                                                       # (empty — the file vanished from output)
+  $ GIT_CONFIG_GLOBAL=/dev/null git status --porcelain=v2 --untracked-files=all
+  ? ignored-by-global.txt                            # correctly reported again once neutralized
+  ```
+  This confirms both halves: a fabricated global `core.excludesFile`
+  genuinely does alter `inspectWorkingTree`-equivalent output when left
+  unaddressed, and `GIT_CONFIG_GLOBAL=<null device>` genuinely restores
+  correct, config-injection-free reporting. Repository-local Git config
+  remains fully valid and continues to be read normally where BR3
+  intentionally consumes it (e.g. `branch.<b>.remote`/`.merge`, §9/§10) —
+  this mechanism only neutralizes the *global* layer, never the local one.
+  Four dedicated regression tests (inherited `GIT_DIR`, inherited
+  `GIT_INDEX_FILE`, `GIT_CONFIG_COUNT`-style env injection, and fabricated
+  global `core.excludesFile`) are required (§20).
+- **`LC_ALL: "C"`, `LANG: "C"`** — forces the POSIX/C locale, purely
   for the **readability/determinism of diagnostic text** that might end
   up in `GitError.details` for a genuinely unanticipated failure —
   **stated explicitly (corrects Round 1 review finding #5): no BR3
@@ -1796,6 +2101,11 @@ hand-constructed `refs/remotes/<remote>/<branch>` path)**
   (§9), not from any stderr text
 - No upstream configured (`branch.<branch>.remote`/`.merge` config both
   absent) → `upstream: null`
+- **Repository has no remotes configured at all, but `branch.<b>.remote`
+  is set to `"."` (a local-branch upstream)** → `upstream` is genuinely
+  configured and resolves correctly (`remote: "."`, correct
+  `branch`/`ref`/`sha`) — the specific Round 3 regression test proving
+  "no remotes" is not treated as an overriding "no upstream" rule (§10)
 - **Upstream configured with a real local remote-tracking ref present,
   under Git's default fetch refspec** (e.g. `git remote add`, `git fetch`
   against a local bare repository used purely as an in-test fixture
@@ -1814,14 +2124,29 @@ hand-constructed `refs/remotes/<remote>/<branch>` path)**
   the resolved `refs/heads/<other-branch>` path — the second Round 2
   regression test, proving the local-upstream case (which has no
   `refs/remotes/` entry at all) is correctly supported
-- **Upstream configured (`branch.<branch>.remote`/`.merge` both present),
+- **Upstream configured (ordinary remote-tracking, default refspec),
   remote-tracking ref subsequently removed** (e.g. via
   `git update-ref -d refs/remotes/<remote>/<branch>` in the fixture's own
   setup — the exact scenario a naive `@{upstream}`-only design, with no
   separate config check, could not distinguish from "no upstream
-  configured" at all) → `sha: null`, `remote`/`branch` still correctly
-  populated from config, `ref` falling back to the conventional
-  constructed path (§9/§10)
+  configured" at all) → `sha: null`, **`ref: null`** (revised — corrects
+  Round 3 review finding #3; previously specified as falling back to a
+  constructed `refs/remotes/<remote>/<branch>` guess), `remote`/`branch`
+  still correctly populated from config (§9/§10)
+- **Upstream configured under a custom fetch refspec, the custom-namespace
+  tracking ref subsequently removed** (e.g. `remote.origin.fetch`
+  rewritten to a non-standard namespace, fetched, then that
+  custom-namespace ref deleted via `git update-ref -d`) → `sha: null`,
+  `ref: null`, `remote`/`branch` still correctly populated — the specific
+  Round 3 regression test proving the removed fallback is not
+  reconstructed for the custom-refspec subcase either (§9/§10)
+- **Upstream is a local branch (`remote="."`), the target local branch
+  subsequently deleted** (`git branch --set-upstream-to=<other-branch>`,
+  then `git branch -D <other-branch>`) → `sha: null`, `ref: null`,
+  `remote: "."`/`branch` still correctly populated — the specific Round 3
+  regression test proving the removed fallback is not reconstructed for
+  the local-branch-upstream subcase either, which never had a
+  `refs/remotes/` entry to begin with (§9/§10)
 - No network operation occurs during any BR3 test (asserted structurally,
   e.g. by running in an environment with no network access, or by
   confirming no test ever configures a real, reachable remote URL)
@@ -1911,6 +2236,20 @@ signature, corrects Round 1 review finding #4**
   pattern using a bracket expression (`[a-z]`) both match as expected —
   confirming these two features remain genuinely enabled, not
   accidentally disabled alongside negation/extglobs
+- **`?` (single-character wildcard) — new, Round 3 review finding #4,
+  Option A:** a declared pattern using `?` (e.g. `src/auth/?.ts`) matches
+  a path with exactly one character in that position (`src/auth/a.ts`)
+  and does **not** match zero or two-or-more characters there
+  (`src/auth/.ts`, `src/auth/ab.ts`), and does **not** match across a `/`
+  boundary (`src/auth/a/b.ts` does not match `src/auth/?.ts`) — three
+  dedicated assertions within one test or as separate cases
+- **Backslash-escape semantics — new, Round 3 review finding #4, Option
+  A:** a declared pattern containing `\X` (e.g. `src/auth\-legacy/**`,
+  escaping a literal hyphen) matches exactly the literal, unescaped
+  string it encodes (`src/auth-legacy/**`'s target paths) — confirming
+  `\` is genuinely treated as glob escape syntax, not as an inert
+  separator-like character and not as "matches nothing" (the now-corrected
+  claim §12 previously made)
 - `matchProtectedPaths` is confirmed **pure**: calling it twice with the
   same (deep-equal, but not reference-equal) `inputs`/`protectedSystems`
   arguments produces deep-equal outputs, and neither input array/object
@@ -1930,6 +2269,60 @@ signature, corrects Round 1 review finding #4**
   temporarily manipulating `PATH` in the test's own subprocess
   environment so `git` cannot be found — not by uninstalling Git from
   the actual test-runner environment)
+- **Index-mutation regression — mandatory, new (Round 3 review finding
+  #1):** against a fixture repository with one committed, unchanged
+  tracked file, snapshot `.git/index`'s raw bytes (or a hash of them)
+  before calling `inspectWorkingTree`; touch that tracked file's mtime
+  without changing its content; call `inspectWorkingTree`; snapshot
+  `.git/index` again and assert the bytes/hash are **byte-for-byte
+  unchanged**. This detects actual index mutation directly — unlike the
+  bullet above (which only proves BR3's *reported result* is stable
+  across repeated calls), this test would fail if `inspectWorkingTree`
+  silently rewrote `.git/index` on disk as a side effect even while still
+  reporting the same semantic `WorkingTreeStatus` each time — exactly the
+  gap `GIT_OPTIONAL_LOCKS=0` (§19) exists to close.
+- **Environment-sanitization regressions — mandatory, new (Round 3 review
+  finding #2), four dedicated cases:**
+  - **(A) Inherited `GIT_DIR` cannot redirect repository inspection:**
+    with two real, unrelated fixture repositories on disk, set an
+    inherited `GIT_DIR` environment variable (in the *test process's*
+    own environment, not passed through any BR3 API parameter) pointing
+    at the second repository's `.git`, then call `resolveRepository`/
+    `inspectHead` with `projectRoot` set to the first repository. Assert
+    the result reflects the **first** repository (`projectRoot`'s own
+    HEAD SHA, branch, etc.), never the second — proving BR3's `env`
+    construction (§19) strips the inherited `GIT_DIR` before spawning
+    Git, rather than letting it pass through.
+  - **(B) Inherited `GIT_INDEX_FILE` cannot redirect working-tree
+    inspection:** analogous to (A), but with an inherited `GIT_INDEX_FILE`
+    pointing at a second repository's index, calling `inspectWorkingTree`
+    against the first repository's `projectRoot`. Assert the reported
+    `WorkingTreeEntry[]` reflects the first repository's own index/working
+    tree, never the second's.
+  - **(C) `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`-style
+    injected config has no effect:** first confirm, in the test's own
+    setup (not as part of asserting BR3's behavior), that this
+    environment-based config-injection mechanism genuinely works against
+    a bare `git config` invocation when those three variables are set
+    (proving the threat is real, not hypothetical); then call a BR3
+    function (e.g. `inspectHead`, whose §9/§10 upstream determination
+    reads `branch.<b>.remote`/`.merge` via `git config --get`) with those
+    same three variables set in the inherited test-process environment,
+    injecting a config value BR3 does not expect, and assert BR3's result
+    is unaffected — proving BR3's `env` construction (§19) strips these
+    before spawning Git.
+  - **(D) A fabricated global `core.excludesFile` does not change
+    untracked-path reporting:** with a fixture repository containing one
+    untracked file, and a fixture "global" gitconfig file (pointed at via
+    an inherited `GIT_CONFIG_GLOBAL`/`HOME`-style environment variable in
+    the test's own setup, never a real machine-wide config) declaring a
+    `core.excludesFile` that would exclude that untracked file, call
+    `inspectWorkingTree` twice — once with that fabricated global config
+    reachable in the inherited environment, once without — and assert
+    **identical** results both times (the untracked file reported in
+    both cases), proving BR3's own `GIT_CONFIG_GLOBAL=<null device>`
+    override (§19) neutralizes the inherited global config regardless of
+    what the surrounding environment supplies.
 
 ## 20a. Acceptance Criteria
 
@@ -1956,15 +2349,26 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   `--show-toplevel`) rather than relying on any BR3-side filesystem-shape
   precheck (§8, Round 2 review finding #1).
 - **B.** `inspectHead` correctly reports all three branch/HEAD states
-  (normal, detached, unborn) and all three upstream states (not
-  configured, configured with tracking ref present, configured with
-  tracking ref absent), with every classification derived from exit
-  codes and/or machine-readable output only — never from inspecting
+  (normal, detached, unborn) and all upstream states — not configured,
+  configured and resolving (both the remote-tracking and the
+  local-branch subcase), and configured but unresolvable (`ref: null`,
+  `sha: null`, `remote`/`branch` still populated — never a
+  fallback-constructed `refs/remotes/<remote>/<branch>` guess, for any of
+  the three configured-but-unresolvable shapes: ordinary remote-tracking,
+  custom-refspec, or local-branch upstream) — and correctly treats
+  "no remotes configured" as merely one way `branch.<b>.remote`/`.merge`
+  can be absent, never as an overriding rule that a local-branch
+  (`remote="."`) upstream with zero remotes configured is somehow not a
+  real upstream — with every classification derived from exit codes
+  and/or machine-readable output only — never from inspecting
   human-readable stderr text (§9, §10).
-- **C.** "Remote SHA" is precisely and only the local remote-tracking
-  ref's already-recorded SHA; no BR3 code path ever invokes `git fetch`
-  or otherwise contacts a network endpoint, proven by running the full
-  BR3 suite with network access disabled (§10, §20).
+- **C.** "Upstream SHA" is precisely and only whatever `@{upstream}`
+  itself already resolves to locally — the local remote-tracking ref's
+  already-recorded SHA for the ordinary/custom-refspec subcase, or the
+  other local branch's own tip for the local-branch-upstream subcase; no
+  BR3 code path ever invokes `git fetch` or otherwise contacts a network
+  endpoint, proven by running the full BR3 suite with network access
+  disabled (§9, §10, §20).
 - **D.** `inspectWorkingTree` returns a structured, per-path
   `WorkingTreeEntry[]` — never a single boolean — correctly
   distinguishing staged/unstaged/both-on-the-same-path/added/deleted/
@@ -1991,17 +2395,34 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   correctly derives `matchedVia` from each input's own `origin` field,
   correctly reports `..`-containing inputs/patterns via
   `invalidInputs`/`invalidPatterns` rather than throwing or silently
-  dropping them, and correctly implements the final picomatch feature
-  grammar (negation and extglobs disabled; brace expansion and bracket
-  expressions enabled) (§7a, §12, §16, §17).
+  dropping them, and correctly implements the final, complete picomatch
+  feature grammar (negation and extglobs disabled; `*`, `**`, `?`,
+  backslash-escaping, brace expansion, and bracket expressions all
+  enabled — §16, Round 3 review finding #4, Option A) (§7a, §12, §16,
+  §17).
 - **H.** Zero Git mutation occurs anywhere in the implementation — every
   Git subcommand string used is one of `status`, `diff`, `rev-parse`,
   `symbolic-ref`, `config` (read-only `--get` only), and no others (§5,
-  §6, §27).
+  §6, §27); **and** the read-only guarantee is genuinely mechanically
+  enforced, not merely a consequence of subcommand choice — `.git/index`
+  is byte-for-byte unchanged after `inspectWorkingTree` even when a
+  tracked file's mtime (but not content) changed beforehand, proven by
+  the dedicated index-mutation regression test (§20, Round 3 review
+  finding #1), via `GIT_OPTIONAL_LOCKS=0` (§19).
 - **I.** Every Git subprocess is invoked via `execFile` with an argv
   array — never a shell, never string concatenation — with the exact
   determinism `env`/flags (§19) applied at exactly one shared call site
-  (§18).
+  (§18); **and** that `env` is genuinely sanitized, not a wholesale
+  `process.env` spread — every inherited `GIT_*`-prefixed variable is
+  stripped via a prefix filter, with only BR3's own five controlled
+  `GIT_*` variables (`GIT_PAGER`, `GIT_TERMINAL_PROMPT`,
+  `GIT_OPTIONAL_LOCKS`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`)
+  re-added, and global (non-repository-local) Git config is neutralized
+  via `GIT_CONFIG_GLOBAL` pointed at a null device — proven by the four
+  dedicated environment-sanitization regression tests (§20, Round 3
+  review finding #2: inherited `GIT_DIR`, inherited `GIT_INDEX_FILE`,
+  `GIT_CONFIG_COUNT`-style injection, fabricated global
+  `core.excludesFile` — none of which may alter BR3's result).
 - **J.** A path that is not valid UTF-8 produces `MALFORMED_GIT_OUTPUT`
   for the containing operation — never silent corruption, never an
   uncaught decoding exception, and never a partial/filtered result
@@ -2245,6 +2666,27 @@ The independent reviewer must specifically examine, for BR3:
   whether the determinism env/flags (§19) are applied at exactly one
   shared call site, not duplicated (and potentially inconsistently
   applied) per file
+- Whether the shared exec helper's `env` (§18, §19) is genuinely
+  constructed by stripping every inherited `GIT_*`-prefixed variable
+  (via a prefix filter, not an enumerated blocklist) and re-adding only
+  BR3's own five controlled `GIT_*` variables — never a wholesale
+  `{ ...process.env }` spread — proven by the four dedicated real
+  regression tests (§20, Round 3 review finding #2): an inherited
+  `GIT_DIR` cannot redirect `resolveRepository`/`inspectHead` to a
+  different repository; an inherited `GIT_INDEX_FILE` cannot redirect
+  `inspectWorkingTree` to a different index; `GIT_CONFIG_COUNT`-style
+  environment-based config injection has no effect on any BR3 result;
+  and a fabricated global `core.excludesFile`, reachable via
+  `GIT_CONFIG_GLOBAL`, does not change `inspectWorkingTree`'s
+  untracked-path reporting — with repository-local Git config (e.g.
+  `branch.<b>.remote`/`.merge`) still correctly read in every case
+- Whether BR3's read-only guarantee is genuinely mechanically enforced
+  via `GIT_OPTIONAL_LOCKS=0` (§19, Round 3 review finding #1), not merely
+  a byproduct of which Git subcommands are invoked — proven by the
+  dedicated index-mutation regression test (§20) asserting `.git/index`'s
+  raw bytes are unchanged by `inspectWorkingTree` even when a tracked
+  file's mtime (not content) changed beforehand — a check that inspects
+  actual index bytes, not merely BR3's reported semantic result
 - Whether a ref string shaped like a Git command-line option (e.g.
   `--upload-pack=...`) passed as `DiffRequest.fromRef`/`.toRef` is
   genuinely rejected as `REF_NOT_FOUND` before ever reaching a `diff`
@@ -2264,10 +2706,22 @@ The independent reviewer must specifically examine, for BR3:
 - Whether `inspectHead`'s upstream resolution (§9, §10) uses
   `git rev-parse --verify -q @{upstream}` (and
   `--symbolic-full-name @{upstream}`) for tracking-ref resolution — never
-  a hand-constructed `refs/remotes/<remote>/<branch>` path — proven by a
-  real fixture using a custom `remote.<name>.fetch` refspec and a second
-  real fixture using a local-branch upstream (`branch.<name>.remote =
-  "."`), both resolving correctly
+  a hand-constructed `refs/remotes/<remote>/<branch>` path, including on
+  the failure path (i.e., a configured-but-unresolvable upstream produces
+  `ref: null`, not a fallback-constructed guess) — proven by a real
+  fixture using a custom `remote.<name>.fetch` refspec and a second real
+  fixture using a local-branch upstream (`branch.<name>.remote = "."`),
+  both resolving correctly, plus three further real fixtures — an
+  ordinary, a custom-refspec, and a local-branch upstream, each with its
+  resolution target subsequently deleted — each correctly producing
+  `ref: null`/`sha: null` with `remote`/`branch` still populated, never a
+  reconstructed path
+- Whether `inspectHead`'s "no upstream configured" determination (§10) is
+  genuinely derived only from `branch.<b>.remote`/`.merge` config-key
+  presence, never from "how many remotes exist" as an independent or
+  overriding signal — proven by a real fixture with zero remotes
+  configured but a local-branch upstream (`remote="."`) present, which
+  must report a genuinely configured, resolving `upstream`, not `null`
 - Whether every `execFile` call site in `packages/core/src/git/`
   (via the shared `internal/exec.ts` helper, §18) requests
   `encoding: "buffer"` — never the default lossy string decoding — and
@@ -2299,6 +2753,13 @@ The independent reviewer must specifically examine, for BR3:
 - Whether the `..`-rejection in `matchProtectedPaths` (§12, §17) is
   reachable and correctly reported via `invalidInputs`/`invalidPatterns`,
   not silently matched and not thrown
+- Whether `matchProtectedPaths`'s pattern grammar (§12, §16) is exactly
+  and completely the documented set — `*`, `**`, `?`, backslash-escaping,
+  bracket expressions, and brace expansion all genuinely functional, with
+  negation and extglobs genuinely disabled (matched literally, not
+  thrown, not silently no-op) — proven by dedicated fixtures for each,
+  including `?`'s never-crosses-`/` behavior and backslash-escape's
+  literal-match behavior specifically (Round 3 review finding #4)
 - Whether copy detection is genuinely disabled (`--find-copies` never
   passed) — confirmed by a fixture proving a copy-shaped change is
   reported as a plain `added` entry, not by reading the specification's
@@ -2314,11 +2775,11 @@ The independent reviewer must specifically examine, for BR3:
 - Whether the working-tree same-path-staged+unstaged case (§11) is
   genuinely represented as two separate entries, proven by a real fixture
   exercising it
-- Whether `inspectHead`'s "remote SHA" is genuinely never derived from a
+- Whether `inspectHead`'s "upstream SHA" (for either subcase —
+  remote-tracking or local-branch) is genuinely never derived from a
   network call — proven by running the full BR3 test suite with network
   access disabled (or an equivalent structural check) and confirming
-  every upstream-SHA test still passes using only already-local
-  remote-tracking refs
+  every upstream-SHA test still passes using only already-local refs
 - Whether `git status --porcelain=v2 -z --find-renames=50%
   --untracked-files=all --ignore-submodules=none` (§11, §19) and
   `git diff --name-status -z` (with the exact flags §13/§19 specify) are
