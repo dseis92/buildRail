@@ -2,8 +2,27 @@
   "name": "@buildrail/core",
   "version": "0.1.0",
   "private": true,
-  "description": "BuildRail provider-neutral governance engine. No functional implementation yet (BR0).",
+  "description": "BuildRail provider-neutral governance engine: config/state loading, schema validation, authorization policy, and the lifecycle transition engine.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true }); require('node:fs').rmSync('dist-tests', { recursive: true, force: true })\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:tests": "tsc -p tsconfig.test.json",
+    "test": "npm run build && npm run build:tests && node --test \"dist-tests/tests/**/*.test.js\""
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "typescript": "^5.9.3"
+  },
   "license": "Apache-2.0"
 }
