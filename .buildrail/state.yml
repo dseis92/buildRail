@@ -9,15 +9,15 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: FROZEN
-  development_phase: BR1
+  lifecycle_state: AUTHORIZED
+  development_phase: BR2
 
 authorization:
-  id: BR1
+  id: BR2
   type: feature
-  title: CLI Skeleton
-  status: completed
-  specification: .buildrail/specs/BR1-CLI-SKELETON.md
+  title: Governance Engine
+  status: authorized
+  specification: .buildrail/specs/BR2-GOVERNANCE-ENGINE.md
   granted_by: human
 
 candidate:
@@ -42,16 +42,16 @@ baselines:
     status: frozen
 
 # BR0 and BR1 have each been independently reviewed, approved, and frozen
-# at the SHAs recorded under `baselines`. No implementation authorization
-# is currently active. BR1 established the first real, executable
-# BuildRail CLI (packages/cli) — governance/state/config loading, Git
-# inspection, and verification remain unimplemented until later phases.
+# at the SHAs recorded under `baselines`. BR1 established the first real,
+# executable BuildRail CLI (packages/cli) — governance/state/config
+# loading, Git inspection, and verification remain unimplemented until
+# BR2 and later phases are implemented (BR2 implementation has not yet
+# started as of this authorization; see `authorization` above).
 completed_phases:
   - BR0
   - BR1
 
 planned_phases:
-  - BR2
   - BR3
   - BR4
   - BR5
