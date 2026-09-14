@@ -3249,18 +3249,46 @@ string-first one) — see each section for its own restatement.
    own argument parser to treat every subsequent argv entry as a
    positional revision specifier, never as a flag, closing the specific
    gap the previous draft's bare `--verify <ref>^{commit}` (with no
-   end-of-options marker) left open). Verified directly:
+   end-of-options marker) left open). **BR3 never adds a bare `--`
+   alongside `--end-of-options` — corrected, mandatory, Round 15 review
+   finding #4 (an earlier draft's own "Verified directly" example used
+   exactly that combination, `--end-of-options -- '...'^{commit}`, which
+   is a genuinely different, and broken, invocation shape: the bare `--`
+   there is not a substitute or reinforcement for `--end-of-options`, and
+   combining them causes `rev-parse` to fail even against a **valid**
+   ref, which means that example proved nothing about option-safety — it
+   merely used a command shape that also fails for legitimate input).**
+   Verified directly (a genuinely valid, option-shaped branch name,
+   created via plumbing to guarantee it is real and resolvable, not a
+   nonexistent string):
    ```
-   $ git rev-parse --verify --end-of-options main^{commit}
-   c350ff0f8469a4972e7626a239be55917aef4df3   # resolves normally
-   $ git rev-parse --verify --end-of-options -- '--upload-pack=x'^{commit}
-   fatal: Needed a single revision   # exit 128 — rejected, never
-                                       # reinterpreted as a flag
+   $ git checkout -q -b main2 && git commit --allow-empty -q -m x
+   $ COMMIT_SHA=$(git rev-parse HEAD)
+   $ git update-ref refs/heads/-foo "$COMMIT_SHA"
+   $ git rev-parse --verify '-foo^{commit}'
+   fatal: ambiguous argument '-foo^{commit}': unknown revision or path not in the working tree.
+   # exit 128 — bare --verify alone misparses -foo as an option
+   $ git rev-parse --verify --end-of-options '-foo^{commit}'
+   <COMMIT_SHA>   # exit 0 — succeeds, resolves the real, valid ref
+   $ git rev-parse --verify --end-of-options -- '-foo^{commit}'
+   fatal: Needed a single revision   # exit 128 — FAILS even though
+                                       # -foo is a genuinely valid,
+                                       # existing ref; proves the bare
+                                       # `--` combination is wrong for
+                                       # this invocation shape, not a
+                                       # stronger safety measure
    ```
-   If either fails to resolve: `REF_NOT_FOUND`, with `details` naming
-   which of the two refs failed. **This validation happens before any
-   diff command runs at all** — per §19's requirement that caller-provided
-   refs never become arbitrary Git options.
+   This is stronger evidence than a nonexistent, merely option-shaped
+   string (e.g. `--upload-pack=x`, retained below purely as an
+   additional, independent rejected-input case, never as the
+   option-safety proof itself): it demonstrates BR3's exact, normative
+   command (`--end-of-options`, with **no** additional bare `--`)
+   correctly accepts a **genuinely valid** option-shaped ref rather than
+   merely rejecting an invalid one, which a broken command shape could
+   also do for the wrong reason. If either resolution fails: `REF_NOT_FOUND`,
+   with `details` naming which of the two refs failed. **This validation
+   happens before any diff command runs at all** — per §19's requirement
+   that caller-provided refs never become arbitrary Git options.
 2. **Resolved SHAs are always returned, and are the only thing the
    subsequent `diff` invocation ever receives (made explicit — corrects
    Round 1 review finding #3):** `DiffResult.fromSha`/`toSha` are the
@@ -3285,13 +3313,47 @@ string-first one) — see each section for its own restatement.
    then Round 9 review finding #5 (the filter-scan gate is removed
    entirely from `inspectDiff` — see below); further revised — corrects
    Round 9 review finding #1, pinning rename-search-limit semantics;
-   `core.fsmonitor` is not relevant to `diff`, which does not consult
-   it):**
-   `git diff --no-color --no-ext-diff -z --name-status
-   --find-renames=<threshold> -l0 <fromSha> <toSha>` (threshold per
-   §14). `--name-status` (not the default patch format) gives exactly a
-   status-letter-plus-path(s) record per changed file, `-z` NUL-delimits
-   records and (for renames) the two-path pairs within a record.
+   further revised — corrects Round 15 review finding #1, pinning
+   submodule/gitlink visibility; `core.fsmonitor` is not relevant to
+   `diff`, which does not consult it):**
+   `git diff --no-color --no-ext-diff --ignore-submodules=none -z
+   --name-status --find-renames=<threshold> -l0 <fromSha> <toSha>`
+   (threshold per §14). `--name-status` (not the default patch format)
+   gives exactly a status-letter-plus-path(s) record per changed file,
+   `-z` NUL-delimits records and (for renames) the two-path pairs within
+   a record.
+   - **`--ignore-submodules=none` — new, mandatory, Round 15 review
+     finding #1.** The identical repository-local-config hazard §11
+     already documents and defends against for `inspectWorkingTree`
+     (`--ignore-submodules=none` there) applies equally to `inspectDiff`
+     and was, until this correction, left unpinned here: Git's
+     `diff.ignoreSubmodules` config value (independently of
+     `--ignore-submodules` on the command line, which was previously
+     omitted from this exact invocation) can suppress a changed
+     gitlink/submodule path from `diff --name-status` output entirely.
+     **Verified directly:** a fixture repository containing a gitlink
+     whose recorded submodule commit changes between commit A and commit
+     B — under the ordinary, pre-correction BR3 `diff` invocation (no
+     `--ignore-submodules` flag at all), the changed gitlink path is
+     correctly reported (`M\0sub\0`); with repository-local config
+     `git config diff.ignoreSubmodules all` set, the identical,
+     unmodified pre-correction command instead emits **nothing** for
+     that path — a real, deterministic-fact failure: repository-local
+     configuration BR3 does not control silently removes a changed path
+     from `DiffResult`, exactly the kind of environment-dependent
+     behavior §19's determinism guarantee exists to eliminate. Adding
+     `--ignore-submodules=none` to the command line restores the correct
+     `M\0sub\0` report regardless of what `diff.ignoreSubmodules`
+     (or `submodule.<name>.ignore`) a repository's local config
+     declares — the command-line flag always takes precedence over the
+     config default. This mirrors `inspectWorkingTree`'s already-correct,
+     identical `--ignore-submodules=none` policy (§11) exactly: `diff`
+     must report gitlink changes between its two committed trees
+     unconditionally, since `inspectDiff`'s own contract (§2, §7a) makes
+     no distinction between an ordinary file change and a submodule
+     pointer change — both are real, deterministic facts about what
+     differs between `fromSha` and `toSha`, and neither may be silently
+     suppressed by config BR3 does not author.
    - **`-l0` — new, mandatory, Round 9 review finding #1.** The
      identical `diff.renameLimit`/`status.renameLimit` hazard §11
      documents for `inspectWorkingTree` applies equally to `inspectDiff`
@@ -3331,10 +3393,10 @@ string-first one) — see each section for its own restatement.
      **Verified directly** that this gate is unnecessary in the first
      place: a fixture with a `.gitattributes` rule assigning a real,
      marker-writing clean filter, and two real commits whose diff this
-     exact `git diff --no-color --no-ext-diff -z --name-status
-     --find-renames=<threshold> -l0 <fromSha> <toSha>` invocation
-     computes — the marker script is **never invoked**, and the
-     `--name-status` result is correct, for the same reason `--no-ext-diff`
+     exact `git diff --no-color --no-ext-diff --ignore-submodules=none
+     -z --name-status --find-renames=<threshold> -l0 <fromSha> <toSha>`
+     invocation computes — the marker script is **never invoked**, and
+     the `--name-status` result is correct, for the same reason `--no-ext-diff`
      already, separately, defends against a different external-tool
      class: a commit-vs-commit `diff --name-status` compares **already-stored
      Git objects** (the two commits' own tree/blob contents), which
@@ -4281,7 +4343,14 @@ in-process mechanism this helper itself performs.
          attribute-resolution query with no content-transformation
          side effect; this is what makes it safe to run
          unconditionally, on every tracked path, before deciding whether
-         `status`/`diff` may proceed at all.
+         `inspectWorkingTree`'s own `status` invocation may proceed —
+         **corrected, mandatory, Round 15 review finding #3 (an earlier
+         draft of this bullet paired `status`/`diff` here, as though this
+         scan gates both; it never has, and never gates `inspectDiff` at
+         all — see this scan's own scope statement in step 3 above and
+         §13's Round 9 review finding #5 independence correction, both of
+         which already establish `inspectDiff` is never gated by this or
+         any other filter-attribute scan)**.
       5. **`GIT_CONFIG_GLOBAL=<null device>` is preserved, unmodified,
          for the actual BR3 inspection commands (`status`/`diff`
          themselves) — this correction does not re-enable arbitrary
@@ -6398,9 +6467,26 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   returned sorted per §7a's exact `path`/`kind`/`oldPath` key order
 - Rename below threshold → delete + add, not a rename
 - Nonexistent ref → `REF_NOT_FOUND`
-- A ref string shaped like a Git option (e.g. `--upload-pack=x`) passed
-  as `fromRef`/`toRef` → rejected as `REF_NOT_FOUND` (not interpreted as
-  a flag) — the explicit command-injection-shaped regression test
+- A nonexistent, option-shaped ref string (e.g. `--upload-pack=x`)
+  passed as `fromRef`/`toRef` → rejected as `REF_NOT_FOUND` (not
+  interpreted as a flag) — a rejected-input regression test
+- **A genuinely valid, option-shaped ref accepted safely — mandatory,
+  new, Round 15 review finding #4 (the stronger proof; an earlier
+  draft's only option-safety test used a nonexistent string, which
+  cannot distinguish "correctly resolved a real ref" from "failed for
+  any reason at all," and an earlier draft's own normative example
+  additionally used a broken `--end-of-options --` combination that
+  fails even against valid input):** a real branch `refs/heads/-foo`
+  created via `git update-ref` (plumbing, not `git branch`, to guarantee
+  the option-shaped name regardless of `git branch`'s own name
+  validation), pointing at a real commit → first confirm, in the test's
+  own setup, that a bare `git rev-parse --verify '-foo^{commit}'` (no
+  `--end-of-options`) genuinely misparses `-foo` and fails; then confirm
+  BR3's exact, normative form — `--end-of-options` with **no** additional
+  bare `--` — succeeds and returns the expected commit SHA; then call
+  `inspectDiff(projectRoot, { fromRef: "-foo", toRef: <other-ref> })`
+  and assert it **successfully resolves** `-foo` to that exact commit
+  SHA, never treating it as a Git option and never rejecting it
 - Copy detection is confirmed **disabled**: a new file with content
   closely matching an existing, unrelated, unchanged file is reported as
   a plain `added` entry, never a `copied`-shaped result (since no such
@@ -6424,6 +6510,24 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
     config key entirely absent — asserts `inspectDiff`'s results are
     **deep-equal** in both cases, proving the explicit `-l0` override
     makes the local config value irrelevant to BR3's own output.
+- **Submodule/gitlink visibility pinning (`--ignore-submodules=none`) —
+  mandatory, new, Round 15 review finding #1:** a fixture repository
+  containing a gitlink whose recorded submodule commit genuinely changes
+  between commit A and commit B, with repository-local config `git
+  config diff.ignoreSubmodules all` set → first confirm, in the test's
+  own setup, that the unmitigated `git diff --no-color --no-ext-diff -z
+  --name-status --find-renames=<threshold> -l0 <fromSha> <toSha>` form
+  (without `--ignore-submodules=none`) genuinely emits **nothing** for
+  the changed gitlink path under this exact fixture and config
+  (establishing the suppression is real); then call
+  `inspectDiff(projectRoot, { fromRef: A, toRef: B })` and assert the
+  changed submodule/gitlink path **is** returned, as a `DiffChange` with
+  `kind: "modified"` and the correct `path`, proving BR3's own
+  `--ignore-submodules=none` flag overrides the repository-local
+  `diff.ignoreSubmodules=all` default. A second assertion in the same
+  fixture confirms ordinary, non-submodule file changes elsewhere in the
+  identical commit pair remain correctly reported, unaffected by this
+  correction.
 
 **Protected-path matching (§12, §16, §17) — pure, no Git/filesystem
 fixture needed; test bullets updated for the final `ProtectedPathCheckInput`-based
@@ -6689,8 +6793,9 @@ signature, corrects Round 1 review finding #4**
     driver (rather than a `clean`/`process` filter) to a path touched by
     the diff, with a real, marker-writing `textconv` helper script, then
     calling `inspectDiff(A, B)` with the exact, documented
-    `--no-color --no-ext-diff -z --name-status --find-renames=<threshold>
-    -l0` invocation → the marker is **never** created, confirming
+    `--no-color --no-ext-diff --ignore-submodules=none -z --name-status
+    --find-renames=<threshold> -l0` invocation → the marker is **never**
+    created, confirming
     `--no-ext-diff`/`--name-status` genuinely prevent this specific
     invocation from invoking a configured `textconv` helper.
   - **(J) Per-function ownership, explicit cross-check on one shared
@@ -7143,10 +7248,16 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   change made to the working tree after both `fromSha`/`toSha` already
   exist as commits does not alter `inspectDiff`'s result (§13, Round 9
   review finding #5).
-- **F.** A flag-shaped ref string (e.g. `--upload-pack=x`) passed as
-  `DiffRequest.fromRef`/`.toRef` is genuinely rejected as `REF_NOT_FOUND`
-  — proven by an actual regression test constructing exactly this input,
-  not merely documented as rejected (§13, §18, §20).
+- **F.** A nonexistent, flag-shaped ref string (e.g. `--upload-pack=x`)
+  passed as `DiffRequest.fromRef`/`.toRef` is genuinely rejected as
+  `REF_NOT_FOUND` — proven by an actual regression test constructing
+  exactly this input, not merely documented as rejected; **and,** the
+  stronger proof — Round 15 review finding #4 — a genuinely **valid**,
+  option-shaped ref (a real `refs/heads/-foo` created via `git
+  update-ref`) is correctly **accepted and resolved**, never rejected or
+  misinterpreted as a flag, by BR3's exact normative
+  `--end-of-options`-with-no-additional-bare-`--` command form (§13,
+  §18, §20).
 - **G.** `matchProtectedPaths` is genuinely pure (no Git access, no
   filesystem access — confirmed by static inspection of its module's
   imports, not only by behavioral testing), uses the single, final
@@ -7527,15 +7638,17 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   `inspectWorkingTree` call's own internal `check-attr`-then-`status`
   subprocess sequence, and does not claim an atomic filesystem snapshot
   across those two separate Git processes (§6, §18, §20).
-- **AB.** — new, Round 10 review finding #4. Exactly one canonical
-  `status` invocation (`git -c core.fsmonitor= -c status.renameLimit=0
-  status --porcelain=v2 -z --find-renames=50% --untracked-files=all
-  --ignore-submodules=none`) and exactly one canonical `diff` invocation
-  (`git diff --no-color --no-ext-diff -z --name-status
+- **AB.** — new, Round 10 review finding #4, revised, Round 15 review
+  finding #1. Exactly one canonical `status` invocation (`git -c
+  core.fsmonitor= -c status.renameLimit=0 status --porcelain=v2 -z
+  --find-renames=50% --untracked-files=all --ignore-submodules=none`)
+  and exactly one canonical `diff` invocation (`git diff --no-color
+  --no-ext-diff --ignore-submodules=none -z --name-status
   --find-renames=<threshold> -l0 <fromSha> <toSha>`) are stated
   identically everywhere this document names "the exact command" — §11,
   §13, §19, §20, and §27 no longer contain a stale restatement omitting
-  `-c status.renameLimit=0` or `-l0`; and the command allowlist
+  `-c status.renameLimit=0`, `-l0`, or (Round 15) `diff`'s
+  `--ignore-submodules=none`; and the command allowlist
   (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`
   (`--get`/`--get-all` only — `--get-regexp` removed entirely, Round 14
   review finding #4), `ls-files`, `check-attr`) is stated identically
@@ -7645,6 +7758,38 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   that report. The Round 13 trust-boundary conclusion itself (no shell
   requested, no shell interpolation, trusted-but-unauthenticated resolved
   executable) is unchanged (§6, §8, §18).
+- **AL.** — new, Round 15 review finding #1. `inspectDiff`'s exact,
+  canonical `diff` invocation includes `--ignore-submodules=none`,
+  identically restated everywhere the command appears (§13, §19, §20,
+  §20a, §20b, §27) — proven by the dedicated fixture where repository-local
+  `diff.ignoreSubmodules=all` config is confirmed (in test setup) to
+  suppress a changed gitlink path under the unmitigated command form,
+  while BR3's actual `--ignore-submodules=none`-bearing invocation
+  correctly reports it as a `modified` `DiffChange` (§13, §20).
+- **AM.** — new, Round 15 review finding #2. No acceptance criterion or
+  independent-review bullet anywhere in this specification restates
+  Round 13's withdrawn "configured but currently unresolvable because
+  the branch is unborn" assumption as current, normative behavior —
+  every such passage reflects Round 14's corrected contract: unborn
+  status alone never forces `ref`/`sha` null, only a genuine `@{upstream}`
+  resolution failure does (§9, §10, §20, §27).
+- **AN.** — new, Round 15 review finding #3. §18's `check-attr`
+  filter-safety scan is described, everywhere it appears, as gating only
+  `inspectWorkingTree`'s own `status` invocation — no remaining sentence
+  pairs `status`/`diff` as though both are gated by this scan;
+  `inspectDiff`'s independence from this scan (already established,
+  §13's Round 9 review finding #5 correction) is unchanged and
+  unweakened (§18, §20, §27).
+- **AO.** — new, Round 15 review finding #4. §13's `inspectDiff`
+  ref-resolution "Verified directly" example, and every restatement of
+  it, use BR3's exact normative form — `--end-of-options` with **no**
+  additional bare `--` — demonstrated against a genuinely valid,
+  option-shaped ref (`refs/heads/-foo`, created via `git update-ref`),
+  proving BR3 correctly accepts and resolves a real option-shaped ref
+  rather than merely rejecting a nonexistent one. Zero remaining example
+  anywhere in this document combines `--end-of-options` with an
+  additional bare `--` as though that combination were BR3's own
+  command or a stronger safety measure (§13, §20).
 
 ## 20b. Implementation Plan
 
@@ -8625,11 +8770,12 @@ The independent reviewer must specifically examine, for BR3:
   --ignore-submodules=none` (§11, §19, Round 9 review finding #1's
   `-c status.renameLimit=0` included — corrected here, Round 10 review
   finding #4, since an earlier draft of this exact bullet omitted it) and
-  `git diff --no-color --no-ext-diff -z --name-status
-  --find-renames=<threshold> -l0` (with the exact flags §13/§19 specify,
-  including `-l0`) are the actual commands invoked — not `--porcelain`
-  (v1), not a partial flag set, and not a patch-format diff requiring
-  hunk-parsing
+  `git diff --no-color --no-ext-diff --ignore-submodules=none -z
+  --name-status --find-renames=<threshold> -l0` (with the exact flags
+  §13/§19 specify, including `-l0` and, Round 15 review finding #1,
+  `--ignore-submodules=none`) are the actual commands invoked — not
+  `--porcelain` (v1), not a partial flag set, and not a patch-format
+  diff requiring hunk-parsing
 - Whether BR3 adds no new CLI command and does not modify
   `packages/cli/src/commands/status.ts` or any other existing CLI
   command's behavior (§21)
@@ -8684,15 +8830,27 @@ The independent reviewer must specifically examine, for BR3:
   never mischaracterizes a tag or custom-namespace ref as a branch
 - **Unborn-branch configured-upstream semantics and porcelain v2
   submodule-field precision — new, mandatory, Round 13 review finding
-  #4:** whether a symbolic, unborn branch with `branch.<name>.remote`/
-  `.merge` genuinely configured reports a non-null, genuinely configured
-  `UpstreamInfo` (`ref: null`, `sha: null`) rather than an
-  undifferentiated `upstream: null` — proven by the dedicated fixture
-  (§9, §20) configuring both keys before any commit exists, confirming
-  "configured but currently unresolvable because the branch is unborn"
-  is represented identically to every other configured-but-unresolvable
-  shape this specification already defines, never conflated with "not
-  configured"; **and** whether §11's porcelain v2 record-layout
+  #4; upstream half corrected again, mandatory, Round 15 review finding
+  #2 (this bullet previously restated Round 13's own since-withdrawn
+  `ref: null`/`sha: null` assumption verbatim, contradicting §9/§10's
+  and this document's own AG's Round 14 correction — fixed here rather
+  than left as a stale duplicate):** whether a symbolic branch — normal
+  or unborn — with `branch.<name>.remote`/`.merge` genuinely configured
+  reports a non-null, genuinely configured `UpstreamInfo` rather than an
+  undifferentiated `upstream: null`, with the identical `@{upstream}`
+  resolution procedure attempted regardless of unborn status —
+  `ref`/`sha` populated whenever that resolution genuinely succeeds
+  (which requires only that the *configured target* exists, never that
+  the current branch itself has any commits), and `null` only on a
+  genuine resolution failure, **never** merely because the branch is
+  unborn — proven by the dedicated fixture pair (§9, §20): one unborn
+  branch whose configured upstream target genuinely exists
+  (`ref`/`sha` both populated) and one whose configured target does not
+  (`ref`/`sha` both null), confirming "configured but currently
+  unresolvable" is represented identically to every other
+  configured-but-unresolvable shape this specification already defines,
+  never conflated with "not configured," and never assumed from unborn
+  status alone; **and** whether §11's porcelain v2 record-layout
   description correctly treats `<sub>` (the submodule marker) as its own
   independent, separate field from `<XY>` — never described as residing
   within or merely "adjacent to" `<XY>` in a way that could be
@@ -8769,6 +8927,49 @@ The independent reviewer must specifically examine, for BR3:
   executable is a trusted environment dependency, BR3 does not
   authenticate the Git executable, and BR3 does not claim the trusted
   executable can never itself launch an interpreter or subprocess
+- **`inspectDiff` submodule/gitlink visibility pinning
+  (`--ignore-submodules=none`) — new, mandatory, Round 15 review finding
+  #1:** whether BR3's exact, canonical `diff` invocation includes
+  `--ignore-submodules=none` everywhere it is restated (§13, §19, §20,
+  §20a, §20b, §27), and whether the dedicated fixture (§20) proves
+  repository-local `diff.ignoreSubmodules=all` config would otherwise
+  silently suppress a changed gitlink path from `DiffResult` (confirmed
+  in the test's own setup against the unmitigated command form) while
+  BR3's actual `inspectDiff` call correctly reports it as a `modified`
+  `DiffChange`, with ordinary non-submodule diff behavior unaffected
+- **Withdrawal of the stale Round 13 unborn-upstream acceptance/review
+  text — new, mandatory, Round 15 review finding #2:** whether every
+  acceptance criterion and independent-review bullet describing unborn-
+  branch upstream semantics (§20a, §27) reflects Round 14's corrected
+  contract — unborn status never by itself forces `ref`/`sha` null; only
+  a genuine `@{upstream}` resolution failure does — with **zero**
+  remaining restatement of Round 13's withdrawn "configured but
+  currently unresolvable because the branch is unborn" framing presented
+  as current, normative behavior anywhere in the document (a historical
+  mention of the withdrawn assumption, explicitly marked as withdrawn
+  and false, remains acceptable; a normative restatement of it does not)
+- **`check-attr` scope precision — `inspectWorkingTree`/`status` only,
+  never `diff` — new, mandatory, Round 15 review finding #3:** whether
+  §18's filter-safety mechanism is described, everywhere it appears, as
+  gating only `inspectWorkingTree`'s own `status` invocation — with no
+  remaining sentence pairing `status`/`diff` as though both are gated by
+  the `check-attr` scan — while continuing to state, unchanged,
+  `inspectDiff`'s already-correct independence (§13's Round 9 review
+  finding #5 correction): `check-attr` is never invoked at all as part
+  of `inspectDiff`, proven structurally, not merely by the scan's result
+  happening not to matter
+- **Option-safety proof uses a genuinely valid ref, with no extra bare
+  `--` — new, mandatory, Round 15 review finding #4:** whether §13's
+  `inspectDiff` ref-resolution "Verified directly" example, and every
+  test/acceptance-criterion restatement of it (§20, §20a), use BR3's
+  exact normative form (`--end-of-options`, with **no** additional bare
+  `--`) against a genuinely valid, option-shaped ref created via `git
+  update-ref` (e.g. `refs/heads/-foo`) — proving BR3 correctly accepts
+  and resolves real option-shaped refs, not merely rejects a nonexistent
+  one — with **zero** remaining example anywhere in the document
+  combining `--end-of-options` with an additional bare `--`, a
+  combination independently verified to fail even against a valid ref
+  and therefore incapable of proving option-safety
 - Whether test evidence is real (tests actually run against real,
   ephemeral, temporary Git repositories — not mocked Git command output)
 
