@@ -981,9 +981,91 @@ first, using only machine-readable facts:
            positive ref-storage-format check added to `resolveRepository`'s
            main algorithm itself — see step 5b below, immediately after
            the object-format check (step 5a).
+     - **If neither shape is present at `projectRoot` itself, check the
+       ancestor chain before concluding `NOT_A_GIT_REPOSITORY` — new,
+       mandatory, Round 16 review finding #4 (an earlier draft of this
+       classifier checked only `projectRoot` itself, never accounting for
+       Git's own ordinary parent-directory repository discovery, which
+       step 2's authoritative `--is-bare-repository` invocation itself
+       already relies on).** `git rev-parse --is-bare-repository`
+       normally walks up from `cwd` to find the enclosing repository — a
+       `projectRoot` nested inside a real repository's own working tree
+       (e.g. `projectRoot = /repo/sub`, with the real repository rooted
+       at `/repo`) is genuinely, truthfully inside a Git repository, even
+       though `/repo/sub` itself has neither candidate shape. **Verified
+       directly:** a real repository at `/repo` with its own
+       `/repo/.git/config` deliberately malformed (the identical
+       unterminated-`[section` technique already used above), and
+       `projectRoot` set to a plain, non-repository subdirectory
+       `/repo/sub` (no `/repo/sub/.git` of any kind) — `git
+       rev-parse --is-bare-repository` run with `cwd=/repo/sub` fails
+       with exit 128 (Git's own discovery walks up to `/repo`, finds the
+       real repository, then fails reading its malformed `config`); at
+       `projectRoot` itself, neither the non-bare shape
+       (`/repo/sub/.git` — absent) nor the bare shape
+       (`/repo/sub/HEAD`+`objects/`+ref-storage — absent) is present, so
+       the pre-Round-16 classifier above would incorrectly conclude
+       `NOT_A_GIT_REPOSITORY` — **false**, since `projectRoot` is
+       demonstrably inside a real repository; Git was merely unable to
+       inspect it successfully. **The corrected check:** walk
+       `projectRoot`'s own ancestor chain (`path.dirname`, repeated, up
+       to and including the filesystem root — the identical directory
+       Git's own repository discovery would itself traverse), and at
+       each ancestor, apply the **identical** non-bare-shape check
+       already defined above (`<ancestor>/.git` exists, as file or
+       directory, with the same `HEAD`-entry shape discipline when it is
+       a directory) — **ancestor-chain discovery only ever looks for the
+       non-bare shape, never the bare shape**, since a bare repository is
+       never itself an ancestor directory of some other, different
+       `projectRoot` in the way a non-bare repository's root can be (a
+       bare repository has no working tree for a `projectRoot` to be
+       nested inside in the first place). **If a plausible ancestor
+       repository marker is found:** `resolveRepository` cannot
+       positively distinguish "this ancestor repository is real and
+       healthy, but `projectRoot` itself is simply not inside it
+       correctly" from "this ancestor repository is real but itself
+       malformed" from a filesystem check alone — but it does not need
+       to, because either way, Git already, authoritatively, failed
+       before establishing a toplevel, and a repository marker genuinely
+       exists in the discovery ancestry. The correct classification is
+       `GIT_COMMAND_FAILED` (**not** `NOT_A_GIT_REPOSITORY`, and,
+       critically, **not** `PROJECT_ROOT_MISMATCH` either) — `details`
+       naming the ancestor path where the marker was found, for caller
+       diagnosis. **Why not `PROJECT_ROOT_MISMATCH`:** that code is
+       reserved exclusively for the healthy path — Git successfully,
+       authoritatively resolves a real `--show-toplevel`, and that
+       resolved toplevel differs from `projectRoot` (§8, below) — a case
+       that requires Git to have actually, successfully told BR3 what the
+       real toplevel is. Here, Git failed *before* `--show-toplevel`
+       could ever run, let alone succeed — BR3 knows a real repository
+       marker exists somewhere in the discovery ancestry, but cannot
+       truthfully claim to know the exact repository root Git would have
+       authoritatively accepted had the repository been healthy, so it
+       must not claim `PROJECT_ROOT_MISMATCH`'s more specific meaning.
+       **If no ancestor marker is found anywhere up to the filesystem
+       root:** this is a genuine plain non-Git directory, not nested
+       inside anything Git would itself have discovered →
+       `NOT_A_GIT_REPOSITORY`, exactly as below. **The same reasoning
+       applies to an ancestor repository Git cannot inspect for another
+       already-recognized reason, such as dubious ownership (above),
+       where practical** — the ancestor-marker check is purely
+       filesystem-shape-based and does not depend on knowing *why* Git's
+       own discovery ultimately failed, only that a real repository
+       marker exists somewhere between `projectRoot` and the filesystem
+       root. This ancestor-chain check runs **only** as this
+       already-existing fallback's own extension — it does not run before
+       step 2's authoritative Git invocation, does not change when this
+       fallback itself runs (only after step 2 has already, authoritatively,
+       failed), and does not reintroduce any early, non-authoritative
+       precheck of any kind (the Round 2 correction removing the original
+       `<projectRoot>/.git`-existence precheck is fully preserved — this
+       check exists exclusively inside the post-failure secondary
+       classifier, never before it).
      - If **neither** the non-bare shape **nor** the bare shape is
-       present: this is a genuine plain non-Git directory →
-       `NOT_A_GIT_REPOSITORY` (unchanged from before).
+       present at `projectRoot` itself, **and** no plausible ancestor
+       repository marker is found in the chain above: this is a genuine
+       plain non-Git directory → `NOT_A_GIT_REPOSITORY` (unchanged from
+       before).
      - If **either** shape is present (non-bare `<projectRoot>/.git`, or
        bare `projectRoot/HEAD`+`objects/`+(`refs/` or
        `reftable/tables.list`)) but the authoritative
@@ -2623,10 +2705,11 @@ override described in §18; further revised — corrects Round 6 review
 finding #1, replacing the withdrawn filter-driver suppression overrides
 with a pre-invocation discovery-and-refuse gate; further revised —
 corrects Round 9 review finding #1, pinning rename-search-limit
-semantics):**
+semantics; further revised — corrects Round 16 review finding #2,
+pinning `status.showStash`):**
 
 ```
-git -c core.fsmonitor= -c status.renameLimit=0 status --porcelain=v2 -z --find-renames=50% --untracked-files=all --ignore-submodules=none
+git -c core.fsmonitor= -c status.renameLimit=0 -c status.showStash=false status --porcelain=v2 -z --find-renames=50% --untracked-files=all --ignore-submodules=none
 ```
 
 run with `cwd` at `projectRoot`, **and only ever run at all once §18's
@@ -2640,16 +2723,42 @@ Round 7 review finding #4; this replaces Round 4/5's now-withdrawn `-c
 filter.<name>.clean=`/`-c filter.<name>.process=` suppression overrides,
 which must not appear in this command, and supersedes relying on
 config-enumeration alone, which Round 7 proved insufficient against a
-globally-defined driver). The `-c core.fsmonitor=` and `-c
-status.renameLimit=0` overrides are always present, unconditionally, for
-both the superproject and every initialized submodule Git itself
-inspects internally during this call. This exact invocation — verified
-to accept all five `status`-level flags together without error — is what
-§18 (process execution safety), §19 (determinism), §20 (test plan), and
-§27 (independent review) all reference; no section states a different or
-partial form of this command. Each `status`-level flag is individually
-required, not incidental:
+globally-defined driver). The `-c core.fsmonitor=`, `-c
+status.renameLimit=0`, and `-c status.showStash=false` overrides are
+always present, unconditionally, for both the superproject and every
+initialized submodule Git itself inspects internally during this call.
+This exact invocation — verified to accept all six `status`-level flags
+together without error — is what §18 (process execution safety), §19
+(determinism), §20 (test plan), and §27 (independent review) all
+reference; no section states a different or partial form of this
+command. Each `status`-level flag is individually required, not
+incidental:
 
+- **`-c status.showStash=false` — new, mandatory, Round 16 review finding
+  #2.** Repository-local config `status.showStash=true` causes Git's
+  porcelain v2 `status` output to include an additional, non-path header
+  record — `# stash <N>\0` — reporting the current stash count, which
+  is **not** one of the path/status record shapes §11's parser contract
+  otherwise recognizes. **Verified directly:** a fixture repository with
+  one real stash entry and repository-local `status.showStash=true` set
+  — BR3's exact, pre-correction `status` invocation genuinely emits a
+  `# stash 1\0` record interleaved with the ordinary NUL-delimited
+  path/status records. Since BR3's public `WorkingTreeStatus`/
+  `WorkingTreeEntry` model (§7a) has no representation for stash state at
+  all, and this specification's own parser contract treats any
+  unrecognized porcelain v2 record shape as `MALFORMED_GIT_OUTPUT` (§13,
+  §17), an ordinary, repository-local config setting a caller does not
+  control — and BR3 never authors — could otherwise cause a
+  perfectly healthy repository to fail working-tree inspection entirely.
+  `-c status.showStash=false` (a per-invocation `-c` override, the
+  identical mechanism already used for `core.fsmonitor`/
+  `status.renameLimit`) unconditionally suppresses the `# stash` header
+  record regardless of what `status.showStash` a repository's local
+  config declares, restoring deterministic, stash-count-independent
+  behavior — the simpler, v0.1-appropriate design, chosen over teaching
+  the parser to additionally recognize and discard an unmodeled `#`
+  header record, since stash state is not, and is not planned to become,
+  part of BR3's public contract.
 - **`-c status.renameLimit=0` — new, mandatory, Round 9 review finding
   #1.** A fixed `--find-renames=50%` similarity threshold alone does
   **not** make rename classification deterministic: Git separately caps
@@ -2742,7 +2851,7 @@ required, not incidental:
 | `2 .R ... <score> <path>\0<origPath>\0` (unstaged rename) | `unstaged_rename` (with `oldPath`, `similarity` from `<score>`) — **corrected, Round 6 review finding #6: no longer under-classified; reachability corrected, Round 7 review finding #2.** An earlier draft of this specification represented this record as a plain `unstaged_modify` on the new path, deliberately discarding the `oldPath`/`similarity` data this exact porcelain v2 record type already carries in the identical positions as the staged-rename record above. `unstaged_rename` remains a first-class `WorkingTreeEntryKind` (§7a), populated identically to `staged_rename`, whenever BR3's own documented `status` invocation (§11) actually emits this record. **A plain, ordinary filesystem rename with no accompanying index operation does *not*, by itself, reliably produce `2 .R`** — this earlier draft's implied reachability claim ("a plain filesystem rename... causes Git to emit `2 .R`") is corrected: **verified directly**, starting from a committed, tracked `old.txt` with no other changes, a plain `mv old.txt new.txt` with zero index operations, under BR3's exact `status` invocation, instead produces two independent records — `1 .D ... old.txt` (`unstaged_delete`) and `? new.txt` (`untracked`) — **never** `2 .R`. Porcelain v2's unstaged-rename detection requires the new path to already be represented in the index in some form for Git's rename-pairing heuristic to have anything to pair the deletion against; a genuinely untracked new path gives Git no such pairing signal. **A real, reachable `2 .R` state was independently verified** via `mv old.txt new.txt` followed by `git add -N new.txt` (an intent-to-add index entry — no content staged, the change remains fully unstaged) — BR3's exact `status` invocation against that state emits `2 .R ... R100 new.txt\0old.txt\0`, confirming `unstaged_rename` is genuinely reachable, just not via the naive "plain rename" construction an earlier draft implied. §11/§14/§20/§27 are corrected accordingly: BR3 reports whatever Git actually emits for a given repository state and never synthesizes a rename relationship Git itself did not provide — a plain, unstaged, non-intent-to-added filesystem rename is correctly, truthfully reported as `unstaged_delete`(old) + `untracked`(new), two independent facts, not a rename. |
 | `u <xy> ... <path>` (unmerged) | `conflicted` |
 | `? <path>` | `untracked` |
-| `1 <XY> <sub> ...` where `<sub>` is `S<c><m><u>` (a separate, dedicated field — never inside `<XY>` itself; see §11's submodule-field correction, Round 13 review finding #4B) | (combined with the base kind derived from `<XY>` above) `submodule` populated per §11's submodule handling |
+| `1 <XY> <sub> ...` / `2 <XY> <sub> ...` / `u <XY> <sub> ...` — every porcelain v2 record type that carries the dedicated `<sub>` field, not type `1` alone — where `<sub>` is `S<c><m><u>` (a separate, dedicated field, present at its own fixed position in each of these three record types — never inside `<XY>` itself; see §11's submodule-field correction, Round 13 review finding #4B, extended to types `2`/`u`, Round 16 review finding #3B) | (combined with the base kind(s) derived from `<XY>` above, per record type) `submodule` populated per §11's submodule handling on **every** `WorkingTreeEntry` the source record produces |
 
 **Same-path staged+unstaged case (explicit, per the task's requirement):**
 porcelain v2's ordinary-changed-entry record type `1` carries **two**
@@ -2902,6 +3011,57 @@ discovered driver anywhere in that scope causes BR3 to **refuse**
 (`EXTERNAL_GIT_FILTER_UNSUPPORTED`) rather than execute `status` at all,
 never to silently suppress the driver and proceed. See §18's "detect,
 never execute, refuse safely" correction for the complete mechanism.
+
+**`<sub>` is present on, and must be parsed from, every record type that
+carries it — type `1`, type `2`, and unmerged `u` — never type `1`
+alone — corrected, mandatory, Round 16 review finding #3B (an earlier
+draft of this section's normative parsing contract was written centered
+on type-1 records only, leaving type-2 and `u` records' own `<sub>`
+field unaddressed).** Porcelain v2's dedicated `<sub>` field is not
+type-1-exclusive — Git's own documented record layout places it at a
+fixed position in type-2 (rename) and unmerged (`u`) records as well,
+independently of `<XY>` exactly as already established for type-1 above.
+**Verified directly, two further real record shapes:**
+```
+2 RM S.M. ... R100 renamed\0sub\0
+```
+(a **dirty submodule with a staged rename** — the submodule path itself
+was renamed, and its child working tree independently carries an
+unstaged content modification), and
+```
+u UU SC.. 160000 160000 160000 160000 <sha1> <sha2> <sha3> sub
+```
+(a **conflicted gitlink** — an unmerged submodule reference, §18's Round
+16 review finding #3A dedup correction governs its *enumeration*
+identity; this bullet governs its *status-record* `<sub>`-field parsing,
+a separate concern). In both cases, `<sub>` occupies its own fixed field
+position in the record, decoded via the identical `S<c><m><u>`/`N...`
+rule already established for type-1 records — never searched for inside
+`<XY>`, never assumed absent merely because the record is type `2` or
+`u`.
+
+**One porcelain record producing more than one `WorkingTreeEntry` —
+exact `SubmoduleState` attachment rule, new, mandatory, Round 16 review
+finding #3B.** A single source record can emit multiple
+`WorkingTreeEntry` objects (the combined type-2 XY matrix above, §8
+review finding #1B — e.g. `2 RM` emits both `staged_rename` and
+`unstaged_modify`). **The decoded `SubmoduleState` belongs to the path
+the source record describes, not to only one X/Y axis of that record —
+BR3 attaches the identical, single decoded `SubmoduleState` to every
+`WorkingTreeEntry` the source record produces whose `path` is that
+submodule path.** For the example above, `2 RM S.M. ... R100
+renamed\0sub\0` decodes `<sub>` once (`S.M.` →
+`{ commitChanged: false, hasUntrackedContent: false, hasModifiedContent:
+true }`) and attaches that **same** decoded value to **both** the
+resulting `staged_rename` entry and the resulting `unstaged_modify`
+entry — never decoded twice, never attached to only one of the two, and
+never split or partitioned across the X/Y axes. This is consistent with
+`SubmoduleState`'s own public contract (§7a): `submodule?: SubmoduleState`
+is a property of the path's **current, overall submodule state** as Git
+itself reports it for that one record, not a property scoped to a single
+status axis — a caller reading either emitted entry for that path sees
+the identical, correct submodule state regardless of which axis-derived
+entry they inspect.
 
 **Path normalization:** every `path`/`oldPath` in `WorkingTreeEntry` is
 the repository-relative path exactly as Git reports it (already relative
@@ -3864,16 +4024,16 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 | `GIT_EXECUTABLE_UNAVAILABLE` | Either (a) the `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call), or (b) — corrected, Round 11 review finding #2, candidate validity made exact Round 12 review finding #2 — BR3's own in-process executable-resolution mechanism (§8) found no valid `git` candidate at all before ever attempting to spawn one: on POSIX, no candidate anywhere in the effective search path (`PATH`'s value when present; `/usr/bin:/bin` when `PATH` is absent — Round 11 review finding #1) that is simultaneously (i) present, (ii) a regular file after symlink resolution — never a directory, FIFO, socket, device node, or broken symlink, and (iii) executable; on Windows, no candidate anywhere in the sanitized `PATH` that is simultaneously (i) literally named `git.exe` (never `.cmd`/`.bat`/`.com`/any other name) and (ii) a non-directory, regular-file executable target after resolution — never a directory or broken link — with an invalid candidate at one `PATH` entry never terminating the search while a later, valid candidate exists further down `PATH` — this is the single, exact typed outcome for "no usable Git executable," never an alternative, implementation-chosen code | Expected — a real, anticipated environment condition (Git not installed / not resolvable under the applicable search path); always a typed `GitResult` failure, never an uncaught exception |
 | `GIT_VERSION_UNSUPPORTED` | **New — Round 6 review finding #3.** The installed `git` binary spawns successfully but reports a version below BR3's supported floor (2.45.0), or `git --version`'s output does not match the expected `git version X.Y.Z` prefix shape at all (§8's "Git Capability Floor" subsection) — checked before any other `resolveRepository` step | Expected — distinct from `GIT_EXECUTABLE_UNAVAILABLE` (binary not found at all vs. found and run, but too old/unrecognized); `details` names the actual reported version string |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
-| `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4, further revised — corrects Round 5 review finding #4 and Round 6 review findings #5 and #7.** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms **neither** candidate repository shape is present — `<projectRoot>/.git` does not exist (non-bare shape) **and** `projectRoot` itself lacks the `HEAD`+`objects/`+(`refs/` or `reftable/tables.list`) bare-repository-root shape (bare shape, either ref backend) — i.e. `projectRoot` is genuinely not inside any Git repository, bare or non-bare, under either ref backend. A `--is-bare-repository` failure where **either** shape **is** present (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8. **`--show-toplevel` (§8 step 3) failing after step 2 already succeeded with `false` is no longer classified here at all — corrected, Round 6 review finding #7:** step 2 having already, positively, successfully established that Git recognizes `projectRoot` as a non-bare repository makes "no repository exists here" truthfully unreachable at that point; an unexpected step-3 failure is instead classified as `GIT_COMMAND_FAILED` (see that row) | Expected |
-| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) | Expected — `details` names the actual resolved toplevel |
+| `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4, further revised — corrects Round 5 review finding #4 and Round 6 review findings #5 and #7, further revised — corrects Round 16 review finding #4 (ancestor-chain discovery).** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms **neither** candidate repository shape is present at `projectRoot` itself — `<projectRoot>/.git` does not exist (non-bare shape) **and** `projectRoot` itself lacks the `HEAD`+`objects/`+(`refs/` or `reftable/tables.list`) bare-repository-root shape (bare shape, either ref backend) — **and** no plausible non-bare repository marker is found anywhere in `projectRoot`'s own ancestor chain up to the filesystem root (§8, Round 16 review finding #4) — i.e. `projectRoot` is genuinely not inside any Git repository, bare or non-bare, under either ref backend, and is not nested inside one either. A `--is-bare-repository` failure where **either** shape **is** present (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8. **`--show-toplevel` (§8 step 3) failing after step 2 already succeeded with `false` is no longer classified here at all — corrected, Round 6 review finding #7:** step 2 having already, positively, successfully established that Git recognizes `projectRoot` as a non-bare repository makes "no repository exists here" truthfully unreachable at that point; an unexpected step-3 failure is instead classified as `GIT_COMMAND_FAILED` (see that row) | Expected |
+| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) — reserved exclusively for the healthy path, where Git successfully, authoritatively resolves a real `--show-toplevel` that differs from `projectRoot`; **never** used for the case where step 2's own `--is-bare-repository` call fails before any toplevel is established, even when a plausible ancestor repository marker exists — that case is `GIT_COMMAND_FAILED` instead (§8, Round 16 review finding #4) | Expected — `details` names the actual resolved toplevel |
 | `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 2) | Expected |
 | `UNSUPPORTED_OBJECT_FORMAT` | **New — Round 6 review finding #4.** `git rev-parse --show-object-format` (§8 step 5a) reports anything other than `sha1` for `projectRoot` (e.g. `sha256`, for a repository created via `git init --object-format=sha256`) | Expected — BR3 v0.1 supports SHA-1 repositories only, a deliberate scope decision (§8); `details` names the actual reported object format; `resolveRepository` fails before any SHA-producing BR3 function can be reached for that repository |
 | `UNSUPPORTED_REF_FORMAT` | **New — Round 7 review finding #1, made fail-closed Round 8 review finding #5.** `git config --get extensions.refStorage` (§8 step 5b) successfully reports any value other than `files` for `projectRoot` (a healthy repository using a ref-storage backend BR3 does not support) — this includes `reftable` **and any other, including future/unrecognized, backend value** the key might report; BR3 v0.1's contract is an allowlist of exactly one supported value (`files`, or the key's ordinary absence), not a denylist of `reftable` specifically | Expected — BR3 v0.1 supports the traditional `files` ref-storage backend only, a deliberate scope decision (§8); `details` contains the actual reported value verbatim; `resolveRepository` fails before any later step is reached for that repository. Distinct from a **malformed** repository (either ref backend), which is `GIT_COMMAND_FAILED` via the post-Git-failure secondary classifier (§8) — this code is reserved for a positively-recognized, *healthy* repository reporting an unsupported format; also distinct from the `extensions.refStorage` query itself failing for a reason other than ordinary key-absence, which is likewise `GIT_COMMAND_FAILED`, never inferred as `files`-backend support (§8) |
 | `EXTERNAL_GIT_FILTER_UNSUPPORTED` | **New — Round 6 review finding #1, detection mechanism corrected Round 7 review finding #4, scope narrowed to `inspectWorkingTree` only Round 9 review finding #5, ownership made exclusive and caching removed Round 10 review finding #3.** BR3's repository-effective-attribute scan (`git check-attr --stdin -z filter` over every relevant tracked path, superproject and every initialized submodule recursively — §18) finds at least one path with an active `filter` attribute, run fresh, unconditionally, on **every** `inspectWorkingTree` call — never cached or reused across separate calls — *before* that call's own `status` invocation, which could trigger the corresponding driver — regardless of whether that driver's command definition is repository-local, global/user-level (and therefore otherwise hidden by BR3's own `GIT_CONFIG_GLOBAL`-neutralized inspection environment), or currently undefined. BR3 refuses to proceed rather than execute the external filter or suppress it and risk returning a false working-tree fact (§18). **This code is returned by `inspectWorkingTree` exclusively** — `resolveRepository` never performs this scan and never returns this code merely because a repository's working tree contains an active filter attribute; `inspectHead` never performs it; `inspectDiff` never triggers this scan or returns this code at all (§13, Round 9 review finding #5) — a commit-vs-commit `diff` compares already-stored Git objects and performs no working-tree content canonicalization, so it has no dependency on current working-tree/index/`.gitattributes` state. This guarantee assumes the repository's relevant configuration is not concurrently, adversarially mutated during the brief window between the `check-attr` scan and the subsequent `status` invocation within one call (§18's stated concurrency boundary) | Expected — a real, anticipated repository-configuration condition; `details` names the affected path(s)/attribute value(s); the `status` invocation that could trigger the filter is never run |
-| `UNSAFE_SUBMODULE_PATH` | **New — Round 7 review finding #5, extended to cover repository-metadata identity and the parent→child relationship, Round 8 review finding #3, tightened to exclude linked-worktree metadata and the `.git`-entry-itself symlink case, Round 9 review finding #4.** A gitlink working-tree path (mode `160000` in `git ls-files --stage -z`, §18) discovered during initialized-submodule enumeration is itself a symbolic link (detected via `lstat`, never a symlink-following `stat`); **or** its own `.git` *entry* (one level inside an already-accepted, non-symlinked working-tree directory) is itself a symbolic link; **or** its canonical working-tree root **or** its canonical `(gitDir, gitCommonDir)` metadata identity has already been visited earlier in the same recursive enumeration (a cycle/alias, reachable even when the working-tree roots are themselves canonically distinct — §18 step 4a); **or** its resolved `.git` pointer names a location outside the three explicitly-recognized legitimate parent→child submodule shapes (§18 step 4a) — in particular, a pointer resolving to the parent's own `--git-dir`/`--git-common-dir`, to a location outside the parent's own `--git-common-dir` tree entirely, or to a location beneath the parent's `--git-common-dir` that is nonetheless a linked-worktree metadata directory rather than genuine, self-contained submodule metadata (`gitDir !== gitCommonDir` for the child) | Expected — a real, anticipated adversarial-or-corrupted-repository condition; BR3 fails safely rather than recursing into a symlink-redirected, cyclic, aliased, externally-pointed, or linked-worktree-redirected submodule path, and never recursively inspects the aliased/external/worktree repository before the refusal is produced; `details` names the offending gitlink path |
+| `UNSAFE_SUBMODULE_PATH` | **New — Round 7 review finding #5, extended to cover repository-metadata identity and the parent→child relationship, Round 8 review finding #3, tightened to exclude linked-worktree metadata and the `.git`-entry-itself symlink case, Round 9 review finding #4; explicitly never triggered merely by an unmerged gitlink's multiple index-stage records for one legitimate path, Round 16 review finding #3A.** A gitlink working-tree path (mode `160000` in `git ls-files --stage -z`, §18) discovered during initialized-submodule enumeration is itself a symbolic link (detected via `lstat`, never a symlink-following `stat`); **or** its own `.git` *entry* (one level inside an already-accepted, non-symlinked working-tree directory) is itself a symbolic link; **or** its canonical working-tree root **or** its canonical `(gitDir, gitCommonDir)` metadata identity has already been visited earlier in the same recursive enumeration (a cycle/alias, reachable even when the working-tree roots are themselves canonically distinct — §18 step 4a); **or** its resolved `.git` pointer names a location outside the three explicitly-recognized legitimate parent→child submodule shapes (§18 step 4a) — in particular, a pointer resolving to the parent's own `--git-dir`/`--git-common-dir`, to a location outside the parent's own `--git-common-dir` tree entirely, or to a location beneath the parent's `--git-common-dir` that is nonetheless a linked-worktree metadata directory rather than genuine, self-contained submodule metadata (`gitDir !== gitCommonDir` for the child) | Expected — a real, anticipated adversarial-or-corrupted-repository condition; BR3 fails safely rather than recursing into a symlink-redirected, cyclic, aliased, externally-pointed, or linked-worktree-redirected submodule path, and never recursively inspects the aliased/external/worktree repository before the refusal is produced; `details` names the offending gitlink path |
 | `HEAD_UNAVAILABLE` | **Complete, final trigger condition (revised — corrects Round 4 review finding #5, which extended this beyond Round 1's `symbolic-ref`-exit-code-only definition): EITHER (a)** `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal/unborn/corrupt-but-symbolic) or 1 (detached) — verified as exit 128 for genuine `.git/HEAD` corruption — **OR (b)** `git symbolic-ref -q HEAD` succeeds (exit 0) but `git rev-parse --verify -q HEAD^{commit}` fails AND the resolved branch ref name itself (`git rev-parse --verify -q <resolved-ref-name>`, no `^{commit}`) exits 0 — i.e. HEAD is genuinely symbolic and points at a branch ref that exists, but that ref's stored value does not name a real commit object (§9's "corrupt HEAD" case; distinguished from the unborn case, where the same ref-name check exits 1) — **OR (c)** HEAD is direct/detached (`symbolic-ref -q HEAD` exits 1) but `git rev-parse --verify -q HEAD^{commit}` also fails (a detached HEAD pointing at a non-existent object). These three conditions are the exact, complete trigger set §9 defines; there is no fourth, undocumented path to this code | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
 | `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify --end-of-options <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
-| `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis |
+| `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) — this includes, per §8's Round 16 review finding #4 correction, `resolveRepository`'s step-2 `--is-bare-repository` failure where a plausible non-bare repository marker is found either at `projectRoot` itself or anywhere in its ancestor chain, meaning a real repository genuinely exists but Git could not authoritatively establish a toplevel for it | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis (or, for the ancestor-marker case, the ancestor path where the marker was found) |
 | `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line, a path that is not valid UTF-8, or — corrected, Round 10 review finding #1 — any Category 2 repository-controlled textual value (a ref/branch name, `config --get`/`--get-all` value, `--show-toplevel`/`--git-dir`/`--git-common-dir` output) that is not valid UTF-8 — §13) | Exceptional — this should be unreachable against a conforming Git version and well-formed repository content; exists so a genuinely unexpected format change, a non-UTF-8 path, or a non-UTF-8 ref/branch/config-derived textual value (§13) fails loudly and specifically rather than silently misparsing or substituting U+FFFD |
 
 **`matchProtectedPaths`'s own error-shaped handling (§7a is the single
@@ -4563,7 +4723,53 @@ in-process mechanism this helper itself performs.
      reference, not an ordinary blob," independent of any porcelain
      rendering. Every other mode is not a submodule path and is ignored
      for this enumeration's purposes.
-  3. For each gitlink path found, **determine whether it is genuinely
+  2a. **Deduplicate to unique repository-relative candidate paths before
+     any further processing — new, mandatory, Round 16 review finding
+     #3A.** `git ls-files --stage -z`'s own documented output shape
+     includes an explicit **stage** field, and a genuinely legitimate,
+     real repository state — an **unmerged (conflicted) gitlink** — can
+     produce **three separate index records for the identical
+     repository-relative path**, one per conflict stage (`160000 <sha1>
+     1\t<path>\0`, `160000 <sha2> 2\t<path>\0`, `160000 <sha3>
+     3\t<path>\0`). **Verified directly:** a real, previously-initialized
+     submodule checkout (its working tree still populated at `sub/`),
+     with a genuine, unresolved merge conflict constructed on the
+     gitlink entry itself — `git ls-files --stage -z` emits three
+     distinct `160000`-mode records, all naming the identical path
+     `sub`, differing only in stage number and object ID; the
+     corresponding `status --porcelain=v2` record is a single unmerged
+     (`u`) line, `u UU S C.. 160000 160000 160000 160000 <sha1> <sha2>
+     <sha3> sub` — genuinely one legitimate conflicted path, not three
+     distinct submodules or a cycle. **Index stage is metadata describing
+     one conflicted path's multiple pending versions — it is never a
+     recursion or enumeration identity, and the step 4a visited-set
+     mechanism below must never be used, even incidentally, as a
+     duplicate-index-record detector.** A literal implementation that
+     processes each stage record independently — validating stage 1's
+     `sub`, adding its working-tree root and metadata identity to the
+     visited sets, then encountering stage 2's `sub` and finding that
+     identical root/metadata already present — would **falsely** produce
+     `UNSAFE_SUBMODULE_PATH` for a perfectly legitimate, merely
+     conflicted path; this is not the cycle/alias condition step 4a
+     exists to detect. **The corrected contract:** before step 3's
+     `lstat`/initialization check, step 4's validation, or step 4a's
+     visited-set/relationship checks ever run, the raw `160000`-mode
+     records from step 2 are collapsed to their **unique
+     repository-relative paths** — a path appearing at multiple stages
+     contributes exactly **one** candidate to every subsequent step, not
+     one per stage. **Mixed-mode conflict handling — at minimum:** when
+     one or more unmerged stages for a path are mode `160000` and the
+     current working-tree path is an initialized submodule checkout Git's
+     own `status` may inspect, that working-tree location is safety-scanned
+     (steps 3–5) **at most once** for that path — never once per
+     conflicting stage record. The conflict's own stage-level detail
+     (which specific object ID each stage names) is a `status`/`diff`
+     content-reporting concern (§11, addressed separately by finding
+     #3B's `<sub>`-field parsing below), never a submodule-enumeration
+     concern; enumeration's only job is producing the correct, unique set
+     of candidate working-tree paths to recurse into.
+  3. For each **unique candidate** gitlink path produced by step 2a,
+     **determine whether it is genuinely
      initialized (its working tree actually populated) without
      initializing or mutating it and without executing anything inside
      it — and, corrected, Round 7 review finding #5, without ever
@@ -5155,15 +5361,66 @@ includes, unconditionally:
     to every BR3 Git subprocess, not merely the ones expected to touch
     promisor objects, for the identical "one place, no detect-then-decide
     race" rationale §18's `core.fsmonitor=` override already establishes.
+  - **`GIT_NO_REPLACE_OBJECTS: "1"`** — **new, mandatory, Round 16 review
+    finding #1.** Git's replacement-refs mechanism (`git replace`,
+    storing substitute objects under repository-local
+    `refs/replace/<original-sha>`) can, by design, cause Git commands to
+    **transparently substitute a different object's content** for the
+    one a caller's SHA actually names — while `rev-parse`-family SHA
+    resolution keeps reporting the *original*, requested object's own
+    SHA, commands that actually read object *content* (`diff`, `status`
+    internally comparing tree/blob content) silently operate on the
+    *replacement* object's content instead. **This directly breaks one
+    of BR3's most important contracts: the exact SHA BR3 reports may not
+    identify the content BR3 actually inspected and reported facts
+    about** — a governance-critical property, since later evidence
+    binding (§23, explicitly out of BR3's own scope, but a documented
+    reason this property matters now) relies on an exact candidate SHA
+    truthfully identifying the object content it names. **Verified
+    directly:** a repository with commit `A`, commit `B`, and a separate
+    replacement commit `B2` with a deliberately different tree,
+    installed via `git replace B B2` — `git rev-parse --verify
+    B^{commit}` still reports `B`'s own, original, unchanged SHA (the
+    replacement never alters SHA resolution), but BR3's exact,
+    pre-correction `diff` invocation (`git diff --no-color --no-ext-diff
+    --ignore-submodules=none -z --name-status --find-renames=50% -l0 A
+    B`) reports changes computed against `B2`'s replacement tree, not
+    `B`'s real, recorded tree — meaning `DiffResult.toSha` names `B`
+    while `DiffResult.changes` actually describes `B2`'s content, a
+    truthful-SHA/false-content mismatch. The identical hazard reaches
+    `inspectWorkingTree`: with `HEAD` replaced by a commit whose tree
+    differs from `HEAD`'s own real, recorded tree, BR3's exact,
+    pre-correction `status` invocation reports false staged
+    modified/deleted facts relative to the *replacement* tree, even
+    though the index and working tree genuinely match the real `HEAD`
+    commit content. **`GIT_NO_REPLACE_OBJECTS=1`** (Git's own documented
+    environment-variable mechanism, equivalent to the global
+    `--no-replace-objects` flag) instructs every Git command in the
+    subprocess to ignore `refs/replace/*` entirely and operate only on
+    real, original object content — verified directly to eliminate both
+    reproductions above (the `diff` invocation correctly reports `B`'s
+    real content; the `status` invocation correctly reports no false
+    staged facts). This protection must be BR3's own, unconditionally
+    re-added variable, for the identical reason `GIT_NO_LAZY_FETCH` is:
+    **§19's own unconditional `GIT_*`-prefix strip (step 2 above) removes
+    any inherited `GIT_NO_REPLACE_OBJECTS` a caller may have already
+    set**, so without re-adding it explicitly, a caller who protected
+    themselves against replacement objects would silently lose that
+    protection the moment BR3 invoked Git on their behalf.
+    `GIT_NO_REPLACE_OBJECTS` is added to the same explicit, re-added set
+    as every other controlled `GIT_*` variable above — applied
+    unconditionally to every BR3 Git subprocess, not merely ones expected
+    to encounter a replacement ref, for the identical "one place, no
+    detect-then-decide race" rationale.
 
-  This brings the controlled `GIT_*` variable count to **seven** (not six,
-  as of Round 4) — every occurrence of "six" describing this set
-  elsewhere in this document is updated to "seven" as part of this
+  This brings the controlled `GIT_*` variable count to **eight** (not
+  seven, as of Round 5) — every occurrence of "seven" describing this
+  set elsewhere in this document is updated to "eight" as part of this
   round's correction.
 
   Together, steps 1–4 mean the final `env` passed to every BR3 `execFile`
   call is `process.env` **minus every `GIT_*`-prefixed key, unconditionally**,
-  **plus** exactly the seven `GIT_*` keys named above **plus** `LC_ALL`/
+  **plus** exactly the eight `GIT_*` keys named above **plus** `LC_ALL`/
   `LANG` **plus** the `XDG_CONFIG_HOME` override described immediately
   below (which is not itself a `GIT_*`-prefixed variable, and is counted
   separately) — never a wholesale `{ ...process.env }` spread with ad-hoc
@@ -5252,7 +5509,7 @@ includes, unconditionally:
   creating one per invocation — it need only be empty and contain no
   `git/` subdirectory) as part of the same `env` construction algorithm
   above (added as a non-`GIT_*` override, alongside `LC_ALL`/`LANG`, not
-  counted among the seven `GIT_*` variables above since it is not itself
+  counted among the eight `GIT_*` variables above since it is not itself
   `GIT_*`-prefixed).
   - **Repository-local `.git/info/exclude` — explicitly decided: honored
     (verified directly, alongside repository-local `.gitignore` below).**
@@ -5310,7 +5567,7 @@ includes, unconditionally:
   chooses to run.
 
   **The fix:** `GIT_NO_LAZY_FETCH=1` (re-added centrally, alongside
-  `GIT_OPTIONAL_LOCKS=0`, as one of the seven controlled `GIT_*`
+  `GIT_OPTIONAL_LOCKS=0`, as one of the eight controlled `GIT_*`
   variables above — not a separate mechanism) is Git's own documented
   environment-variable equivalent of the global `--no-lazy-fetch` flag:
   it instructs Git to never perform this on-demand promisor fetch,
@@ -5480,9 +5737,9 @@ includes, unconditionally:
   produces `EXTERNAL_GIT_FILTER_UNSUPPORTED` instead, before this
   invocation ever runs (§17, §18)** (§11 — restated here so this
   section, §11, §20, and §27 all name the identical command, `git -c
-  core.fsmonitor= -c status.renameLimit=0 status --porcelain=v2 -z
-  --find-renames=50% --untracked-files=all --ignore-submodules=none`,
-  with no drift between them).
+  core.fsmonitor= -c status.renameLimit=0 -c status.showStash=false
+  status --porcelain=v2 -z --find-renames=50% --untracked-files=all
+  --ignore-submodules=none`, with no drift between them).
 - **No reliance on Git aliases:** every BR3 Git invocation uses a
   first-argument literal plumbing/porcelain subcommand name
   (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`, `ls-files`,
@@ -5600,6 +5857,40 @@ current validation algorithm)**
   malformed-non-bare-config fixture above run side-by-side with the
   ordinary-non-Git-directory fixture in the same test to prove the
   secondary check correctly discriminates all three
+- **Ancestor-chain repository discovery, four fixtures run side-by-side
+  in the same test to prove correct four-way discrimination — mandatory,
+  new, Round 16 review finding #4:**
+  - **(A) Existing healthy nested directory** — a real, healthy
+    repository at `/repo` with a plain, non-repository subdirectory
+    `/repo/sub` used as `projectRoot` → `PROJECT_ROOT_MISMATCH`, `details`
+    naming `/repo` as the actual resolved toplevel (the unchanged, healthy
+    path — Git's `--is-bare-repository`/`--show-toplevel` both succeed).
+  - **(B) Existing plain non-Git directory** — an entirely standalone
+    directory with **no** repository anywhere in its own ancestor chain
+    up to the filesystem root used as `projectRoot` →
+    `NOT_A_GIT_REPOSITORY` (the ancestor-chain check runs and correctly
+    finds no marker anywhere).
+  - **(C) Existing malformed repository ROOT** — the malformed-bare and
+    malformed-non-bare fixtures already above, `projectRoot` set directly
+    to the malformed repository's own root → `GIT_COMMAND_FAILED`
+    (unchanged from the existing fixtures above; re-asserted here
+    explicitly alongside (D) to prove the new ancestor-chain logic does
+    not alter this already-correct case).
+  - **(D) NEW — malformed repository PARENT, nested `projectRoot` — the
+    specific regression case this round's finding targets:** a real
+    repository at `/repo` with its own `/repo/.git/config` deliberately
+    malformed (the identical unterminated-`[section` technique used
+    throughout this section), and `projectRoot` set to a plain,
+    non-repository subdirectory `/repo/sub` (no `/repo/sub/.git` of any
+    kind) → first confirm, in the test's own setup, that `git
+    rev-parse --is-bare-repository` run with `cwd=/repo/sub` genuinely
+    fails with exit 128 (Git's own discovery walks up to `/repo` and
+    fails there); then call `resolveRepository("/repo/sub")` and assert
+    `GIT_COMMAND_FAILED` — **never** `NOT_A_GIT_REPOSITORY` (the
+    pre-Round-16 classifier's incorrect result) and **never**
+    `PROJECT_ROOT_MISMATCH` (which would falsely claim Git successfully
+    established a real toplevel) — `details` naming `/repo` as the
+    ancestor path where the non-bare repository marker was found.
 - **Unsafe/dubious-ownership repository — not added as a fixture in this
   round (Round 4 review finding #4):** this scenario requires genuinely
   differing file ownership between the repository directory and the
@@ -6327,6 +6618,33 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   (`GIT_COMMAND_FAILED`), proving `GIT_NO_LAZY_FETCH=1` (§19) genuinely
   prevents Git's automatic on-demand promisor fetch rather than BR3
   silently succeeding via a hidden local-remote fetch
+- **Replacement-object neutralization, `inspectDiff` — mandatory, new,
+  Round 16 review finding #1(A)** (a real fixture: commit `A`, commit
+  `B`, a separate replacement commit `B2` with a deliberately different
+  tree, installed via `git replace B B2`) → first confirm, in the test's
+  own setup, that an unmitigated `git diff` between `A` and `B` (without
+  `GIT_NO_REPLACE_OBJECTS=1`) genuinely reports `B2`'s replacement
+  content rather than `B`'s real, recorded tree (establishing the hazard
+  is real); then call `inspectDiff(projectRoot, { fromRef: A, toRef: B
+  })` and assert: `fromSha`/`toSha` are the actual, real `A`/`B` object
+  IDs (unaffected either way, since `rev-parse` SHA resolution never
+  consults replacement refs), **and** `changes` describes the real
+  difference between `A` and `B`'s own, original trees — **never** `B2`'s
+  replacement content — proving `GIT_NO_REPLACE_OBJECTS=1` (§19) is
+  genuinely applied to BR3's `diff` invocation.
+- **Replacement-object neutralization, `inspectWorkingTree` — mandatory,
+  new, Round 16 review finding #1(B)** (a real fixture: repository index
+  and working tree genuinely match the real `HEAD` commit's own content;
+  a replacement ref installed for `HEAD`'s commit pointing at a separate
+  commit with a deliberately different tree) → first confirm, in the
+  test's own setup, that an unmitigated `git status` (without
+  `GIT_NO_REPLACE_OBJECTS=1`) genuinely reports false staged
+  modified/deleted facts relative to the replacement tree (establishing
+  the hazard is real); then call `inspectWorkingTree(projectRoot)` and
+  assert `clean: true`, `entries: []` — **no** replacement-induced staged
+  facts appear — proving `GIT_NO_REPLACE_OBJECTS=1` (§19) is genuinely
+  applied to BR3's `status` invocation as well, and that no
+  `refs/replace/*` ref of any kind can alter any fact BR3 reports.
 
 **Working tree (§11)**
 - Clean repository → `clean: true`, `entries: []`
@@ -6415,6 +6733,21 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
     `-c status.renameLimit=0` override is applied regardless of which of
     the two config keys a repository happens to set, closing the
     fallback path as a possible gap too.
+- **`status.showStash` pinning (`-c status.showStash=false`) —
+  mandatory, new, Round 16 review finding #2:** a fixture repository
+  with one real stash entry (created via `git stash push`) and
+  repository-local config `status.showStash=true` set → first confirm,
+  in the test's own setup, that BR3's own `status`-flag-shaped invocation
+  *without* `-c status.showStash=false` genuinely emits a `# stash 1\0`
+  header record interleaved with the ordinary path/status records
+  (establishing the hazard is real); then call `inspectWorkingTree` and
+  assert: **no** `MALFORMED_GIT_OUTPUT` is produced, **no** stash
+  pseudo-entry of any kind appears in `entries`, and every ordinary
+  working-tree entry elsewhere in the identical fixture is still
+  correctly reported — proving `-c status.showStash=false` (§11)
+  unconditionally suppresses the `# stash` header regardless of
+  repository-local config, and that a repository having a stash can
+  never, by itself, cause `inspectWorkingTree` to fail.
 - Untracked file
 - Conflicted/unmerged path (constructed via a real merge conflict in the
   fixture repository)
@@ -6456,6 +6789,47 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   independent field position in the record — never by searching for an
   `S`-prefixed substring inside the separate `<XY>` field (`.M`) — and
   that the two fields are never confused with one another.
+- **Submodule `<sub>`-field parsing on a type-2 (rename) record, with
+  attachment to both emitted entries — mandatory, new, Round 16 review
+  finding #3B** (a real initialized submodule, staged-renamed (`git mv`)
+  to a new path, with its own working tree independently made dirty —
+  producing the verified real record shape `2 RM S.M. ... R100
+  renamed\0sub\0` under BR3's exact `status` invocation) →
+  `inspectWorkingTree` returns **both** a `staged_rename` entry
+  (`path: "renamed"`, `oldPath: "sub"`, correct `similarity`) and an
+  `unstaged_modify` entry (`path: "renamed"`), and **both** entries carry
+  the identical, correctly decoded `submodule: { commitChanged: false,
+  hasUntrackedContent: false, hasModifiedContent: true }` — proving
+  `<sub>` is genuinely parsed from a type-2 record (not only type-1) and
+  is correctly attached to every `WorkingTreeEntry` the source record
+  produces, never decoded twice or attached to only one axis.
+- **Submodule `<sub>`-field parsing on an unmerged (`u`) record — real
+  conflicted gitlink — mandatory, new, Round 16 review finding #3B** (a
+  real initialized submodule left in a genuine, unresolved merge
+  conflict on the gitlink entry itself, producing the verified real
+  record shape `u UU SC.. 160000 160000 160000 160000 <sha1> <sha2>
+  <sha3> sub` under BR3's exact `status` invocation) → the resulting
+  `conflicted` entry correctly carries `submodule: { commitChanged: true,
+  hasUntrackedContent: false, hasModifiedContent: false }` (decoded from
+  `SC..`), proving `<sub>` is genuinely parsed from an unmerged `u`
+  record, not only type-1/type-2 records.
+- **Conflicted-gitlink enumeration does not falsely trigger
+  `UNSAFE_SUBMODULE_PATH` — mandatory, new, Round 16 review finding #3A**
+  (a real, previously-initialized submodule checkout, its working tree
+  still populated at `sub/`, with genuine, unresolved stage-1/stage-2/
+  stage-3 gitlink index entries constructed for the identical path `sub`
+  — first confirmed, in the test's own setup, that `git ls-files --stage
+  -z` genuinely emits three separate `160000`-mode records all naming
+  `sub`) → `inspectWorkingTree(projectRoot)` (and any other
+  submodule-enumeration-dependent operation, e.g. the filter-discovery
+  scan, §18) does **not** return `UNSAFE_SUBMODULE_PATH` merely because
+  the same conflicted path appeared at three index stages — the
+  enumeration correctly collapses the three stage records to one unique
+  candidate path, safety-scans `sub`'s working-tree location at most
+  once, and the resulting status remains representable as a legitimate
+  conflicted path (a `conflicted` `WorkingTreeEntry` for `sub`, per the
+  fixture immediately above) — proving index stage is never mistaken for
+  a recursion/cycle identity.
 
 **Diff inspection (§13, §14, §15)**
 - Two valid refs/SHAs → correct `fromSha`/`toSha` and changed-path list
@@ -7224,10 +7598,12 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   emitting both a `staged_rename` and an independent Y-mapped entry,
   never discarding either axis — §11, Round 8 review finding #1B)/
   untracked/conflicted/submodule states, using the exact command `git -c
-  core.fsmonitor= -c status.renameLimit=0 status --porcelain=v2 -z
-  --find-renames=50% --untracked-files=all --ignore-submodules=none`
-  (§11, `-c status.renameLimit=0` added Round 9 review finding #1), with
-  §11/§19/§20/§27 all agreeing on that exact command — and never runs
+  core.fsmonitor= -c status.renameLimit=0 -c status.showStash=false
+  status --porcelain=v2 -z --find-renames=50% --untracked-files=all
+  --ignore-submodules=none` (§11, `-c status.renameLimit=0` added Round 9
+  review finding #1, `-c status.showStash=false` added Round 16 review
+  finding #2), with §11/§19/§20/§27 all agreeing on that exact command —
+  and never runs
   this command at all for a repository where the effective-filter-attribute
   scan (§18) found an active `filter` attribute anywhere in scope,
   superproject- or initialized-submodule-local, producing `EXTERNAL_GIT_FILTER_UNSUPPORTED`
@@ -7310,10 +7686,11 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   stripped via a **case-insensitive** prefix filter (corrected, Round 8
   review finding #4 — a case-sensitive filter leaves a real gap on
   Windows, where `git_dir`/`Git_Dir`/etc. are the identical variable as
-  `GIT_DIR`), with only BR3's own seven controlled `GIT_*` variables
+  `GIT_DIR`), with only BR3's own eight controlled `GIT_*` variables
   (`GIT_PAGER`, `GIT_TERMINAL_PROMPT`, `GIT_OPTIONAL_LOCKS`,
   `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `GIT_ATTR_NOSYSTEM`,
-  `GIT_NO_LAZY_FETCH` — the last new in Round 5), always added in one
+  `GIT_NO_LAZY_FETCH`, `GIT_NO_REPLACE_OBJECTS` — the last new in Round
+  16), always added in one
   canonical uppercase form with no case-variant duplicate ever present,
   re-added, `XDG_CONFIG_HOME` overridden to a fresh empty directory (new
   in Round 4, §19), the effective `PATH` key normalized via one
@@ -7639,16 +8016,18 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   subprocess sequence, and does not claim an atomic filesystem snapshot
   across those two separate Git processes (§6, §18, §20).
 - **AB.** — new, Round 10 review finding #4, revised, Round 15 review
-  finding #1. Exactly one canonical `status` invocation (`git -c
-  core.fsmonitor= -c status.renameLimit=0 status --porcelain=v2 -z
-  --find-renames=50% --untracked-files=all --ignore-submodules=none`)
+  finding #1, revised again, Round 16 review finding #2. Exactly one
+  canonical `status` invocation (`git -c core.fsmonitor= -c
+  status.renameLimit=0 -c status.showStash=false status --porcelain=v2
+  -z --find-renames=50% --untracked-files=all --ignore-submodules=none`)
   and exactly one canonical `diff` invocation (`git diff --no-color
   --no-ext-diff --ignore-submodules=none -z --name-status
   --find-renames=<threshold> -l0 <fromSha> <toSha>`) are stated
   identically everywhere this document names "the exact command" — §11,
   §13, §19, §20, and §27 no longer contain a stale restatement omitting
-  `-c status.renameLimit=0`, `-l0`, or (Round 15) `diff`'s
-  `--ignore-submodules=none`; and the command allowlist
+  `-c status.renameLimit=0`, `-l0`, (Round 15) `diff`'s
+  `--ignore-submodules=none`, or (Round 16) `status`'s `-c
+  status.showStash=false`; and the command allowlist
   (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`
   (`--get`/`--get-all` only — `--get-regexp` removed entirely, Round 14
   review finding #4), `ls-files`, `check-attr`) is stated identically
@@ -7790,6 +8169,48 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   anywhere in this document combines `--end-of-options` with an
   additional bare `--` as though that combination were BR3's own
   command or a stronger safety measure (§13, §20).
+- **AP.** — new, Round 16 review finding #1. `GIT_NO_REPLACE_OBJECTS=1`
+  is one of BR3's eight controlled `GIT_*` variables, unconditionally
+  re-added after the `GIT_*`-prefix strip, applied to every BR3 Git
+  subprocess. No `refs/replace/*` ref can alter any SHA, diff content, or
+  working-tree fact BR3 reports — proven by dedicated fixtures for both
+  `inspectDiff` (a replacement commit with a different tree) and
+  `inspectWorkingTree` (a replacement ref for `HEAD`), each first
+  confirming the unmitigated hazard is real, then confirming BR3's actual
+  output is unaffected (§18, §19, §20).
+- **AQ.** — new, Round 16 review finding #2. BR3's canonical `status`
+  invocation includes `-c status.showStash=false`, unconditionally,
+  identically restated everywhere the command appears (§11, §19, §20,
+  §20a, §27). A repository having a real stash, with repository-local
+  `status.showStash=true` set, never causes `inspectWorkingTree` to
+  produce `MALFORMED_GIT_OUTPUT` or any stash-shaped pseudo-entry — proven
+  by the dedicated fixture confirming the unmitigated `# stash` header
+  hazard is real, then confirming BR3's actual invocation suppresses it
+  (§11, §20).
+- **AR.** — new, Round 16 review finding #3. **(A)** The initialized-submodule
+  enumeration mechanism (§18) collapses `git ls-files --stage -z`'s
+  gitlink records to unique repository-relative candidate paths before
+  any `lstat`/validation/visited-set/recursion step runs — a legitimately
+  conflicted gitlink represented at multiple index stages is
+  safety-scanned at most once and never produces a false
+  `UNSAFE_SUBMODULE_PATH`, proven by a real three-stage conflicted-gitlink
+  fixture. **(B)** `<sub>` is parsed from every porcelain v2 record type
+  that carries it — type `1`, type `2`, and unmerged `u` — not type `1`
+  alone, with the decoded `SubmoduleState` attached identically to every
+  `WorkingTreeEntry` one source record produces, proven by dedicated
+  type-2-rename and unmerged-conflict fixtures in addition to the
+  existing type-1 fixture (§11, §18, §20).
+- **AS.** — new, Round 16 review finding #4. `resolveRepository`'s
+  post-Git-failure secondary classifier checks `projectRoot`'s own
+  ancestor chain, not only `projectRoot` itself, for a plausible non-bare
+  repository marker before concluding `NOT_A_GIT_REPOSITORY` — a
+  `projectRoot` nested inside a real repository whose own config is too
+  malformed for Git to establish a toplevel correctly reports
+  `GIT_COMMAND_FAILED`, never `NOT_A_GIT_REPOSITORY` and never
+  `PROJECT_ROOT_MISMATCH` (reserved exclusively for the healthy path),
+  proven by a dedicated four-fixture regression (healthy nested
+  directory, plain non-Git directory, malformed repository root,
+  malformed repository parent with a nested `projectRoot`) (§8, §17, §20).
 
 ## 20b. Implementation Plan
 
@@ -8054,7 +8475,7 @@ The independent reviewer must specifically examine, for BR3:
   constructed by stripping every inherited `GIT_*`-prefixed variable
   (via a **case-insensitive** prefix filter, not an enumerated blocklist
   and not a case-sensitive comparison — corrected, Round 8 review finding
-  #4) and re-adding only BR3's own seven controlled `GIT_*` variables, in
+  #4) and re-adding only BR3's own eight controlled `GIT_*` variables, in
   one canonical uppercase form with no case-variant duplicate — never a
   wholesale `{ ...process.env }` spread — proven by the dedicated real
   regression tests (§20, Round 3 review finding #2, extended Round 8
@@ -8765,15 +9186,17 @@ The independent reviewer must specifically examine, for BR3:
   network call — proven by running the full BR3 test suite with network
   access disabled (or an equivalent structural check) and confirming
   every upstream-SHA test still passes using only already-local refs
-- Whether `git -c core.fsmonitor= -c status.renameLimit=0 status
-  --porcelain=v2 -z --find-renames=50% --untracked-files=all
-  --ignore-submodules=none` (§11, §19, Round 9 review finding #1's
-  `-c status.renameLimit=0` included — corrected here, Round 10 review
-  finding #4, since an earlier draft of this exact bullet omitted it) and
-  `git diff --no-color --no-ext-diff --ignore-submodules=none -z
-  --name-status --find-renames=<threshold> -l0` (with the exact flags
-  §13/§19 specify, including `-l0` and, Round 15 review finding #1,
-  `--ignore-submodules=none`) are the actual commands invoked — not
+- Whether `git -c core.fsmonitor= -c status.renameLimit=0 -c
+  status.showStash=false status --porcelain=v2 -z --find-renames=50%
+  --untracked-files=all --ignore-submodules=none` (§11, §19, Round 9
+  review finding #1's `-c status.renameLimit=0` included — corrected
+  here, Round 10 review finding #4, since an earlier draft of this exact
+  bullet omitted it; `-c status.showStash=false` included, Round 16
+  review finding #2) and `git diff --no-color --no-ext-diff
+  --ignore-submodules=none -z --name-status --find-renames=<threshold>
+  -l0` (with the exact flags §13/§19 specify, including `-l0` and, Round
+  15 review finding #1, `--ignore-submodules=none`) are the actual
+  commands invoked — not
   `--porcelain` (v1), not a partial flag set, and not a patch-format
   diff requiring hunk-parsing
 - Whether BR3 adds no new CLI command and does not modify
@@ -8970,6 +9393,57 @@ The independent reviewer must specifically examine, for BR3:
   combining `--end-of-options` with an additional bare `--`, a
   combination independently verified to fail even against a valid ref
   and therefore incapable of proving option-safety
+- **`GIT_NO_REPLACE_OBJECTS=1` centrally re-added — new, mandatory, Round
+  16 review finding #1:** whether the controlled `GIT_*` variable count
+  is genuinely eight everywhere it is stated (§18, §19, §20a, §27, with
+  no remaining "seven" describing this set), whether
+  `GIT_NO_REPLACE_OBJECTS` is re-added unconditionally after the
+  `GIT_*`-prefix strip for every BR3 Git subprocess, and whether the
+  dedicated `inspectDiff`/`inspectWorkingTree` replacement-object
+  fixtures (§20) each first confirm the unmitigated hazard is real (a
+  replacement commit/ref genuinely alters diff content or produces false
+  staged facts under an unprotected invocation) before confirming BR3's
+  actual, protected invocation is unaffected — proving the exact SHA BR3
+  reports always identifies the object content BR3 actually inspected
+- **`status.showStash=false` pinned on the canonical `status` invocation
+  — new, mandatory, Round 16 review finding #2:** whether every exact
+  restatement of the canonical `status` command (§11, §19, §20, §20a,
+  §27) includes `-c status.showStash=false` identically, with no older,
+  two-`-c` form remaining anywhere, and whether the dedicated fixture
+  (§20) first confirms, in test setup, that the unmitigated command
+  genuinely emits a `# stash <N>` header record for a repository with a
+  real stash and `status.showStash=true` set, before confirming BR3's
+  actual invocation suppresses it with no `MALFORMED_GIT_OUTPUT` and no
+  stash pseudo-entry
+- **Conflicted-gitlink enumeration deduplication and `<sub>`-field
+  parsing on every carrying record type — new, mandatory, Round 16
+  review finding #3:** whether the initialized-submodule enumerator
+  (§18) collapses `ls-files --stage -z`'s gitlink records to unique
+  repository-relative candidate paths **before** any `lstat`/validation/
+  visited-set step, proven by a real three-index-stage conflicted-gitlink
+  fixture asserting `inspectWorkingTree` does **not** falsely return
+  `UNSAFE_SUBMODULE_PATH` merely because the same path appears at
+  multiple stages; **and** whether `<sub>` is genuinely parsed from
+  type-2 (rename) and unmerged (`u`) porcelain v2 records, not only
+  type-1, with the identical decoded `SubmoduleState` correctly attached
+  to every `WorkingTreeEntry` one source record emits — proven by
+  dedicated type-2-dirty-rename and unmerged-conflicted-submodule
+  fixtures in addition to the existing type-1 fixture (§11, §18, §20)
+- **Ancestor-chain repository discovery in the post-Git-failure secondary
+  classifier — new, mandatory, Round 16 review finding #4:** whether
+  `resolveRepository` correctly reports `GIT_COMMAND_FAILED` — never
+  `NOT_A_GIT_REPOSITORY`, never `PROJECT_ROOT_MISMATCH` — for a
+  `projectRoot` nested inside a real repository whose own, ancestor-level
+  config is too malformed for Git's `--is-bare-repository` to
+  authoritatively establish a toplevel, proven by the dedicated
+  four-fixture regression (§20: healthy nested directory →
+  `PROJECT_ROOT_MISMATCH`; plain non-Git directory → `NOT_A_GIT_REPOSITORY`;
+  malformed repository root → `GIT_COMMAND_FAILED`; malformed repository
+  parent with nested `projectRoot` → `GIT_COMMAND_FAILED`, never the
+  other two codes) — and whether §8's own prose makes clear this
+  ancestor-chain check runs only inside the existing post-failure
+  fallback, never before step 2's authoritative Git invocation, and does
+  not reintroduce the Round-2-removed early `.git`-existence precheck
 - Whether test evidence is real (tests actually run against real,
   ephemeral, temporary Git repositories — not mocked Git command output)
 
