@@ -9,10 +9,20 @@ import type { ConfigError } from "./errors.js";
 export type { BuildRailConfig } from "./types.js";
 export type { ConfigError, ConfigErrorCode } from "./errors.js";
 
-export async function loadConfig(projectRoot: string): Promise<LoadResult<BuildRailConfig, ConfigError>> {
+/**
+ * `schemasDirOverride` is an internal-only test seam forwarded to
+ * `createRegistry()` (see schema/registry.ts) — never part of the
+ * documented public contract, never re-exported from the package's
+ * public `index.ts` barrel. Every real caller invokes `loadConfig`
+ * with a single `projectRoot` argument, unaffected by this parameter.
+ */
+export async function loadConfig(
+  projectRoot: string,
+  schemasDirOverride?: string,
+): Promise<LoadResult<BuildRailConfig, ConfigError>> {
   let registry;
   try {
-    registry = createRegistry();
+    registry = createRegistry(schemasDirOverride);
   } catch (error) {
     if (error instanceof SchemaReferenceUnresolvedError) {
       return {

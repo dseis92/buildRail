@@ -4,8 +4,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createRegistry, CONFIG_SCHEMA_ID, STATE_SCHEMA_ID, AUTHORIZATION_SCHEMA_ID } from "@buildrail/core";
-import { buildRegistryFromDir } from "./helpers/build-registry-from-dir.js";
+import { createRegistry, loadConfig, loadState, CONFIG_SCHEMA_ID, STATE_SCHEMA_ID, AUTHORIZATION_SCHEMA_ID } from "@buildrail/core";
 
 const execFileAsync = promisify(execFile);
 const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -35,28 +34,58 @@ test("authorization $ref inside state.schema.json resolves correctly (invalid ne
   }
 });
 
-test("a deliberately broken/unregistered $ref fails predictably at registry-setup time with SchemaReferenceUnresolvedError", () => {
+test("a deliberately broken internal $ref fails predictably at registry-setup time via createRegistry() itself with SchemaReferenceUnresolvedError", () => {
+  // Exercises the exact production createRegistry() algorithm (not a
+  // duplicated test-only registration routine) via its internal-only
+  // schemasDirOverride seam, pointed at a fixture directory whose three
+  // schema files all load/parse fine but whose authorization.schema.json
+  // has a deliberately mismatched $id, so state.schema.json's relative
+  // $ref to it cannot resolve.
   assert.throws(
-    () =>
-      buildRegistryFromDir(
-        join(fixturesDir, "broken-ref-schema"),
-        ["config.schema.json", "state.schema.json"],
-        "https://buildrail.dev/schemas/state.schema.json",
-      ),
+    () => createRegistry(join(fixturesDir, "broken-ref-schema")),
     (error: unknown) => error instanceof Error && error.constructor.name === "SchemaReferenceUnresolvedError",
   );
 });
 
-test("a missing schema asset file fails predictably at registry-setup time with SchemaSetupError", () => {
+test("a broken internal $ref surfaces through the production loadConfig()/loadState() translation path as SCHEMA_REFERENCE_UNRESOLVED", async () => {
+  const brokenRefSchemasDir = join(fixturesDir, "broken-ref-schema");
+  const validProject = join(fixturesDir, "valid-project");
+
+  const configResult = await loadConfig(validProject, brokenRefSchemasDir);
+  assert.equal(configResult.ok, false);
+  if (!configResult.ok) {
+    assert.equal(configResult.error.code, "SCHEMA_REFERENCE_UNRESOLVED");
+  }
+
+  const stateResult = await loadState(validProject, brokenRefSchemasDir);
+  assert.equal(stateResult.ok, false);
+  if (!stateResult.ok) {
+    assert.equal(stateResult.error.code, "SCHEMA_REFERENCE_UNRESOLVED");
+  }
+});
+
+test("a missing schema asset file fails predictably at registry-setup time via createRegistry() itself with SchemaSetupError", () => {
   assert.throws(
-    () =>
-      buildRegistryFromDir(
-        join(fixturesDir, "missing-schema-asset"),
-        ["config.schema.json", "state.schema.json"],
-        "https://buildrail.dev/schemas/state.schema.json",
-      ),
+    () => createRegistry(join(fixturesDir, "missing-schema-asset")),
     (error: unknown) => error instanceof Error && error.constructor.name === "SchemaSetupError",
   );
+});
+
+test("a missing schema asset file surfaces through the production loadConfig()/loadState() translation path as SCHEMA_SETUP_FAILED", async () => {
+  const missingAssetSchemasDir = join(fixturesDir, "missing-schema-asset");
+  const validProject = join(fixturesDir, "valid-project");
+
+  const configResult = await loadConfig(validProject, missingAssetSchemasDir);
+  assert.equal(configResult.ok, false);
+  if (!configResult.ok) {
+    assert.equal(configResult.error.code, "SCHEMA_SETUP_FAILED");
+  }
+
+  const stateResult = await loadState(validProject, missingAssetSchemasDir);
+  assert.equal(stateResult.ok, false);
+  if (!stateResult.ok) {
+    assert.equal(stateResult.error.code, "SCHEMA_SETUP_FAILED");
+  }
 });
 
 test("verification-report.schema.json and handoff.schema.json are confirmed NOT registered", () => {

@@ -16,10 +16,20 @@ export type {
 } from "./types.js";
 export type { StateError, StateErrorCode } from "./errors.js";
 
-export async function loadState(projectRoot: string): Promise<LoadResult<BuildRailState, StateError>> {
+/**
+ * `schemasDirOverride` is an internal-only test seam forwarded to
+ * `createRegistry()` (see schema/registry.ts) — never part of the
+ * documented public contract, never re-exported from the package's
+ * public `index.ts` barrel. Every real caller invokes `loadState`
+ * with a single `projectRoot` argument, unaffected by this parameter.
+ */
+export async function loadState(
+  projectRoot: string,
+  schemasDirOverride?: string,
+): Promise<LoadResult<BuildRailState, StateError>> {
   let registry;
   try {
-    registry = createRegistry();
+    registry = createRegistry(schemasDirOverride);
   } catch (error) {
     if (error instanceof SchemaReferenceUnresolvedError) {
       return {

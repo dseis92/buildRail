@@ -63,12 +63,25 @@ function schemasDir(): string {
 function normalizeAjvErrors(errors: ErrorObject[] | null | undefined): SchemaValidationErrorDetail[] {
   if (!errors) return [];
   return errors.map((error) => {
-    const path = error.instancePath
+    const segments = error.instancePath
       .split("/")
-      .filter((segment) => segment.length > 0)
-      .join(".");
+      .filter((segment) => segment.length > 0);
+    // For a `required`-keyword failure, Ajv's instancePath points at the
+    // *containing* object (e.g. "/authorization"), not the missing
+    // property itself — the missing property's name is instead in
+    // error.params.missingProperty (e.g. "granted_by"). Append it so the
+    // normalized path names the actual missing field
+    // ("authorization.granted_by"), not merely its container
+    // ("authorization"). Every other validation-keyword's path is left
+    // exactly as instancePath alone produces.
+    if (error.keyword === "required") {
+      const missingProperty = (error.params as { missingProperty?: string } | undefined)?.missingProperty;
+      if (typeof missingProperty === "string" && missingProperty.length > 0) {
+        segments.push(missingProperty);
+      }
+    }
     return {
-      path,
+      path: segments.join("."),
       message: error.message ?? "",
       keyword: error.keyword,
     };
@@ -85,9 +98,20 @@ function normalizeAjvErrors(errors: ErrorObject[] | null | undefined): SchemaVal
  * parsed fine but an internal `$ref` among them could not be resolved.
  * Throws `SchemaSetupError` for every other registration-time failure
  * (missing/unreadable/malformed schema file).
+ *
+ * `schemasDirOverride` is an internal-only test seam (never part of the
+ * documented public contract, never re-exported from the package's public
+ * `index.ts` barrel) letting tests point registration at a fixture
+ * directory instead of the package's real `packages/core/schemas/`, so
+ * the exact production registration/translation algorithm above can be
+ * exercised against deliberately broken fixture schemas without any test
+ * helper duplicating this function's logic. Every real (non-test) caller
+ * — including every call inside `@buildrail/core` itself — invokes
+ * `createRegistry()` with no arguments, which is unaffected by this
+ * parameter's existence.
  */
-export function createRegistry(): SchemaRegistry {
-  const dir = schemasDir();
+export function createRegistry(schemasDirOverride?: string): SchemaRegistry {
+  const dir = schemasDirOverride ?? schemasDir();
   const ajv = new Ajv2020({ allErrors: true });
 
   const compiled = new Map<Br2SchemaId, ValidateFunction>();
