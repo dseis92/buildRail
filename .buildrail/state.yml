@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: MERGE_AUTHORIZED
+  lifecycle_state: MERGED
   development_phase: BR2
 
 authorization:
@@ -44,9 +44,10 @@ baselines:
 # BR0 and BR1 have each been independently reviewed, approved, and frozen
 # at the SHAs recorded under `baselines`. BR1 established the first real,
 # executable BuildRail CLI (packages/cli). BR2 implementation
-# (candidate.branch above) has been independently reviewed, approved, and
-# passed Human QA, and its merge is now authorized — Git inspection and
-# verification-report generation remain unimplemented until BR3/BR4.
+# (candidate.branch above) has been independently reviewed, approved,
+# passed Human QA, and merged, and is now awaiting production
+# verification — Git inspection and verification-report generation
+# remain unimplemented until BR3/BR4.
 completed_phases:
   - BR0
   - BR1
