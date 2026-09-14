@@ -277,23 +277,58 @@ different binary" structurally impossible within one operation (§8).
 **It does not, and cannot, mean the file occupying that resolved path is
 mechanically frozen against replacement for the duration of the
 operation** — a portable, path-string-based resolver operating within
-BR3's Node-only, shell-free process contract has no mechanism to pin an
-OS-level file identity (an inode, a content hash) across multiple,
-separate `execFile` invocations; it can only pin the *pathname* it
-invokes. **BR3 therefore assumes the resolved Git executable file is not
-replaced or mutated during one top-level BR3 operation** — the ordinary
-case, and the only case this specification's guarantees are scoped to.
-BR3 resolves the executable once, validates its version once, and uses
-that absolute path throughout the operation, but does not claim this
-creates an atomic, OS-level executable-identity snapshot against a
-concurrently, adversarially replacing actor operating specifically in
-the narrow window between BR3's own `--version` check and a later Git
-invocation within the same operation. Closing that stronger,
-adversarial-executable-replacement case would require an execution/image-identity
-mechanism (e.g. verifying a content hash or inode identity immediately
-before each invocation, or an OS-level file-locking primitive) outside
-BR3 v0.1's current portable Node contract — explicitly deferred to a
-future phase (§26), should a concrete threat model ever require it.
+BR3's Node-only process contract (§18 — BR3 itself never requests a
+shell; see below for the precise scope of that guarantee) has no
+mechanism to pin an OS-level file identity (an inode, a content hash)
+across multiple, separate `execFile` invocations; it can only pin the
+*pathname* it invokes. **BR3 therefore assumes the resolved Git
+executable file is not replaced or mutated during one top-level BR3
+operation** — the ordinary case, and the only case this specification's
+guarantees are scoped to. BR3 resolves the executable once, validates
+its version once, and uses that absolute path throughout the operation,
+but does not claim this creates an atomic, OS-level executable-identity
+snapshot against a concurrently, adversarially replacing actor operating
+specifically in the narrow window between BR3's own `--version` check
+and a later Git invocation within the same operation. Closing that
+stronger, adversarial-executable-replacement case would require an
+execution/image-identity mechanism (e.g. verifying a content hash or
+inode identity immediately before each invocation, or an OS-level
+file-locking primitive) outside BR3 v0.1's current portable Node
+contract — explicitly deferred to a future phase (§26), should a
+concrete threat model ever require it.
+
+**The resolved Git executable is a trusted environment dependency, not
+an authenticated one — new, explicit, mandatory, Round 13 review finding
+#1.** BR3 verifies the resolved executable's *reported* version (§8's
+Capability Floor) but does **not**, and cannot, cryptographically or
+otherwise authenticate that the resolved executable genuinely is an
+unmodified Git binary — a malicious native binary occupying a resolved
+`git`/`git.exe` pathname could report any `--version` output it chooses.
+BR3's own process-security guarantees are precisely: it never requests a
+shell or performs shell-string interpolation of its own arguments; Git's
+arguments are always a literal argv array, never caller/repository-
+controlled text; it never falls back to `exec()`, `shell: true`,
+`cmd.exe`, or PowerShell under any circumstance; and, once resolved, the
+executable at that path is invoked directly and trusted as an
+environment dependency, exactly as BR3 already trusts the OS kernel,
+the filesystem, and Node itself — BR3 does not sandbox, does not
+authenticate, and does not guarantee that the trusted Git executable's
+own implementation, OS-level loader, or execution semantics never
+launches a further interpreter or subprocess of its own (§18's dedicated
+correction documents a concrete, verified instance of this: an
+executable text file without a shebang, satisfying every one of BR3's
+own POSIX candidate-validity rules, can still be run through the OS
+kernel's own `ENOEXEC`/interpreter-fallback behavior, entirely outside
+anything Node's `shell: false` `execFile` contract governs). **This is a
+categorically different, and separately, fully mandatory, threat
+boundary from the repository-controlled external-helper protections
+this specification already requires** (content-filter refusal,
+`core.fsmonitor` suppression, `--no-ext-diff` — §6, §18): those exist
+because repository-supplied *data* could otherwise cause the
+*already-trusted* Git binary to itself spawn an arbitrary,
+repository-selected helper — a hazard entirely independent of whether
+the initial Git executable itself is trustworthy, and one this round's
+correction does not relax in any way.
 
 ## 7. Proposed Module Structure
 
@@ -389,11 +424,44 @@ interface HeadInfo {
   upstream: UpstreamInfo | null;   // null if no upstream is configured
 }
 
+// UpstreamInfo — corrected, mandatory, Round 13 review finding #3
+// (replaces an earlier draft's `branch: string`, which assumed a
+// configured upstream is always a branch under refs/heads/ — false in
+// general: Git permits branch.<name>.merge to name ANY ref, e.g.
+// refs/tags/v1 or an arbitrary refs/custom/foo namespace, and
+// @{upstream} resolves such a configuration correctly. Verified
+// directly: a real repository with branch.<current>.remote="." and
+// branch.<current>.merge=refs/tags/v1 resolves
+// `<current>@{upstream}` to refs/tags/v1 successfully via
+// `git rev-parse --symbolic-full-name --verify -q --end-of-options`,
+// with the SHA resolving correctly too — the same succeeds for an
+// arbitrary refs/custom/foo namespace. Calling this a "branch" would be
+// simply false for these real, valid configurations.)
 interface UpstreamInfo {
-  remote: string;   // e.g. "origin", or "." for a local-branch upstream (§9/§10),
-                    // populated directly from branch.<b>.remote config —
-                    // independent of whether the upstream actually resolves;
-                    // strict-UTF-8-decoded (§13 Category 2)
+  remote: string;    // e.g. "origin", or "." for a local-branch upstream (§9/§10),
+                     // populated directly from branch.<b>.remote config —
+                     // independent of whether the upstream actually resolves;
+                     // strict-UTF-8-decoded (§13 Category 2)
+  mergeRef: string;  // the exact, complete, FIRST configured
+                     // branch.<current>.merge value (§9/§10, Round 9
+                     // review finding #2's first-value semantics,
+                     // preserved unchanged) — read NUL-safely (Round 13
+                     // review finding #2) and never shortened, never
+                     // assumed to live under refs/heads/, and never
+                     // reinterpreted: e.g. "refs/heads/main",
+                     // "refs/tags/v1", or "refs/custom/foo" are all
+                     // valid, faithfully preserved values — populated
+                     // directly from config, independent of whether the
+                     // upstream actually resolves; strict-UTF-8-decoded
+                     // (§13 Category 2)
+  branch: string | null; // the short branch name (e.g. "main"), populated
+                         // ONLY when mergeRef is genuinely under
+                         // refs/heads/ (i.e. mergeRef === "refs/heads/" +
+                         // branch) — null whenever the configured
+                         // upstream target is a tag, a custom-namespace
+                         // ref, or any other non-refs/heads/ target;
+                         // BR3 never calls a tag or a custom ref a
+                         // "branch" (§9/§10, Round 13 review finding #3)
   ref: string | null; // the symbolic full name @{upstream} itself resolves to,
                       // e.g. "refs/remotes/origin/main" (an ordinary
                       // remote-tracking upstream), "refs/custom-ns/origin/main"
@@ -413,15 +481,6 @@ interface UpstreamInfo {
                       // BR3 cannot tell you where its data lives" state, never
                       // a guess presented as fact. When non-null,
                       // strict-UTF-8-decoded (§13 Category 2).
-  branch: string;   // e.g. "main" (the remote-side branch name, from
-                    // branch.<b>.merge — read via --get-all, since this
-                    // key may be multi-valued; branch is derived from
-                    // the FIRST configured value, the same entry
-                    // @{upstream} itself uses — see §9/§10, Round 9
-                    // review finding #2), populated directly from
-                    // config — independent of whether the upstream
-                    // resolves; strict-UTF-8-decoded (§13 Category 2)
-                    // actually resolves
   sha: string | null; // resolved via @{upstream} — see §9/§10. null exactly
                       // when ref is null: whenever @{upstream} itself fails
                       // to resolve locally (§9's "configured but unresolvable"
@@ -1801,9 +1860,62 @@ every case below — there is no separate function per case.
 | Case | `branch` | `detached` | `unborn` | `headSha` | `upstream` |
 |---|---|---|---|---|---|
 | Normal branch, has commits | branch name | `false` | `false` | 40-hex SHA | per below |
-| Detached HEAD (checked out to a SHA/tag directly) | `null` | `true` | `false` | 40-hex SHA | `null` (detached HEAD never has an upstream) |
-| Unborn branch (fresh `git init`, zero commits) | branch name (the to-be-created branch, from `git symbolic-ref HEAD` — this resolves even with no commits) | `false` | `true` | `null` | `null` (no commit exists yet to have an upstream relationship against) |
+| Detached HEAD (checked out to a SHA/tag directly) | `null` | `true` | `false` | 40-hex SHA | `null` (detached HEAD never has an upstream — there is no current branch name for §10's `branch.<name>` config lookup to key on at all) |
+| Unborn branch (fresh `git init`, zero commits) | branch name (the to-be-created branch, from `git symbolic-ref HEAD` — this resolves even with no commits) | `false` | `true` | `null` | **per below — corrected, Round 13 review finding #4A: not unconditionally `null`** |
 | Corrupt HEAD (symbolic-ref resolves to a branch name, but that branch ref does not point at a real, existing commit object) | branch name (from `symbolic-ref`, still reported — the ref name itself is knowable even though it does not resolve to a real commit) | `false` | `false` | `null` | `null` | (see `HEAD_UNAVAILABLE`, below) |
+
+**Unborn-branch upstream semantics — corrected, mandatory, Round 13
+review finding #4A (an earlier draft of this table unconditionally
+reported `upstream: null` for every unborn branch, reasoning "no commit
+exists yet to have an upstream relationship against" — that reasoning
+conflates two genuinely distinct BR3 concepts this specification already,
+elsewhere, carefully separates: whether an upstream is *configured* at
+all, versus whether it currently *resolves*).** A symbolic, unborn
+branch (HEAD points at `refs/heads/<name>`, but that ref file does not
+yet exist because nothing has been committed) can still have both
+`branch.<name>.remote` and `branch.<name>.merge` **genuinely configured**
+in `.git/config` — most commonly because a fresh repository was cloned
+from a template, or because a caller/tool explicitly set up tracking
+before the first commit. This is a real, **configured** upstream
+identity, even though `<name>@{upstream}` itself cannot resolve yet,
+precisely because the local branch ref the tracking relationship is
+anchored to does not exist yet — exactly the "configured but currently
+unresolvable" shape §9/§10 already define and require for other cases
+(a deleted remote-tracking ref, a deleted local-upstream target), not a
+"nothing is configured" shape. Treating every unborn branch's upstream
+as unconditionally `null` — regardless of what `.git/config` actually
+declares — would silently discard a real, configured fact, which
+directly contradicts this specification's own, already-established
+"configured but unresolvable is not the same as not configured" principle
+(§9/§10, corrected in earlier rounds specifically to stop BR3 from
+conflating these two states for other cases).
+
+**The corrected, complete decision table for `upstream` across every
+`branch`/`detached`/`unborn` combination:**
+- **Detached HEAD:** `upstream: null` — unconditionally, always; there is
+  no current branch name at all for §10's `branch.<name>.remote`/`.merge`
+  config lookup to key on (unchanged from the existing, correct
+  behavior).
+- **Symbolic branch (normal or unborn), no `branch.<name>.remote`/`.merge`
+  configured:** `upstream: null` — the ordinary "no upstream configured"
+  case, determined purely by config-key absence (§10 step 1), unaffected
+  by whether the branch is unborn.
+- **Symbolic normal branch (has commits), `branch.<name>.remote`/`.merge`
+  configured:** unchanged, existing behavior — `UpstreamInfo` returned,
+  `ref`/`sha` resolved via `@{upstream}` if possible, `null` for both if
+  configured-but-unresolvable (§10).
+- **Symbolic unborn branch, `branch.<name>.remote`/`.merge` genuinely
+  configured — the corrected case:** `UpstreamInfo` is returned, **not**
+  `null` — `remote`/`mergeRef`/`branch` populated exactly as §10 step 1
+  already specifies (directly from config, independent of resolution);
+  `ref: null`, `sha: null`, since `<name>@{upstream}` cannot resolve
+  while the branch itself remains unborn — this is the identical
+  "configured but unresolvable" shape §9/§10 already define, reached for
+  a different underlying reason (the branch not existing yet, rather
+  than a tracking ref having been deleted) but represented identically:
+  a truthful, configured `UpstreamInfo` with `ref`/`sha` both `null`,
+  never collapsed to an undifferentiated `upstream: null` that would
+  erase the fact that something real is configured.
 
 **Determination method — exit codes and machine-readable facts only,
 never stderr-text matching (revised — corrects Round 1 review finding
@@ -2010,16 +2122,56 @@ data is actually present.
 
 1. **Configured identity, independent of the tracking ref's existence —
    corrected to use `--get-all` for `.merge`, mandatory, Round 9 review
-   finding #2:** `git config --get branch.<branch>.remote` and `git
-   config --get-all branch.<branch>.merge` (both genuinely read-only —
+   finding #2; made NUL-safe, mandatory, Round 13 review finding #2:**
+   `git config -z --get branch.<branch>.remote` and `git config -z
+   --get-all branch.<branch>.merge` (both genuinely read-only —
    `--get`/`--get-all`, never `--set`/`--add`; both already on §27's
-   read-only command allowlist, `--get-all` newly named explicitly this
-   round). `<branch>` is the branch name from the branch/detached
+   read-only command allowlist, `--get-all` and `-z` both named
+   explicitly). `<branch>` is the branch name from the branch/detached
    determination above (this step is skipped entirely, `upstream: null`,
    if HEAD is detached — a detached HEAD has no branch name to look up
    config for).
 
-   **Why `--get-all`, not a bare `--get`, is required for `.merge`:**
+   **Why `-z` is mandatory for `--get-all`, not merely a stylistic
+   preference — new, mandatory, Round 13 review finding #2 (this is
+   implementation-blocking, not cosmetic):** a Git config value can
+   itself contain an **embedded newline** — the value is not required to
+   be a single line of text. Plain, newline-delimited `git config
+   --get-all branch.<b>.merge` output is therefore **fundamentally
+   ambiguous** for any consumer, including BR3, that needs to recover
+   the exact number and content of configured values, not merely a
+   flattened stream of lines. **Verified directly:** a fixture where the
+   **first** `branch.<b>.merge` value's own content is literally
+   `refs/heads/foo\nrefs/heads/bar` (i.e. one configured value whose text
+   contains an embedded newline) and the **second**, separate, genuinely
+   distinct configured value is `refs/heads/bar` — plain `git config
+   --get-all branch.<b>.merge` output is byte-for-byte indistinguishable
+   from a **three**-separate-value configuration
+   (`refs/heads/foo`, `refs/heads/bar`, `refs/heads/bar`); a line-based
+   parser cannot tell these two genuinely different configurations apart
+   from the output alone. `git config -z --get-all branch.<b>.merge`,
+   by contrast, correctly emits each **complete** value NUL-terminated
+   (`<first complete value, embedded newline included>\0<second complete
+   value>\0`), which is unambiguous. Since BR3's upstream contract
+   specifically depends on identifying the exact **first** configured
+   `.merge` value (below), this ambiguity is not a cosmetic parsing
+   nicety — a line-based parser could silently misidentify which value
+   is "first" whenever an earlier value contains an embedded newline.
+   **The corrected parsing pipeline, mirroring §13's existing byte-first
+   discipline exactly (never a second, separate lossy policy):** `git
+   config -z --get branch.<branch>.remote`/`-z --get-all
+   branch.<branch>.merge` are invoked with `encoding: "buffer"` (§18,
+   universal for every BR3 Git call); the raw `Buffer` output is
+   NUL-split (`Buffer.prototype.indexOf(0x00)`/`.subarray()`, never
+   `buffer.toString().split(...)`, exactly as §13 already requires for
+   working-tree/diff path output); each complete, isolated value's byte
+   range is then strict-UTF-8-decoded individually (§13 Category 2) —
+   never decoding the whole buffer first and splitting the resulting
+   string, which would already have discarded the byte-exact record
+   boundaries `-z` exists to preserve.
+
+   **Why `--get-all`, not a bare `--get`, is additionally required for
+   `.merge` (unchanged from Round 9, restated with `-z` now included):**
    Git explicitly permits **multiple** `branch.<name>.merge` values —
    an octopus-merge-style configuration — and a bare `git config --get
    branch.<branch>.merge` against a multi-valued key returns only the
@@ -2031,9 +2183,8 @@ data is actually present.
    ```
    $ git config --get branch.master.merge
    refs/heads/bar                          # last value only
-   $ git config --get-all branch.master.merge
-   refs/heads/foo
-   refs/heads/bar                          # both values, in order
+   $ git config -z --get-all branch.master.merge
+   refs/heads/foo\0refs/heads/bar\0        # both complete values, in order, NUL-safe
    $ git rev-parse --symbolic-full-name master@{upstream}
    refs/heads/foo                          # @{upstream} uses the FIRST value
    ```
@@ -2042,42 +2193,51 @@ data is actually present.
    in step 2, unaffected by this bug) describe `refs/heads/foo`** — a
    single `UpstreamInfo` object internally describing two different
    targets, which is a genuine correctness defect, not merely an edge
-   case: `branch` and `ref`/`sha` must always describe the *same*
-   upstream.
+   case: the reported merge target and `ref`/`sha` must always describe
+   the *same* upstream.
 
    **The corrected mapping from Git's multi-valued `.merge` configuration
    to BR3's single `UpstreamInfo` object:**
-   - **Zero merge values** (`--get-all` exits 1, no stdout — the
+   - **Zero merge values** (`-z --get-all` exits 1, no stdout — the
      ordinary case): `upstream: null`, subject to the same remote-key
      rules already established (both `.remote` and `.merge` must be
      present for anything to be configured at all). **Not** an error —
      this is the ordinary "no upstream configured" case, determined by
      config-key absence, not by any ref resolution having been attempted.
    - **One merge value:** identical to this specification's existing,
-     already-correct behavior — the remote-side branch name is known
-     directly from that one value, with no ambiguity.
+     already-correct behavior — that one, complete, NUL-delimited value
+     is used directly, with no ambiguity.
    - **Multiple merge values:** BR3 uses the **same** merge entry Git's
      own `@{upstream}` shorthand represents — **verified against BR3's
      supported Git floor to be the first configured value** (the
      reproduction above; `refs/heads/foo`, the first of the two
-     configured values, not the last) — so `branch` is derived from that
-     **first** `--get-all` value specifically, never the last (bare
-     `--get`'s behavior) and never an arbitrary/unspecified pick among
-     the set. This is what makes `UpstreamInfo.branch`,
-     `UpstreamInfo.ref`, and `UpstreamInfo.sha` — the latter two derived
-     via `@{upstream}` in step 2, which Git itself already resolves
-     against this same first value — describe the **same** upstream,
-     consistently, in every case.
+     configured values, not the last) — so `mergeRef` is derived from
+     that **first** NUL-delimited `--get-all` record specifically, never
+     the last (bare `--get`'s behavior) and never an arbitrary/unspecified
+     pick among the set. This is what makes `UpstreamInfo.mergeRef`/
+     `.branch`, `UpstreamInfo.ref`, and `UpstreamInfo.sha` — the latter
+     two derived via `@{upstream}` in step 2, which Git itself already
+     resolves against this same first value — describe the **same**
+     upstream, consistently, in every case.
 
    Once the first `.merge` value (for the single- or multi-valued case
    alike) is identified, BR3 has the remote name (from
-   `branch.<branch>.remote`, e.g. `origin` or `.`) and the merge ref
-   (e.g. `refs/heads/main`) — from which the remote-side branch name
-   (`main`) is known directly, with no further Git call needed. The
-   `ref` field reported to callers (§7a) remains the resolved tracking
-   ref **as Git itself resolves it** — see step 2, not a BR3-constructed
-   path, and (as already established) never re-derived from a different
-   merge entry than the one `branch` itself names.
+   `branch.<branch>.remote`, e.g. `origin` or `.`) and the merge ref —
+   from which `UpstreamInfo.mergeRef` is populated with that **exact,
+   complete, unaltered** value (§7a, Round 13 review finding #3 —
+   never shortened, never assumed to be a branch name, whatever its
+   actual namespace: `refs/heads/main`, `refs/tags/v1`, and
+   `refs/custom/foo` are all preserved verbatim). `UpstreamInfo.branch`
+   is then derived, separately, **only** when `mergeRef` genuinely
+   begins with the literal prefix `refs/heads/` — in that case `branch`
+   is the remainder of the string after that prefix (e.g. `"main"` for
+   `mergeRef: "refs/heads/main"`); for any other `mergeRef` namespace
+   (`refs/tags/...`, `refs/custom/...`, or anything else), `branch` is
+   `null` — BR3 never calls a tag or a custom-namespace ref a "branch."
+   The `ref` field reported to callers (§7a) remains the resolved
+   tracking ref **as Git itself resolves it** — see step 2, not a
+   BR3-constructed path, and (as already established) never re-derived
+   from a different merge entry than the one `mergeRef` itself names.
 2. **Upstream-SHA resolution, via `@{upstream}` itself, resolved
    in the context of `<branch>` (not whatever branch HEAD happens to
    currently be, so this remains correct if that ever diverges) — this
@@ -2147,9 +2307,26 @@ data is actually present.
        `refs/heads/<other-branch>` — a plain local branch ref, never
        anything under `refs/remotes/` — and `sha` is that other local
        branch's own current tip.
+     - **Non-branch local upstream target — new, mandatory, Round 13
+       review finding #3.** `branch.<name>.remote = "."` does not
+       require the configured `.merge` target to itself be a branch —
+       Git equally supports a local tag or an arbitrary local ref
+       namespace as the configured upstream. **Verified directly:** a
+       real repository with `branch.<current>.remote = "."` and
+       `branch.<current>.merge = refs/tags/v1` — `git rev-parse
+       --symbolic-full-name --verify -q --end-of-options
+       '<current>@{upstream}'` successfully resolves to `refs/tags/v1`,
+       with the SHA resolving correctly too; the identical mechanism
+       succeeds equally for an arbitrary `refs/custom/foo` namespace.
+       In both cases `ref` is the exact, faithfully-resolved target
+       (`refs/tags/v1`/`refs/custom/foo`), `sha` is that target's own
+       resolved commit, and `UpstreamInfo.mergeRef` (step 1) already
+       preserves the identical, unshortened configured value —
+       `UpstreamInfo.branch` is correctly `null` for both, since neither
+       target lives under `refs/heads/` (§7a).
 
      **This is the entirety of what "upstream SHA" means in BR3, for
-     either subcase** — the SHA `@{upstream}`'s own already-resolved
+     any subcase** — the SHA `@{upstream}`'s own already-resolved
      target already records locally, never a live query to an actual
      remote server. For a remote-tracking upstream specifically, that SHA
      is exactly as fresh as whenever the *user* (not BR3) last ran an
@@ -2403,7 +2580,7 @@ required, not incidental:
 | `2 .R ... <score> <path>\0<origPath>\0` (unstaged rename) | `unstaged_rename` (with `oldPath`, `similarity` from `<score>`) — **corrected, Round 6 review finding #6: no longer under-classified; reachability corrected, Round 7 review finding #2.** An earlier draft of this specification represented this record as a plain `unstaged_modify` on the new path, deliberately discarding the `oldPath`/`similarity` data this exact porcelain v2 record type already carries in the identical positions as the staged-rename record above. `unstaged_rename` remains a first-class `WorkingTreeEntryKind` (§7a), populated identically to `staged_rename`, whenever BR3's own documented `status` invocation (§11) actually emits this record. **A plain, ordinary filesystem rename with no accompanying index operation does *not*, by itself, reliably produce `2 .R`** — this earlier draft's implied reachability claim ("a plain filesystem rename... causes Git to emit `2 .R`") is corrected: **verified directly**, starting from a committed, tracked `old.txt` with no other changes, a plain `mv old.txt new.txt` with zero index operations, under BR3's exact `status` invocation, instead produces two independent records — `1 .D ... old.txt` (`unstaged_delete`) and `? new.txt` (`untracked`) — **never** `2 .R`. Porcelain v2's unstaged-rename detection requires the new path to already be represented in the index in some form for Git's rename-pairing heuristic to have anything to pair the deletion against; a genuinely untracked new path gives Git no such pairing signal. **A real, reachable `2 .R` state was independently verified** via `mv old.txt new.txt` followed by `git add -N new.txt` (an intent-to-add index entry — no content staged, the change remains fully unstaged) — BR3's exact `status` invocation against that state emits `2 .R ... R100 new.txt\0old.txt\0`, confirming `unstaged_rename` is genuinely reachable, just not via the naive "plain rename" construction an earlier draft implied. §11/§14/§20/§27 are corrected accordingly: BR3 reports whatever Git actually emits for a given repository state and never synthesizes a rename relationship Git itself did not provide — a plain, unstaged, non-intent-to-added filesystem rename is correctly, truthfully reported as `unstaged_delete`(old) + `untracked`(new), two independent facts, not a rename. |
 | `u <xy> ... <path>` (unmerged) | `conflicted` |
 | `? <path>` | `untracked` |
-| `1 ..` with a `S...` submodule marker in the XY field | (combined with the base kind above) `submodule` populated per §11's submodule handling |
+| `1 <XY> <sub> ...` where `<sub>` is `S<c><m><u>` (a separate, dedicated field — never inside `<XY>` itself; see §11's submodule-field correction, Round 13 review finding #4B) | (combined with the base kind derived from `<XY>` above) `submodule` populated per §11's submodule handling |
 
 **Same-path staged+unstaged case (explicit, per the task's requirement):**
 porcelain v2's ordinary-changed-entry record type `1` carries **two**
@@ -2512,14 +2689,39 @@ valid state matrix above has been checked and found not to match; this
 specification does not fall back to `MALFORMED_GIT_OUTPUT` for any
 record shape this matrix already defines.
 
-**Submodule state:** porcelain v2's submodule marker (`S<c><m><u>` in the
-XY-adjacent field) is decoded into `SubmoduleState { commitChanged,
-hasUntrackedContent, hasModifiedContent }` and attached to the relevant
-entry's `submodule` field. BR3 surfaces this because porcelain v2
-provides it essentially for free (no extra command), but does **not**
-recurse into the submodule itself for BuildRail's *own* higher-level
-inspection — that would require a second, separate
-`resolveRepository`/`inspectWorkingTree` call by the *caller*, against
+**Submodule state — field layout corrected, mandatory, Round 13 review
+finding #4B (an earlier draft of this document inconsistently described
+the submodule marker's location: one table row said "in the XY field,"
+this prose said "the XY-adjacent field" — neither is precise, and the
+first is actively wrong).** Porcelain v2's ordinary-changed-entry record
+(type `1`) has a fixed sequence of **distinct, separate, space-delimited
+fields**, of which `<XY>` (the two-character staged/unstaged status
+pair this section's earlier state-matrix discussion already covers in
+full) and `<sub>` (the four-character submodule marker,
+`S<c><m><u>` when the path is a submodule, or the literal `N...` when it
+is not) are two of those separate fields — `<sub>` is never nested
+inside, searched for within, or otherwise parsed out of `<XY>` itself;
+they are two independent fields in the record's own fixed layout.
+**Verified directly, a real dirty-submodule porcelain v2 record:**
+```
+1 .M S.M. <mode_H> <mode_I> <mode_W> <hH> <hI> <path>
+```
+— here `.M` is `<XY>` (unstaged-modified, ordinary type-1 meaning,
+exactly as the earlier state matrix defines) and `S.M.` is the
+**separate** `<sub>` field, immediately following `<XY>` as its own,
+independent token — never a substring BR3 must search for or extract
+from within `<XY>`'s own two characters. BR3's parser reads `<sub>` as
+its own, dedicated field position in the record (after the mode/hash
+fields already established elsewhere in this document's field-by-field
+parsing description), decoding `S<c><m><u>` into `SubmoduleState {
+commitChanged, hasUntrackedContent, hasModifiedContent }` and attaching
+it to the relevant entry's `submodule` field, precisely when `<sub>`'s
+first character is `S` (never `N`, the not-a-submodule sentinel). BR3
+surfaces this because porcelain v2 provides it essentially for free (no
+extra command), but does **not** recurse into the submodule itself for
+BuildRail's *own* higher-level inspection — that would require a
+second, separate `resolveRepository`/`inspectWorkingTree` call by the
+*caller*, against
 the submodule's own path as a new `projectRoot`, which BR3's existing
 API already supports without special-casing submodules further. **Git
 itself, however, genuinely does inspect each initialized submodule's own
@@ -3481,11 +3683,71 @@ in-process mechanism this helper itself performs.
 - **Primitive: `execFile` (promisified), never `spawn` directly, never
   `exec`.** `execFile` takes the command and its arguments as a separate
   `command: string, args: string[]` pair — never a single shell-interpreted
-  command string — which structurally forbids shell interpolation: there
-  is no shell in the invocation path at all (`execFile` does not spawn a
-  shell intermediary the way `exec` does), so there is no injection
-  surface via argument content, regardless of what a caller-supplied ref
-  string contains. **The `command` argument is always the already-resolved,
+  command string — which structurally forbids shell interpolation of
+  BR3's own argv construction. **The precise, honest guarantee — corrected,
+  mandatory, Round 13 review finding #1 (an earlier draft overclaimed
+  "there is no shell in the invocation path at all," which is false on
+  POSIX):** BR3 itself never requests a shell (`shell: true` is never
+  passed), never constructs a shell command string, and always supplies
+  Git's arguments as a literal argv array to `execFile`'s `command`/`args`
+  parameters — this is what "structurally forbids shell interpolation"
+  actually, truthfully means: **BR3's own invocation path contains no
+  shell**, not "no shell can ever become involved by any means
+  whatsoever." **Verified directly**, Node 22.16.0 on Linux: a regular,
+  executable text file (`#!`-less — literal shell-script text with no
+  shebang line, made executable via `chmod +x`) invoked by its absolute
+  path via `execFile(path, [], { shell: false })` succeeds and produces
+  the script's own output — Node/libuv's POSIX execution path uses
+  `execvp`-family semantics, and the OS kernel's own `ENOEXEC` handling
+  for a non-binary, non-shebang executable text file can itself fall
+  back to invoking a shell/interpreter to run it, entirely below Node's
+  own `shell: false` contract and outside anything `execFile`'s own
+  argument-passing discipline can prevent. **A candidate satisfying
+  BR3's own resolver rules (§8: exists, a regular file after symlink
+  resolution, executable) does not, on its own, prove the OS will treat
+  it as a native binary with no interpreter fallback of its own** — this
+  is a property of the resolved executable file's own contents and the
+  OS's own execution semantics, not something `execFile`'s argv-array
+  discipline governs at all. **BR3 therefore does not claim to eliminate
+  every conceivable path by which *some* shell or interpreter could ever
+  become involved in running the resolved executable — it claims,
+  precisely, that BR3's own invocation never requests one and never
+  constructs shell-interpretable text.** This is why the resolved Git
+  executable is treated as a **trusted environment dependency** (see
+  below), not as a target BR3 itself sandboxes against; and it is why
+  the *separate*, genuinely different threat this specification's other
+  mitigations exist for — repository-controlled data (a
+  `.gitattributes` filter, `core.fsmonitor`, an external diff driver)
+  causing the *already-trusted* Git binary to itself spawn a
+  repository-selected helper — remains fully, independently mandatory
+  (§6, §18) regardless of this correction, since that threat does not
+  depend on whether the initial Git invocation path contains a shell at
+  all.
+
+  **The trust boundary, stated explicitly — new, mandatory, Round 13
+  review finding #1:** BR3 verifies the resolved executable's *reported*
+  version (§8's Capability Floor) but does **not**, and cannot,
+  cryptographically or otherwise authenticate that the resolved
+  executable is a genuine, unmodified Git binary — a malicious native
+  binary named `git` (or occupying a resolved `git`/`git.exe` pathname)
+  can report any `--version` output it chooses, exactly as a script
+  could. BR3's actual, defensible guarantees are precisely these, no
+  more and no less: (i) BR3 itself never requests a shell or performs
+  shell-string interpolation of its own arguments; (ii) Git's arguments
+  are always supplied as a literal argv array, never a caller/repository-
+  controlled string capable of being reinterpreted as multiple
+  arguments or flags (§13's `--end-of-options` protections remain fully
+  in force, unaffected by this correction — a caller-supplied ref string
+  never becomes shell text *or* a flag-shaped positional argument, for
+  entirely separate reasons); (iii) BR3 never falls back to `exec()`,
+  `shell: true`, `cmd.exe`, PowerShell, or any other explicit
+  shell/interpreter invocation, under any circumstance; and (iv) once
+  resolved, BR3 treats the executable at that path as a **trusted
+  environment dependency** — BR3 does not guarantee that the trusted Git
+  executable itself, its OS-level loader, or its own internal
+  implementation never launches a further interpreter or subprocess of
+  its own; that is outside what a portable, Node-only, no-shell process
+  contract can mechanically verify. **The `command` argument is always the already-resolved,
   absolute, canonicalized `git` executable path from §8's Capability
   Floor subsection's in-process resolution mechanism — never the bare
   literal string `"git"`** (corrected, Round 8 review finding #2): once
@@ -5428,6 +5690,28 @@ current validation algorithm)**
       non-executable files, or broken symlinks, with no genuinely valid
       candidate anywhere) → resolution fails with exactly
       `GIT_EXECUTABLE_UNAVAILABLE`.
+    - **(F) Documented Node behavior check: an executable text-file
+      candidate is accepted by BR3's own resolver rules and does not
+      itself prove "no shell involved" — new, mandatory, Round 13 review
+      finding #1** (a regular, executable text file — `chmod +x`, no
+      shebang line, literal shell-script text as its content — placed at
+      a `PATH`-directory candidate location) → this candidate satisfies
+      every one of BR3's own POSIX candidate-validity rules above
+      (exists, regular file after symlink resolution, executable) and is
+      therefore accepted by the resolver exactly as any other valid
+      candidate would be; this test exists to document, not to assert a
+      security boundary BR3 does not claim — it confirms the resolver's
+      *filesystem-shape* validation behaves exactly as specified (this
+      candidate genuinely is a regular, executable file, so accepting it
+      is correct under §8's own stated contract), and separately, via a
+      focused Node-behavior check (not a BR3 resolver behavior claim),
+      confirms that invoking such a file's absolute path via
+      `execFile(path, [], { shell: false })` can still succeed and
+      execute the file's script contents (Node/libuv's own POSIX
+      `execvp`-family/`ENOEXEC`-fallback semantics) — proving §8's
+      trust-boundary wording is not merely descriptive prose but reflects
+      genuine, verified runtime behavior this specification's guarantees
+      are correctly scoped around.
   - **Windows environment-key casing during resolution, where testable**
     (on a Windows test runner, or via a focused unit test against the
     resolution function's own Windows-specific branch, independent of
@@ -5533,6 +5817,18 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   regression test proving this is derived from
   `symbolic-ref -q HEAD`/`rev-parse --verify -q HEAD^{commit}` exit codes
   alone (§9), not from any stderr text
+- **Unborn symbolic branch with `branch.<name>.remote`/`.merge`
+  genuinely configured — mandatory, new, Round 13 review finding #4A**
+  (a fresh repository, zero commits, `HEAD` symbolic and unborn as
+  above, but `branch.<name>.remote`/`.merge` config keys set directly —
+  e.g. via `git config` before any commit exists) → `upstream` is a
+  genuinely configured, non-null `UpstreamInfo` — `remote`/`mergeRef`/
+  `branch` correctly populated directly from config — with `ref: null`,
+  `sha: null` (since `<name>@{upstream}` cannot resolve while the branch
+  remains unborn) — proving BR3 does not conflate "configured but
+  currently unresolvable because the branch is unborn" with "no upstream
+  configured at all," the identical distinction §9/§10 already enforce
+  for other configured-but-unresolvable shapes.
 - **Direct/detached HEAD pointing at a nonexistent object — new, Round 4
   review finding #5** (constructed by writing a non-existent, all-zeros
   SHA directly into a detached `.git/HEAD` file) → `HEAD_UNAVAILABLE`
@@ -5566,33 +5862,70 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
 - **Ordinary single `branch.<branch>.merge` value — mandatory, new,
   Round 9 review finding #2** (re-asserted explicitly as the baseline
   the multi-valued fixtures below are contrasted against) → identical
-  existing behavior, `branch`/`ref`/`sha` all correctly describing the
-  one configured value.
+  existing behavior, `mergeRef`/`branch`/`ref`/`sha` all correctly
+  describing the one configured value (`branch` correctly non-null,
+  since this baseline fixture's target is under `refs/heads/`).
 - **Multi-valued `branch.<branch>.merge` (octopus-style config), both
-  targets present — mandatory, new, Round 9 review finding #2**
+  targets present — mandatory, new, Round 9 review finding #2, NUL-safe
+  parsing corrected Round 13 review finding #2**
   (`branch.master.remote = "."`, `branch.master.merge` set to two
   values in order — `refs/heads/foo` then `refs/heads/bar` — both local
-  branches existing) → `branch` is derived from the **first** configured
-  value (`"foo"`), and `ref`/`sha` (via `@{upstream}`) correctly resolve
-  to `refs/heads/foo`'s own target — proving all three fields describe
+  branches existing) → `mergeRef` is derived from the **first**
+  configured value (`"refs/heads/foo"`, with `branch: "foo"`), and
+  `ref`/`sha` (via `@{upstream}`) correctly resolve to
+  `refs/heads/foo`'s own target — proving all relevant fields describe
   the identical upstream, never a mix of the first and last configured
   values. First confirmed, in the test's own setup, that a bare `git
   config --get branch.master.merge` against this exact fixture returns
-  only `refs/heads/bar` (the last value) while `git config --get-all`
-  returns both, and that `git rev-parse --symbolic-full-name
-  master@{upstream}` resolves to `refs/heads/foo` (the first value) —
-  establishing the bare-`--get` hazard is real, not hypothetical.
+  only `refs/heads/bar` (the last value) while `git config -z
+  --get-all` returns both, complete and NUL-delimited, and that `git
+  rev-parse --symbolic-full-name master@{upstream}` resolves to
+  `refs/heads/foo` (the first value) — establishing the bare-`--get`
+  hazard is real, not hypothetical.
 - **Multi-valued `branch.<branch>.merge`, first target missing/deleted —
   mandatory, new, Round 9 review finding #2** (identical to the fixture
   above, but the local branch `refs/heads/foo` — the first configured
   merge value — is subsequently deleted) → the configured-but-unresolvable
   semantics already established for the single-valued case apply
-  identically: `ref: null`, `sha: null`, `remote`/`branch` still
-  populated from config (`branch` still reporting `"foo"`, the first
-  configured value, even though it no longer resolves) — proving BR3
-  does not silently fall back to the second configured value merely
-  because the first one stopped resolving, since `@{upstream}` itself
-  does not fall back either.
+  identically: `ref: null`, `sha: null`, `remote`/`mergeRef`/`branch`
+  still populated from config (`mergeRef` still reporting
+  `"refs/heads/foo"`, `branch` still `"foo"`, the first configured
+  value, even though it no longer resolves) — proving BR3 does not
+  silently fall back to the second configured value merely because the
+  first one stopped resolving, since `@{upstream}` itself does not fall
+  back either.
+- **Multi-valued `branch.<branch>.merge`, first value contains an
+  embedded newline — mandatory, new, Round 13 review finding #2 (the
+  specific, implementation-blocking regression this round's `-z`
+  correction closes)** (`branch.master.remote = "."`; the **first**
+  configured `branch.master.merge` value's own content is literally
+  `refs/heads/foo\nrefs/heads/bar` — one value whose text contains a raw
+  embedded newline, constructed via direct `.git/config` manipulation or
+  an equivalent mechanism bypassing `git config`'s own value-quoting;
+  the **second**, separate, genuinely distinct configured value is
+  `refs/heads/bar`) → BR3 correctly recovers **exactly two** configured
+  values (not three) — first confirmed, in the test's own setup, that
+  plain, non-`-z` `git config --get-all branch.master.merge` output for
+  this exact fixture is byte-for-byte indistinguishable from a
+  three-separate-value configuration, establishing the ambiguity is
+  real; then confirming BR3's own NUL-safe parsing genuinely recovers
+  the correct value count and content via `git config -z --get-all`,
+  never fabricating a third merge value out of the embedded newline.
+- **Local-tag upstream target — mandatory, new, Round 13 review finding
+  #3** (`branch.<current>.remote = "."`, `branch.<current>.merge =
+  refs/tags/v1`, a real local tag `v1` existing) → `mergeRef:
+  "refs/tags/v1"`, `branch: null` (never treated as a branch name),
+  `ref`/`sha` correctly resolved via `@{upstream}` to the tag's own
+  target — proving BR3's upstream model correctly represents a
+  non-branch upstream target rather than misrepresenting or rejecting
+  it.
+- **Custom-namespace local upstream target — mandatory, new, Round 13
+  review finding #3** (identical structure to the tag case, but
+  `branch.<current>.merge = refs/custom/foo`, a real ref existing at
+  that exact path) → `mergeRef: "refs/custom/foo"`, `branch: null`,
+  `ref`/`sha` correctly resolved — proving the same correctness for an
+  arbitrary, non-conventional ref namespace, not merely the
+  already-well-known tag case.
 - **Upstream configured under a custom fetch refspec** (e.g.
   `remote.origin.fetch` rewritten to land tracking refs under a
   non-standard namespace instead of `refs/remotes/<remote>/`, then
@@ -5819,6 +6152,17 @@ review finding #5 (HEAD-resolves-to-a-real-commit validation via
   is returned sorted per §7a's exact `path`/`kind`/`oldPath` key order —
   asserted directly against the expected sorted sequence, not merely
   checked for content correctness irrespective of order
+- **Submodule state field parsing — mandatory, new, Round 13 review
+  finding #4B** (a real initialized submodule made dirty — an unstaged
+  modification to a tracked file inside the submodule's own working
+  tree — producing the verified real record shape `1 .M S.M. ... <path>`
+  under BR3's exact `status` invocation) → the resulting entry's
+  `submodule` field correctly reports `SubmoduleState { commitChanged:
+  false, hasUntrackedContent: false, hasModifiedContent: true }`,
+  proving BR3's parser reads the `<sub>` field (`S.M.`) as its own,
+  independent field position in the record — never by searching for an
+  `S`-prefixed substring inside the separate `<XY>` field (`.M`) — and
+  that the two fields are never confused with one another.
 
 **Diff inspection (§13, §14, §15)**
 - Two valid refs/SHAs → correct `fromSha`/`toSha` and changed-path list
@@ -6961,6 +7305,60 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   stated identically everywhere it appears, with no remaining reference
   to `config` supporting only `--get`/`--get-regexp` (§11, §13, §19,
   §20, §27).
+- **AC.** — new, Round 13 review finding #1. §8/§18's process-security
+  wording states the honest, narrower guarantee — "BR3 itself never
+  requests a shell or performs shell-string interpolation; Git is
+  invoked through a resolved executable path with a separate argv array"
+  — never the overclaim "there is no shell in the invocation path at
+  all," which is verifiably false on POSIX (a `chmod +x` executable text
+  file with no shebang can still be run through the OS kernel's own
+  `ENOEXEC`/interpreter-fallback behavior when invoked via `execFile`
+  with `shell: false`). The resolved Git executable is explicitly
+  documented as a **trusted environment dependency** BR3 verifies the
+  reported version of but does not authenticate — a categorically
+  different, and separately still fully mandatory, threat boundary from
+  the repository-controlled external-helper protections (content
+  filters, `core.fsmonitor`, `--no-ext-diff`), which remain unweakened
+  by this correction (§6, §18, §20).
+- **AD.** — new, Round 13 review finding #2. Every repository-controlled,
+  potentially multi-valued or embedded-newline-bearing Git config value
+  BR3 consumes (`branch.<branch>.remote`/`.merge`) is read via `-z`, with
+  raw `Buffer` output NUL-split before any decoding, then each complete
+  value strict-UTF-8-decoded individually (§13 Category 2) — never
+  line-split, and never assumed to be free of embedded newlines.
+  `extensions.refStorage` (§8 step 5b) is a distinct, single-valued,
+  fixed-machine-token config fact (§13 Category 1: its only meaningful
+  outcomes are "absent," `files`, `reftable`, or another short,
+  unrecognized token — never free-form repository-controlled text) and
+  is correctly read via a bare `--get`, never requiring `-z`; this
+  specification never conflates the two config-value categories or
+  their differing read disciplines (§8, §13). A `branch.<branch>.merge`
+  value whose own content contains an embedded newline is correctly
+  recognized as
+  one complete configured value, never fabricating an extra value out of
+  the embedded newline (§9, §10, §20).
+- **AE.** — new, Round 13 review finding #3. `UpstreamInfo` correctly
+  models that a configured upstream target need not be a branch: `mergeRef`
+  preserves the exact, complete, first configured `branch.<b>.merge`
+  value verbatim, regardless of namespace (`refs/heads/...`,
+  `refs/tags/...`, or any other `refs/...` path); `branch` is populated
+  only when `mergeRef` genuinely begins with `refs/heads/`, and is
+  `null` otherwise — a local tag or custom-namespace upstream target is
+  never mischaracterized as a branch (§7a, §9, §10, §20).
+- **AF.** — new, Round 13 review finding #4. **(A)** A symbolic, unborn
+  branch with `branch.<name>.remote`/`.merge` genuinely configured in
+  `.git/config` reports a non-null, genuinely configured `UpstreamInfo`
+  (`ref: null`, `sha: null`, since `@{upstream}` cannot yet resolve) —
+  never collapsed to an undifferentiated `upstream: null`, which would
+  conflate "configured but currently unresolvable" with "not configured
+  at all," the identical distinction this specification already enforces
+  for every other configured-but-unresolvable shape (§9, §20). **(B)**
+  §11's porcelain v2 submodule-marker table row and prose correctly
+  describe `<sub>` (`S<c><m><u>`) as its own, independent, separate
+  record field — never as residing "in" or "adjacent to" `<XY>` in a way
+  that could be read as requiring a search within `<XY>` itself — with a
+  real dirty-submodule fixture (`1 .M S.M. ...`) proving the parser
+  reads the two fields independently (§11, §20).
 
 ## 20b. Implementation Plan
 
@@ -7759,22 +8157,44 @@ The independent reviewer must specifically examine, for BR3:
   overriding signal — proven by a real fixture with zero remotes
   configured but a local-branch upstream (`remote="."`) present, which
   must report a genuinely configured, resolving `upstream`, not `null`
-- **Multi-valued `branch.<branch>.merge` handling — new, mandatory,
-  Round 9 review finding #2:** whether `branch.<branch>.merge` is read
-  via `git config --get-all`, never a bare `--get` — proven by the
-  dedicated regression fixture with two configured merge values, first
-  confirming (in the test's own setup) that bare `--get` returns only
-  the last value while `--get-all` returns both, in order; **and**
-  whether `UpstreamInfo.branch` is genuinely derived from the **same**
-  first configured value that `ref`/`sha` (via `@{upstream}`) already
-  resolve against — never a mismatched combination where `branch`
-  reflects the last configured value while `ref`/`sha` reflect the
-  first — proven by asserting all three fields describe the identical
-  target in the two-merge-value fixture; **and** whether the
-  configured-but-unresolvable semantics (`ref: null`, `sha: null`,
-  `remote`/`branch` still populated) remain truthful when the *first*
-  configured merge value's target is deleted, without silently falling
-  back to resolving against the second configured value
+- **Multi-valued `branch.<branch>.merge` handling, made NUL-safe — new,
+  mandatory, Round 9 review finding #2, NUL-safety corrected Round 13
+  review finding #2:** whether `branch.<branch>.merge` is read via `git
+  config -z --get-all`, never a bare `--get` and never without `-z` —
+  proven by the dedicated regression fixture with two configured merge
+  values, first confirming (in the test's own setup) that bare `--get`
+  returns only the last value while `-z --get-all` returns both,
+  complete, NUL-delimited, in order; **and** — the specific,
+  implementation-blocking case `-z` closes — whether a fixture where the
+  **first** configured merge value's own content contains an embedded
+  newline is still correctly recovered as exactly **two** configured
+  values, never fabricating a third value out of the embedded newline
+  (proven by constructing this exact fixture and asserting the parsed
+  value count and content); **and** whether `UpstreamInfo.mergeRef` is
+  genuinely derived from the **same** first configured value that
+  `ref`/`sha` (via `@{upstream}`) already resolve against — never a
+  mismatched combination where `mergeRef` reflects the last configured
+  value while `ref`/`sha` reflect the first — proven by asserting all
+  relevant fields describe the identical target in the two-merge-value
+  fixture; **and** whether the configured-but-unresolvable semantics
+  (`ref: null`, `sha: null`, `remote`/`mergeRef` still populated) remain
+  truthful when the *first* configured merge value's target is deleted,
+  without silently falling back to resolving against the second
+  configured value
+- **`UpstreamInfo.mergeRef`/`.branch` data-model correctness — new,
+  mandatory, Round 13 review finding #3:** whether `mergeRef` is
+  genuinely the exact, complete, unaltered first configured
+  `branch.<b>.merge` value regardless of its namespace — never assumed
+  to be a branch name, never shortened, and never reinterpreted —
+  proven by dedicated fixtures for a local-tag upstream
+  (`branch.<b>.merge = refs/tags/v1`) and an arbitrary custom-namespace
+  upstream (`refs/custom/foo`), both of which Git itself genuinely
+  resolves via `@{upstream}` (verified independently reproducible);
+  **and** whether `UpstreamInfo.branch` is correctly `null` for both of
+  those non-`refs/heads/` cases, and correctly populated (the string
+  after the `refs/heads/` prefix) only when `mergeRef` genuinely begins
+  with that exact prefix — proving BR3 never calls a tag or a
+  custom-namespace ref a "branch"
 - Whether every `execFile` call site in `packages/core/src/git/`
   (via the shared `internal/exec.ts` helper, §18) requests
   `encoding: "buffer"` — never the default lossy string decoding — and
@@ -7923,6 +8343,68 @@ The independent reviewer must specifically examine, for BR3:
   `packages/cli/src/commands/status.ts` or any other existing CLI
   command's behavior (§21)
 - Whether any of §6's out-of-scope items leaked into the implementation
+- **Honest process-trust-boundary wording — new, mandatory, Round 13
+  review finding #1:** whether §8/§18 state the precise, narrower
+  guarantee — BR3 itself never requests a shell or performs
+  shell-string interpolation, Git is invoked through a resolved
+  executable path with a separate argv array — rather than the
+  overclaim "there is no shell in the invocation path at all," verified
+  false on POSIX (an executable text file with no shebang, satisfying
+  every one of BR3's own candidate-validity rules, can still be run
+  through the OS kernel's own `ENOEXEC`/interpreter-fallback behavior
+  under shell-free `execFile`); whether the resolved Git executable is
+  explicitly documented as a trusted environment dependency BR3 verifies
+  the reported version of but does not cryptographically or otherwise
+  authenticate; and whether the repository-controlled external-helper
+  protections (content-filter refusal, `core.fsmonitor` suppression,
+  `--no-ext-diff`) remain fully, separately mandatory and unweakened by
+  this correction, since they defend a categorically different threat
+  (repository data causing an already-trusted Git binary to spawn a
+  repository-selected helper) — proven by the dedicated documented Node
+  behavior check §20 adds
+- **NUL-safe repository-controlled config consumption — new, mandatory,
+  Round 13 review finding #2:** whether `branch.<branch>.remote`/`.merge`
+  are genuinely read via `-z`, with raw `Buffer` output NUL-split before
+  any decoding and each complete value strict-UTF-8-decoded individually
+  (§13 Category 2) — never line-split; and whether `extensions.refStorage`
+  (a distinct, single-valued, fixed-machine-token config fact, §13
+  Category 1) is correctly documented as needing only a bare `--get`,
+  never conflated with the `-z` discipline the genuinely
+  repository-controlled, potentially multi-valued branch config values
+  require — proven by the dedicated embedded-newline fixture (§20), where
+  the **first** configured `branch.<b>.merge` value's own content contains a
+  raw newline and BR3 must still recover exactly two configured values,
+  not three, first confirming (in the test's own setup) that plain,
+  non-`-z` output for this exact fixture is genuinely ambiguous between
+  the two- and three-value readings
+- **`UpstreamInfo` data-model correctness (`mergeRef` vs. `branch`) —
+  new, mandatory, Round 13 review finding #3:** whether `mergeRef`
+  genuinely preserves the exact, complete, first configured
+  `branch.<b>.merge` value verbatim regardless of its ref namespace —
+  proven by dedicated fixtures for a local-tag upstream
+  (`refs/tags/v1`) and an arbitrary custom-namespace upstream
+  (`refs/custom/foo`), both independently verified to be genuinely
+  resolvable via `@{upstream}`; and whether `branch` is correctly `null`
+  for both non-`refs/heads/` cases, populated only when `mergeRef`
+  genuinely begins with the exact `refs/heads/` prefix — proving BR3
+  never mischaracterizes a tag or custom-namespace ref as a branch
+- **Unborn-branch configured-upstream semantics and porcelain v2
+  submodule-field precision — new, mandatory, Round 13 review finding
+  #4:** whether a symbolic, unborn branch with `branch.<name>.remote`/
+  `.merge` genuinely configured reports a non-null, genuinely configured
+  `UpstreamInfo` (`ref: null`, `sha: null`) rather than an
+  undifferentiated `upstream: null` — proven by the dedicated fixture
+  (§9, §20) configuring both keys before any commit exists, confirming
+  "configured but currently unresolvable because the branch is unborn"
+  is represented identically to every other configured-but-unresolvable
+  shape this specification already defines, never conflated with "not
+  configured"; **and** whether §11's porcelain v2 record-layout
+  description correctly treats `<sub>` (the submodule marker) as its own
+  independent, separate field from `<XY>` — never described as residing
+  within or merely "adjacent to" `<XY>` in a way that could be
+  misread as requiring a search inside it — proven by the dedicated
+  real dirty-submodule fixture (`1 .M S.M. ...`) confirming the two
+  fields are parsed independently, never confused
 - Whether test evidence is real (tests actually run against real,
   ephemeral, temporary Git repositories — not mocked Git command output)
 
