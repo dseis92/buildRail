@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: VERIFYING
+  lifecycle_state: PENDING_REVIEW
   development_phase: BR2
 
 authorization:
