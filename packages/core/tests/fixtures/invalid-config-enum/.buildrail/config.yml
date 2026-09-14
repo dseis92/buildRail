@@ -1,0 +1,29 @@
+schema_version: 1
+project:
+  name: FixtureProject
+  default_branch: main
+git:
+  force_push: sometimes
+  destructive_reset: forbidden
+  direct_default_branch_push: forbidden
+change_control:
+  additive_by_default: true
+  unexpected_deletion: stop
+  unexpected_rename: stop
+review:
+  require_independent_review: true
+  require_exact_candidate_sha: true
+  self_approval: forbidden
+human_qa:
+  enabled: true
+quality_gates:
+  tests:
+    command: npm test
+    required: true
+  typecheck:
+    command: npm run typecheck
+    required: true
+  build:
+    command: npm run build
+    required: true
+protected_systems: []

@@ -42,6 +42,18 @@ test("missing a required field (current) -> STATE_SCHEMA_INVALID", async () => {
   if (!result.ok) assert.equal(result.error.code, "STATE_SCHEMA_INVALID");
 });
 
+test("empty YAML document -> STATE_YAML_INVALID", async () => {
+  const result = await loadState(join(fixturesDir, "empty-state"));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "STATE_YAML_INVALID");
+});
+
+test("invalid lifecycle_state value (not in the enum) -> STATE_SCHEMA_INVALID", async () => {
+  const result = await loadState(join(fixturesDir, "invalid-lifecycle-state"));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "STATE_SCHEMA_INVALID");
+});
+
 test("invalid authorization.status value -> STATE_SCHEMA_INVALID with an authorization.-pathed error", async () => {
   const result = await loadState(join(fixturesDir, "invalid-authorization-status"));
   assert.equal(result.ok, false);
@@ -52,13 +64,18 @@ test("invalid authorization.status value -> STATE_SCHEMA_INVALID with an authori
   }
 });
 
-test("nested authorization missing a required field (granted_by) -> STATE_SCHEMA_INVALID", async () => {
+test("nested authorization missing a required field (granted_by) -> STATE_SCHEMA_INVALID with path authorization.granted_by exactly", async () => {
   const result = await loadState(join(fixturesDir, "authorization-missing-granted-by"));
   assert.equal(result.ok, false);
   if (!result.ok) {
     assert.equal(result.error.code, "STATE_SCHEMA_INVALID");
     const details = result.error.details as Array<{ path: string }>;
-    assert.ok(details.some((d) => d.path.startsWith("authorization")));
+    // Exact match, not a startsWith("authorization") prefix check: Ajv's
+    // `required`-keyword instancePath alone only points at the containing
+    // object ("authorization"); the missing property name comes from
+    // error.params.missingProperty and must be appended by
+    // normalizeAjvErrors() to name the actual missing field.
+    assert.ok(details.some((d) => d.path === "authorization.granted_by"));
   }
 });
 

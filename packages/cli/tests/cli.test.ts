@@ -136,6 +136,13 @@ test("buildrail status against a fixture with invalid config prints a determinis
   assert.doesNotMatch(result.stdout, /at Object\.|at Module\./);
 });
 
+test("buildrail status against a fixture with valid config but invalid state prints a deterministic error and exits 1", async () => {
+  const result = await runCli(["status"], { cwd: join(fixturesDir, "invalid-state") });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /STATE_SCHEMA_INVALID/);
+  assert.doesNotMatch(result.stdout, /at Object\.|at Module\./);
+});
+
 test("buildrail status does not walk up parent directories to find .buildrail", async () => {
   const result = await runCli(["status"], { cwd: join(fixturesDir, "parent-only", "child") });
   assert.equal(result.exitCode, 1);
