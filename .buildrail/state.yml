@@ -9,20 +9,20 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: PRODUCTION_VERIFIED
+  lifecycle_state: FROZEN
   development_phase: BR2
 
 authorization:
   id: BR2
   type: feature
   title: Governance Engine
-  status: authorized
+  status: completed
   specification: .buildrail/specs/BR2-GOVERNANCE-ENGINE.md
   granted_by: human
 
 candidate:
-  branch: feature/br2-governance-engine
-  base_sha: 2bc542e683d1d17b5f656329094f5bfa71160dcf
+  branch: null
+  base_sha: null
   candidate_sha: null
 
 # Immutable approved checkpoints for completed/frozen phases. Distinct from
@@ -40,18 +40,22 @@ baselines:
   BR1:
     approved_sha: 36f7b0a569eeee0cd1c5d7472cf176763c818a2e
     status: frozen
+  BR2:
+    approved_sha: 720abf34d80933714475ec56ab43fd39fa82f484
+    status: frozen
 
-# BR0 and BR1 have each been independently reviewed, approved, and frozen
-# at the SHAs recorded under `baselines`. BR1 established the first real,
-# executable BuildRail CLI (packages/cli). BR2 implementation
-# (candidate.branch above) has been independently reviewed, approved,
-# passed Human QA, merged, and confirmed production-verified by the human
-# owner, and is now awaiting phase closure (baseline creation and
-# freezing) — Git inspection and verification-report generation remain
-# unimplemented until BR3/BR4.
+# BR0, BR1, and BR2 have each been independently reviewed, approved, and
+# frozen at the SHAs recorded under `baselines`. BR1 established the
+# first real, executable BuildRail CLI (packages/cli). BR2 implemented
+# the provider-neutral governance engine (@buildrail/core) — config/state
+# loading, schema validation, authorization policy, and the lifecycle
+# transition engine — wired into real `buildrail status` output. Git
+# inspection and verification-report generation remain unimplemented
+# until BR3/BR4.
 completed_phases:
   - BR0
   - BR1
+  - BR2
 
 planned_phases:
   - BR3
