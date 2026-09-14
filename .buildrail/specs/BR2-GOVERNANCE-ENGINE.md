@@ -1717,7 +1717,7 @@ which do not:
 | `HUMAN_QA → MERGE_AUTHORIZED` | No | Same rationale |
 | `MERGE_AUTHORIZED → MERGED` | No | Same rationale |
 | `MERGED → PRODUCTION_VERIFIED` | No | Same rationale |
-| `PRODUCTION_VERIFIED → FROZEN` | N/A — not performed by `applyTransition` at all (`LIFECYCLE_DEDICATED_OPERATION_REQUIRED`); see `completeAndFreezePhase` (§15) | Freezing is a human decision independent of the original authorization's active/inactive status, and this edge additionally requires an approved SHA `applyTransition`'s signature has no room for — carved out of `applyTransition`'s generic handling entirely, exactly like `SPECIFIED → AUTHORIZED` above |
+| `PRODUCTION_VERIFIED → FROZEN` | N/A — not performed by `applyTransition` at all (`LIFECYCLE_DEDICATED_OPERATION_REQUIRED`); see `completeAndFreezePhase` (§15) | `PRODUCTION_VERIFIED → FROZEN` is not executed through generic `applyTransition` because closure requires additional atomic governance effects `applyTransition`'s `(state, to, actor)` signature cannot represent: Human Owner authority, an approved baseline SHA, authorization completion, a `completed_phases` update, baseline creation, and candidate clearing — carved out of `applyTransition`'s generic handling entirely, exactly like `SPECIFIED → AUTHORIZED` above. **`completeAndFreezePhase` is the dedicated operation that performs it — and it still composes the canonical `checkImplementationAllowed` policy (§13) as its first phase (§15's "Canonical authorization-policy check"), so successful closure requires a valid, active, phase-matching authorization exactly as any other authorization-gated operation does.** An earlier draft of this row said "freezing is a human decision independent of the original authorization's active/inactive status" — that claim is retracted as false under the final `completeAndFreezePhase` contract: closure cannot succeed with a missing, revoked, inactive (`draft`/`completed`), or phase-mismatched authorization. What *is* still true, and is the corrected substance of this row, is only that `applyTransition`'s own generic authorization-composition table (this table) does not apply to this edge, because the edge isn't reachable through `applyTransition` at all — the authorization requirement is enforced by `completeAndFreezePhase` itself, not bypassed. |
 
 **Closing the resume bypass (correcting an earlier draft's governance
 gap):** an earlier version of this specification exempted *all*
@@ -3135,10 +3135,13 @@ existing shape exactly.
   the **full closure-invariant precondition** (`FROZEN` +
   `authorization.status: completed` + matching `authorization.id` +
   presence in both `completed_phases` and `baselines` with `status:
-  frozen` + a fully-`null` `candidate` — with no BR0-bootstrap exception),
-  and **rejects reactivating a phase ID already present in `baselines` or
-  `completed_phases`** — proven by the dedicated test matrix in §22,
-  including each closure-invariant rejection case tested independently.
+  frozen` + no in-flight candidate, accepting either `candidate` absent
+  or `candidate` present with all three fields `null` — with no
+  BR0-bootstrap exception), and **rejects reactivating a phase ID already
+  present in `baselines` or `completed_phases`** — proven by the
+  dedicated test matrix in §22, including each closure-invariant
+  rejection case tested independently, with both accepted candidate forms
+  specifically tested.
 - **W.** `authorizeSpecifiedWork`, `activatePhase`, and
   `completeAndFreezePhase` are all typed to return
   `Result<BuildRailState, TransitionError>` (§15's API section,
@@ -3388,8 +3391,10 @@ The independent reviewer must specifically examine, for BR2:
   genuinely enforces every closure invariant in its precondition
   (`FROZEN`, `authorization.status: completed`, matching `authorization.id`,
   presence in both `completed_phases` and `baselines` with `status:
-  frozen`, and a fully-`null` `candidate`), each tested as an independent
-  rejection case
+  frozen`, and **no in-flight candidate — accepting either `candidate`
+  absent or `candidate` present with all three fields `null`, both forms,
+  not only the fully-`null` object form**), each tested as an independent
+  rejection case, with both accepted candidate forms specifically tested
 - Whether `applyTransition` correctly refuses both dedicated-operation
   edges (`SPECIFIED → AUTHORIZED`, `PRODUCTION_VERIFIED → FROZEN`) with
   `LIFECYCLE_DEDICATED_OPERATION_REQUIRED` specifically — not
