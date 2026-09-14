@@ -26,8 +26,11 @@ surface:
 - confirm a directory is a Git repository (and exactly which one)
 - determine the current branch, or detached-HEAD state
 - determine the current HEAD commit SHA
-- determine the upstream (remote-tracking) branch's identity and SHA,
-  when one exists, without ever contacting the network
+- determine the upstream identity and upstream SHA, when one exists
+  (revised — corrects Round 4 review finding #7, reconciling this
+  summary line with §9/§10's terminology, which already distinguishes a
+  remote-tracking upstream from a local-branch upstream as two named
+  subcases — see §10), without ever contacting the network
 - inspect the working tree: staged changes, unstaged changes, untracked
   paths, conflicts — as a structured per-path model, not a single
   clean/dirty boolean
@@ -145,8 +148,10 @@ drafting this specification:
   of a Git working tree BR3 will operate against (§8)
 - Current branch / detached-HEAD / unborn-branch detection (§9)
 - HEAD commit SHA detection (§9)
-- Upstream (remote-tracking) branch identity and SHA detection, entirely
-  from local repository state — no network access (§9, §10)
+- Upstream identity and upstream SHA detection (covering both the
+  ordinary remote-tracking subcase and the local-branch subcase — §9,
+  §10; revised, corrects Round 4 review finding #7), entirely from local
+  repository state — no network access (§9, §10)
 - Working-tree status inspection as a structured, per-path model (§11)
 - Diff inspection between two resolved refs/SHAs, including
   added/modified/deleted/renamed classification (§13)
@@ -473,6 +478,74 @@ by external code to redirect BR3 away from its documented root-validation
 behavior, it must go behind `#internal/*`, not a bare relative import
 alone.
 
+**Canonical result ordering — new, mandatory (Round 4 review finding
+#1):** `git status --porcelain=v2` does not document or guarantee a
+stable output order across repository states, and `matchProtectedPaths`'s
+own output order would otherwise depend directly on the caller-supplied
+`inputs`/`protectedSystems` arrays' own order — meaning
+`WorkingTreeStatus.entries`, `DiffResult.changes`, and
+`ProtectedPathMatchResult.matches` were, before this round, unordered
+arrays whose element order silently depended on incidental factors,
+violating §19's determinism promise at the array-ordering level (even
+though each individual entry's content was already correct). BR3 now
+applies an exact, total, stable sort to each of these three result
+arrays as the **last step** of the corresponding function — after all
+parsing/classification is complete, immediately before return, never
+interleaved with parsing — so two semantically-identical repository
+states (or semantically-identical `matchProtectedPaths` inputs) always
+produce deep-equal, identically-ordered arrays:
+
+- **`WorkingTreeStatus.entries`:** sorted by, in order: (1) `path`,
+  compared as a plain ordinal/byte-order string comparison (`<`/`>`/`===`
+  on the JS string, **never** locale-aware comparison via
+  `Intl.Collator`/`String.prototype.localeCompare` — locale-aware
+  comparison would reintroduce exactly the kind of environment-dependent
+  behavior §19 exists to eliminate, since collation rules vary by
+  configured locale); (2) `kind`, ranked by this fixed, total,
+  alphabetical order over every `WorkingTreeEntryKind` value: `conflicted`,
+  `staged_add`, `staged_delete`, `staged_modify`, `staged_rename`,
+  `staged_type_change`, `unstaged_delete`, `unstaged_modify`,
+  `unstaged_type_change`, `untracked` (alphabetical by the literal string
+  value — simple, total, and requires no separate hand-maintained
+  priority table to keep in sync as kinds are added); (3) `oldPath`
+  (present only for `staged_rename`; treated as the empty string `""` for
+  every entry where it is absent, so this key is always comparable) —
+  handling, for total-order completeness, the theoretical case of two
+  `staged_rename` entries sharing the same `path` but differing
+  `oldPath`, even though no real Git repository state has been found to
+  produce this. No further tie-breaker is needed: `path` + `kind` +
+  `oldPath` uniquely identifies every possible `WorkingTreeEntry` this
+  specification defines (a given `path` can appear at most once per
+  `kind`, since Git's own porcelain v2 output never emits two records of
+  the identical kind for the identical path).
+- **`DiffResult.changes`:** sorted identically in structure — by (1)
+  `path` (ordinal string comparison), (2) `kind`, ranked by this fixed
+  alphabetical order over every `DiffChangeKind` value: `added`,
+  `deleted`, `modified`, `renamed`, `type_changed`, (3) `oldPath` (present
+  only for `kind: "renamed"`; `""` when absent).
+- **`ProtectedPathMatchResult.matches`:** sorted by (1) `path` (ordinal
+  string comparison), (2) `matchedVia`, with `"path"` ordered before
+  `"oldPath"` (matching this document's own consistent ordering
+  convention of presenting the current-side case before the
+  old-side-of-rename case throughout §7a/§12), (3) `system.name` (ordinal
+  string comparison) — required as its own explicit final tie-breaker
+  because §12 already establishes that one input's `path` can
+  legitimately match **multiple** `ProtectedSystem` entries, each
+  producing its own `ProtectedPathMatch` with identical `path` and
+  `matchedVia` but a different `system` — `system.name` is guaranteed
+  unique per `config.schema.json`'s `protectedSystem` shape (§3) and
+  fully resolves any remaining tie.
+
+This sort is pure, synchronous, in-process array sorting — it requires no
+additional Git invocation, no additional I/O, and is independently unit
+testable against hand-constructed input arrays with zero Git/filesystem
+setup, exactly mirroring `matchProtectedPaths`'s own existing purity
+(§16). For `matchProtectedPaths` specifically, this final sort is the
+one and only place its result order is decided — the function's own
+internal matching loop may process `inputs`/`protectedSystems` in
+whatever order is convenient; only the returned `matches` array's order
+is contractually canonical. §20 adds the required tests.
+
 ## 8. Repository Root Semantics
 
 **`projectRoot` is an exact, caller-supplied absolute directory path.
@@ -530,10 +603,85 @@ first, using only machine-readable facts:
    fatal: not a git repository (or any of the parent directories): .git
    exit=128
    ```
-   - If the command fails because `projectRoot` is not inside any Git
-     repository at all (the exit-128, fatal-message case above —
-     detected by the command's non-zero exit alone, never by its stderr
-     text, per §19/§9's determinism discipline): `NOT_A_GIT_REPOSITORY`.
+   - **If the command fails (non-zero exit), a secondary, filesystem-based
+     classification runs to distinguish a plain non-Git directory from a
+     real-but-malformed/damaged repository (new — corrects Round 4 review
+     finding #4, which found that every non-zero exit from this command
+     was previously collapsed into `NOT_A_GIT_REPOSITORY` unconditionally,
+     even though a genuinely real repository can also make this exact
+     command fail non-zero, for reasons unrelated to "this directory isn't
+     a Git repository at all"):** verified directly — a repository with a
+     syntactically-malformed `.git/config` (an unterminated `[section`
+     line) produces **the identical exit code (128)** as a plain
+     non-Git directory:
+     ```
+     $ git rev-parse --is-bare-repository   # malformed .git/config in a real repo
+     fatal: bad config line 8 in file .git/config
+     exit=128
+     $ git rev-parse --is-bare-repository   # a plain, non-Git directory
+     fatal: not a git repository (or any of the parent directories): .git
+     exit=128
+     ```
+     **The exit code alone cannot distinguish these two cases** — per
+     §19/§9's determinism discipline, BR3 never inspects stderr text to
+     tell them apart either. The distinguishing signal instead comes from
+     a filesystem-shape check performed *after* this Git command has
+     already failed (this is explicitly not a reintroduction of the
+     Round-2-removed early `.git`-existence precheck, which ran *before*
+     any authoritative Git command and could short-circuit
+     `BARE_REPOSITORY_UNSUPPORTED`/`PROJECT_ROOT_MISMATCH` detection; this
+     check runs only as a fallback once step 2's own Git invocation has
+     already, authoritatively, failed):
+     - Check whether `<projectRoot>/.git` exists at all (as either a
+       directory or a file — covering both an ordinary repository and a
+       worktree/submodule-style `.git` file) **and**, if it is a
+       directory, whether it has the basic shape of a real Git directory
+       (at minimum, a `HEAD` entry directly inside it — verified present
+       in an ordinary repository's `.git/`, including the malformed-config
+       fixture above, whose `.git/HEAD` remains perfectly intact even
+       though `.git/config` is broken).
+     - If `<projectRoot>/.git` is **absent entirely**: this is a genuine
+       plain non-Git directory → `NOT_A_GIT_REPOSITORY` (unchanged from
+       before).
+     - If `<projectRoot>/.git` **exists** (directory or file) but the
+       authoritative `--is-bare-repository` call still failed: this is a
+       real, existing Git repository that BR3 cannot successfully inspect
+       for a specific, different reason — malformed local config being
+       the verified case, filesystem-permission failures reading `.git/`'s
+       contents being a structurally identical unverified-but-plausible
+       case. This is reported as `GIT_COMMAND_FAILED` (§17's existing
+       catch-all code — deliberately **not** a new, more specific code:
+       the underlying cause is open-ended, exactly matching
+       `GIT_COMMAND_FAILED`'s existing "Expected as a result shape, but
+       the underlying cause is inherently open-ended" definition), with
+       `details` carrying the captured stderr for diagnosis. `resolveRepository`
+       never proceeds past this point once this outcome is reached — no
+       later step assumes a Git command that has already failed this way
+       can somehow still succeed.
+     - **Unsafe/dubious ownership** (Git's own "detected dubious ownership
+       in repository at ..." safety feature, triggered when the
+       repository directory's owner differs from the current process
+       user — common in CI/container environments where a repository is
+       mounted from a different UID) is, by Git's own well-documented,
+       stable behavior, a further instance of this same
+       real-repository-that-fails category: `<projectRoot>/.git` genuinely
+       exists and has the correct shape, yet `--is-bare-repository` (and
+       every other Git command against that `cwd`) fails, deterministically,
+       until the directory is added to `safe.directory` — a config-layer
+       decision this specification does not make on a caller's behalf.
+       **This scenario could not be constructed as a real, portable
+       fixture in this correction round** (it requires genuinely differing
+       file ownership, which is not reliably constructible in an ordinary
+       development/CI sandbox) — its typed behavior is specified directly
+       from Git's own documented, stable error contract rather than a
+       fresh verified repro: it folds into the same `<projectRoot>/.git`-exists-but-command-failed
+       bucket above (`GIT_COMMAND_FAILED`), not a distinct code, since
+       BR3 has no more specific, actionable response to offer a caller
+       for it than for a malformed-config repository — both are "a real
+       repository exists here, but BR3 cannot safely proceed," and BR3
+       does not attempt to auto-remediate either (e.g. by writing to a
+       caller's global `safe.directory` config itself, which would be a
+       mutation squarely outside BR3's read-only boundary, §4/§6).
    - If it succeeds and prints `true`: `BARE_REPOSITORY_UNSUPPORTED`
      immediately (§8's "Bare repositories" decision below) — no further
      step runs, since every remaining step assumes a working tree a bare
@@ -651,15 +799,22 @@ every case below — there is no separate function per case.
 | Normal branch, has commits | branch name | `false` | `false` | 40-hex SHA | per below |
 | Detached HEAD (checked out to a SHA/tag directly) | `null` | `true` | `false` | 40-hex SHA | `null` (detached HEAD never has an upstream) |
 | Unborn branch (fresh `git init`, zero commits) | branch name (the to-be-created branch, from `git symbolic-ref HEAD` — this resolves even with no commits) | `false` | `true` | `null` | `null` (no commit exists yet to have an upstream relationship against) |
+| Corrupt HEAD (symbolic-ref resolves to a branch name, but that branch ref does not point at a real, existing commit object) | branch name (from `symbolic-ref`, still reported — the ref name itself is knowable even though it does not resolve to a real commit) | `false` | `false` | `null` | `null` | (see `HEAD_UNAVAILABLE`, below) |
 
 **Determination method — exit codes and machine-readable facts only,
 never stderr-text matching (revised — corrects Round 1 review finding
-#5; each step below verified against real scratch repositories during
-this correction round):**
+#5, and revised again — corrects Round 4 review finding #5, which found
+that `git rev-parse --verify -q HEAD` alone does not actually prove HEAD
+resolves to a real, existing commit object: `rev-parse --verify` on a
+bare ref only validates that the ref *resolves to some SHA-shaped
+string*, not that the SHA names a real object in the object database;
+each step below verified against real scratch repositories during this
+correction round):**
 
 - **Branch vs. detached vs. genuinely unavailable:** `git symbolic-ref -q
   HEAD` — succeeds (exit 0, prints the branch ref, e.g. `refs/heads/main`)
-  for a normal branch (including unborn); fails with **exit 1** (**no
+  for a normal branch (including unborn, and including the newly-added
+  corrupt-but-symbolic case below); fails with **exit 1** (**no
   stderr at all** with `-q`) for the ordinary "HEAD is not a symbolic
   ref" case, i.e. detached HEAD; fails with a **different, non-1 exit
   code** (verified: **exit 128**, with a fatal-error message on stderr,
@@ -671,40 +826,114 @@ this correction round):**
   well-defined outcome distinct from ordinary detached HEAD** — BR3 reads
   only the exit code to tell the two apart, never the fatal message's
   text content.
-- **Unborn vs. has-commits:** `git rev-parse --verify -q HEAD` — succeeds
-  (exit 0, prints the 40-hex SHA) once at least one commit exists; fails
-  (exit 1, **no stderr at all** with `-q`) when the branch is unborn.
-  Verified directly:
+- **HEAD resolves to a real commit — `HEAD^{commit}`, not bare `HEAD`
+  (revised — corrects Round 4 review finding #5):** `git rev-parse
+  --verify -q HEAD^{commit}` — the `^{commit}` peel operator forces Git to
+  actually dereference whatever SHA HEAD (or the branch it points at)
+  names to a real commit object, failing cleanly if that object does not
+  exist. This replaces the previous bare `HEAD` form, which does **not**
+  provide this guarantee. Verified directly: after manually overwriting a
+  repository's branch ref file with the literal all-zeros SHA
+  (`0000000000000000000000000000000000000000`, which does not exist as a
+  real object),
+  ```
+  $ git rev-parse --verify -q HEAD; echo "exit=$?"
+  0000000000000000000000000000000000000000
+  exit=0                     # FALSE SUCCESS — the ref "resolves" to a
+                              # SHA-shaped string, but that string names
+                              # no real object
+  $ git rev-parse --verify -q 'HEAD^{commit}'; echo "exit=$?"
+  exit=1                      # correctly detects the corruption
+  ```
+  and, confirming this does **not** change the unborn-branch exit code
+  (a fresh, uncorrupted, zero-commit repository):
   ```
   $ git init && git symbolic-ref -q HEAD; echo "exit=$?"
   refs/heads/main
   exit=0
-  $ git rev-parse --verify -q HEAD; echo "exit=$?"
-  exit=1                    # (zero stderr output — nothing to match against)
+  $ git rev-parse --verify -q 'HEAD^{commit}'; echo "exit=$?"
+  exit=1                     # same exit code as the previous bare-HEAD
+                              # form — the ^{commit} change does not alter
+                              # unborn detection
   ```
-  and, separately, for the exit-128 corruption case:
+- **Distinguishing "unborn" from "corrupt-but-symbolic" — the genuinely
+  distinguishing signal (new — Round 4 review finding #5):** both the
+  unborn case and the corrupt-but-symbolic case produce the *identical*
+  exit code from `symbolic-ref -q HEAD` (0) and from `rev-parse --verify
+  -q HEAD^{commit}` (1) — verified directly, these two checks alone
+  **cannot** tell the two cases apart. A third check, against the
+  resolved branch ref name itself (the exact string `symbolic-ref -q
+  HEAD` printed, e.g. `refs/heads/main`), **without** the `^{commit}`
+  peel and **without** going through `HEAD` at all, is required and is
+  genuinely distinguishing: `git rev-parse --verify -q <resolved-ref-name>`
+  fails (exit 1, no stderr) when the ref file genuinely does not exist yet
+  (unborn — nothing has ever been committed to create it), but succeeds
+  (exit 0, printing the raw stored SHA) when the ref file exists and
+  contains *some* SHA-shaped value, even a non-existent one (corrupt).
+  Verified directly, against both cases, from the exact same starting
+  point (a fresh `symbolic-ref -q HEAD` resolution of `refs/heads/main`):
   ```
-  $ rm .git/HEAD   # simulated corruption in an otherwise-valid repo
-  $ git symbolic-ref -q HEAD; echo "exit=$?"
-  fatal: not a git repository (or any of the parent directories): .git
-  exit=128
+  # case: genuinely unborn (fresh git init, zero commits)
+  $ git rev-parse --verify -q refs/heads/main; echo "exit=$?"
+  exit=1                      # ref file does not exist — unborn
+
+  # case: corrupted symbolic (one commit made, then the branch ref file
+  # itself overwritten with the all-zeros SHA)
+  $ git rev-parse --verify -q refs/heads/main; echo "exit=$?"
+  0000000000000000000000000000000000000000
+  exit=0                      # ref file exists, resolves to *something*
+                              # (even though that something is not a real
+                              # object) — corrupt, not unborn
+  $ git rev-parse --verify -q refs/heads/main^{commit}; echo "exit=$?"
+  exit=1                      # confirms it is not a real commit either
   ```
-  Combining `symbolic-ref -q HEAD`'s three-way exit code (0 / 1 / other)
-  with `rev-parse --verify -q HEAD`'s two-way exit code (0 / 1) is
-  sufficient to derive every branch/HEAD state with no error-text
-  inspection anywhere: `symbolic-ref` exit 0 + `rev-parse --verify -q
-  HEAD` exit 1 → unborn branch; `symbolic-ref` exit 0 + `rev-parse
-  --verify -q HEAD` exit 0 → normal branch with commits; `symbolic-ref`
-  exit 1 (regardless of `rev-parse`, which will succeed since a detached
-  HEAD always points at a real commit) → detached; `symbolic-ref` exit
-  anything other than 0 or 1 (e.g. 128) → `HEAD_UNAVAILABLE`, checked
-  before either of the other two interpretations is attempted. `LC_ALL=C`
-  (§19) may still be set globally for whatever diagnostic text ends up in
-  `GitError.details` for this last, genuinely unanticipated case, but —
-  stated explicitly here as the corrected contract — **no BR3
-  control-flow branch is ever gated on inspecting stderr content; every
-  classification above is derived purely from exit codes and/or separate
-  machine-readable stdout.**
+  This third check is only ever needed to disambiguate the unborn-vs-corrupt
+  case (i.e., only when `symbolic-ref -q HEAD` succeeded and `rev-parse
+  --verify -q HEAD^{commit}` failed) — it is never run for the ordinary
+  normal-branch or detached-HEAD outcomes, which are already fully
+  determined by the first two checks alone.
+- **Complete decision table, exit codes only:**
+  1. `symbolic-ref -q HEAD` exit 0, `rev-parse --verify -q HEAD^{commit}`
+     exit 0 → **normal branch with commits**.
+  2. `symbolic-ref -q HEAD` exit 1 (detached signature) — `rev-parse
+     --verify -q HEAD^{commit}` will succeed for an ordinary detached HEAD
+     (it always points at a real commit in ordinary use) → **detached**.
+     If, in this branch, `rev-parse --verify -q HEAD^{commit}` were to
+     also fail, that is direct/detached HEAD pointing at a non-existent
+     object — see case 5 below.
+  3. `symbolic-ref -q HEAD` exit 0, `rev-parse --verify -q HEAD^{commit}`
+     exit 1, and `rev-parse --verify -q <resolved-ref-name>` (no
+     `^{commit}`) also exit 1 → **unborn branch** (`headSha: null`,
+     `unborn: true`).
+  4. `symbolic-ref -q HEAD` exit 0, `rev-parse --verify -q HEAD^{commit}`
+     exit 1, but `rev-parse --verify -q <resolved-ref-name>` (no
+     `^{commit}`) exits **0** → **corrupt HEAD**: the branch ref exists
+     and is symbolic, but does not resolve to a real commit object. This
+     is a new, explicit, reachable outcome (see `HEAD_UNAVAILABLE`,
+     below) — not folded into either "unborn" or "normal branch."
+  5. **Detached HEAD pointing at a non-existent object** (direct HEAD —
+     `symbolic-ref -q HEAD` exit 1 — where `rev-parse --verify -q
+     HEAD^{commit}` *also* fails): equally a corrupt-HEAD outcome, folded
+     into the same `HEAD_UNAVAILABLE` classification as case 4 — see
+     below.
+  6. `symbolic-ref -q HEAD` exit anything other than 0 or 1 (e.g. 128) →
+     **`HEAD_UNAVAILABLE`**, checked before any of the above
+     interpretations is attempted (unchanged from Round 1's fix).
+
+  Cases 4, 5, and 6 are, together, the **complete** trigger definition for
+  `HEAD_UNAVAILABLE` (§17) — extended in this round beyond Round 1's
+  `symbolic-ref`-exit-code-only definition to also cover "HEAD resolves
+  (directly or symbolically) to something, but that something is not a
+  real commit object." `LC_ALL=C` (§19) may still be set globally for
+  whatever diagnostic text ends up in `GitError.details` for these
+  genuinely unanticipated cases, but — stated explicitly here as the
+  corrected contract — **no BR3 control-flow branch is ever gated on
+  inspecting stderr content; every classification above is derived purely
+  from exit codes and/or separate machine-readable stdout.** Any
+  remaining wording elsewhere in this document suggesting detached HEAD
+  is valid "regardless of rev-parse" is superseded by this section:
+  detached HEAD's validity is conditional on `rev-parse --verify -q
+  HEAD^{commit}` succeeding (case 2 above), not assumed unconditionally.
 
 **Upstream determination — no network, ever (revised — corrects Round 2
 review finding #2, which found that Round 1's fix, constructing the
@@ -880,7 +1109,8 @@ no caller misreads `upstream.sha` as always-current.
 **Ahead/behind: explicitly excluded from BR3.** Commit-count-based
 ahead/behind reporting (`git rev-list --left-right --count`) is a
 reasonable future addition, but it is not part of BR3's stated scope
-(branch/HEAD/remote-tracking-SHA/working-tree/diff/protected-paths) and
+(branch/HEAD/upstream-SHA/working-tree/diff/protected-paths — revised,
+corrects Round 4 review finding #7) and
 has no clear consumer defined yet — BR4 (verification/evidence) or a
 later phase are more natural owners if this is ever needed, once there's
 an actual governance decision that depends on it. Adding it here would be
@@ -957,17 +1187,28 @@ policy, which needs to know *which* path and *what kind* of change, not
 merely "something changed").
 
 **Determination method — exact command (revised, fully explicit — corrects
-Round 1 review finding #6):**
+Round 1 review finding #6; further revised — corrects Round 4 review
+finding #3, adding the mandatory external-helper-suppressing `-c`
+overrides described in §18):**
 
 ```
-git status --porcelain=v2 -z --find-renames=50% --untracked-files=all --ignore-submodules=none
+git -c core.fsmonitor= [-c filter.<name>.clean= -c filter.<name>.process= ...] status --porcelain=v2 -z --find-renames=50% --untracked-files=all --ignore-submodules=none
 ```
 
-run with `cwd` at `projectRoot`. This exact invocation — verified to
-accept all five flags together without error — is what §19
+run with `cwd` at `projectRoot`. The `-c core.fsmonitor=` override is
+always present; the `-c filter.<name>.clean=`/`-c filter.<name>.process=`
+pairs are present once per configured filter driver `<name>` discovered
+via the read-only `git config --get-regexp` enumeration step §18
+describes (zero such pairs, and thus no additional `-c` flags at all,
+when no filter driver is configured — the base five-flag `status`
+invocation below is what remains in that common case). This exact
+invocation — verified to accept all five `status`-level flags together
+without error, with or without the `-c` overrides preceding the
+subcommand name — is what §18 (process execution safety), §19
 (determinism), §20 (test plan), and §27 (independent review) all
 reference; no section states a different or partial form of this
-command. Each flag is individually required, not incidental:
+command. Each `status`-level flag is individually required, not
+incidental:
 
 - **`--porcelain=v2`** (not v1): Git's own stable, unambiguous,
   machine-oriented status format — it distinguishes staged vs. unstaged
@@ -1369,11 +1610,16 @@ string-first one) — see each section for its own restatement.
    as a flag-shaped string) and for BR4's eventual evidence-binding
    concern (explicitly out of BR3's scope, §23), which needs the *exact*
    SHA, not a symbolic reference that could resolve differently later.
-3. **The diff itself:**
-   `git diff --no-color --no-ext-diff -z --name-status --find-renames=<threshold>
-   <fromSha> <toSha>` (threshold per §14). `--name-status` (not the
-   default patch format) gives exactly a status-letter-plus-path(s) record
-   per changed file, `-z` NUL-delimits records and (for renames) the
+3. **The diff itself (revised — corrects Round 4 review finding #3,
+   adding the same mandatory filter-driver `-c` overrides §11/§18
+   describe for `status`; `core.fsmonitor` is not relevant to `diff`,
+   which does not consult it):**
+   `git [-c filter.<name>.clean= -c filter.<name>.process= ...] diff
+   --no-color --no-ext-diff -z --name-status --find-renames=<threshold>
+   <fromSha> <toSha>` (threshold per §14, filter-driver overrides per §18
+   — zero such `-c` pairs when no filter driver is configured). `--name-status`
+   (not the default patch format) gives exactly a status-letter-plus-path(s)
+   record per changed file, `-z` NUL-delimits records and (for renames) the
    two-path pairs within a record.
 4. **Status-letter mapping** (Git's `diff --name-status` letters) to
    `DiffChangeKind`:
@@ -1574,6 +1820,10 @@ choose the one relevant to its own question.
     path separator" config-authoring-error case)
   - bracket/character-class expressions (`[abc]`, `[a-z]`)
   - brace expansion (`{a,b}`, e.g. `src/{auth,payments}/**`)
+  - `"..."` — double-quoted literal region (glob metacharacters inside
+    the quotes match literally) — **added explicitly, Round 4 review
+    finding #6, Part A**; likewise baseline `picomatch` grammar, not
+    independently toggleable
 
   and explicitly **disables**:
   - negation patterns (a leading `!`)
@@ -1614,6 +1864,85 @@ choose the one relevant to its own question.
   with `!` by treating it as a literal (non-negating) character rather
   than special syntax — BR3 relies on this built-in
   behavior rather than pre-scanning patterns for a leading `!` itself.
+- **Double-quote literal-matching semantics — added, closing a
+  previously undocumented gap (Round 4 review finding #6, Part A):**
+  `picomatch` treats a `"..."` region inside a pattern as a
+  literal-matching span — every character between a pair of double
+  quotes is matched literally, with glob metacharacters inside the quoted
+  region losing their special meaning. **Verified directly** against the
+  installed `picomatch@4.0.7` source (`lib/parse.js`): a character inside
+  an open double-quote region (`state.quotes === 1`) is passed through
+  `utils.escapeRegex` rather than picomatch's ordinary
+  metacharacter-dispatch logic, and this behavior is unconditional — not
+  gated by `nonegate`/`noextglob`/any other option this specification
+  sets, and not independently toggleable via any documented `picomatch`
+  option at all. Verified behaviorally: a pattern
+  `src/"a*b"/x.ts` matches the literal path `src/a*b/x.ts` but does
+  **not** match `src/aZZZb/x.ts` (the glob-expanded form `*` would
+  otherwise produce), confirming quoting genuinely suppresses
+  metacharacter interpretation rather than merely being accepted without
+  erroring. **Decision: Option A — document and support it**, for the
+  identical reasoning Round 3 chose Option A for `?`/backslash-escaping:
+  this is baseline, always-active `picomatch` parser grammar, not a
+  feature a pattern author opts into or out of, so Option B's
+  alternative (pre-validating and rejecting any pattern containing `"`
+  via `invalidPatterns`) would require BR3 to hand-roll a detection pass
+  ahead of `picomatch` for a construct that poses no comparable audit
+  risk to negation/extglobs — quoting can only ever narrow what a pattern
+  matches (forcing literal interpretation of characters that would
+  otherwise be glob metacharacters), never broaden or invert a match, the
+  same narrow-only characteristic that justified keeping `?`/brackets/braces
+  enabled. BR3's supported pattern grammar (§12 cross-reference) therefore
+  additionally includes: **`"..."` — double-quoted literal region**
+  (glob metacharacters inside the quotes are matched literally; the
+  quotes themselves are consumed, not matched as literal quote
+  characters, per `picomatch`'s default `keepQuotes: false` behavior,
+  which BR3 does not override). A dedicated test is required (§20).
+- **Non-throwing contract for matcher-compilation failures — new,
+  mandatory (Round 4 review finding #6, Part B):** `picomatch` throws a
+  `SyntaxError` for a pattern exceeding its own internal maximum input
+  length. **Verified directly** against the installed `picomatch@4.0.7`
+  source (`lib/constants.js`/`lib/parse.js`): `MAX_LENGTH = 1024 * 64`
+  (65536 characters) is the hardcoded ceiling (`opts.maxLength` can only
+  ever *lower* this via `Math.min(MAX_LENGTH, opts.maxLength)`, never
+  raise it); a pattern of exactly 65536 characters compiles without
+  error, while a pattern of 65537 characters throws
+  `SyntaxError: Input length: 65537, exceeds maximum allowed length: 65536`.
+  **Confirmed:** `packages/core/schemas/config.schema.json`'s
+  `#/$defs/protectedSystem.paths` items definition (§3) declares only
+  `{ "type": "string", "minLength": 1 }` for each pattern string — **no**
+  `maxLength` constraint — meaning nothing at the schema-validation layer
+  prevents an absurdly long pattern string from reaching
+  `matchProtectedPaths` and triggering this internal `picomatch` guard.
+  Since `matchProtectedPaths` is fully synchronous and pure and never
+  returns a `GitResult` (§17's established boundary, re-confirmed here:
+  it has no `GitErrorCode`-shaped channel to report a compilation failure
+  through even if one were added), an uncaught `SyntaxError` escaping
+  `matchProtectedPaths` would be a genuine contract violation — a
+  schema-valid config value causing a pure function to throw. **Required
+  fix:** the pattern-compilation step BR3 performs (compiling each
+  declared `ProtectedSystem` path pattern into a `picomatch` matcher
+  function once, per §16's existing "compile once, memoized" design) is
+  wrapped in a `try`/`catch`; any exception thrown during compilation —
+  the overlong-pattern `SyntaxError` verified above, or any other
+  `picomatch`-internal compilation failure — results in that specific
+  pattern string being added to `ProtectedPathMatchResult.invalidPatterns`
+  (the same, already-established result-channel §12/§17 define for
+  `..`-containing patterns) rather than propagating out of
+  `matchProtectedPaths` uncaught. **Stated explicitly as BR3's
+  contract:** no schema-valid protected-path pattern string can cause
+  `matchProtectedPaths` to throw an uncaught exception — every
+  compilation failure, of any kind, is caught and reported via
+  `invalidPatterns`. This is not a new `GitErrorCode` and does not
+  involve `GitResult` at all — it uses the identical, already-established
+  `invalidPatterns` mechanism, consistent with `matchProtectedPaths`'s
+  pure/synchronous boundary (§17). Dedicated tests are required (§20): an
+  overlong pattern (exceeding 65536 characters) reported via
+  `invalidPatterns`, not thrown; and a general "matcher compilation
+  failure does not escape as an uncaught exception" test category,
+  independent of the specific overlong-pattern case, proving the
+  try/catch wrapping is a structural guarantee, not a special case for
+  length alone.
 - **TypeScript typings — final, unconditional decision (revised —
   corrects Round 2 review finding #4, which found the previous
   "implementation must confirm" hedge factually wrong, not merely
@@ -1684,10 +2013,10 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 |---|---|---|
 | `GIT_EXECUTABLE_UNAVAILABLE` | The `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call) | Expected — a real, anticipated environment condition (Git not installed / not on `PATH`); always a typed `GitResult` failure, never an uncaught exception |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
-| `NOT_A_GIT_REPOSITORY` | `git rev-parse --is-bare-repository` (§8 step 2) fails because `projectRoot` is not inside any Git repository at all, or `--show-toplevel` (§8 step 3) fails unexpectedly after step 2 already succeeded | Expected |
+| `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4.** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms `<projectRoot>/.git` does not exist at all — i.e. `projectRoot` is genuinely not inside any Git repository. (`--show-toplevel`, §8 step 3, failing unexpectedly after step 2 already succeeded is retained as a defensive fallback to this same code, though not expected to be reachable in practice.) A `--is-bare-repository` failure where `<projectRoot>/.git` **does** exist (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8 | Expected |
 | `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) | Expected — `details` names the actual resolved toplevel |
 | `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 2) | Expected |
-| `HEAD_UNAVAILABLE` | `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal branch) or 1 (detached HEAD) — verified as exit 128 for genuine `.git/HEAD` corruption. This is the exact same trigger §9 defines for this determination; there is no second, independent mechanism. `git rev-parse --verify -q HEAD` (also used by §9, for the unborn/has-commits distinction) fails identically (exit 128, same underlying corruption) for this same case, but `symbolic-ref -q HEAD` always runs first in §9's control flow and classifies it as `HEAD_UNAVAILABLE` before `rev-parse --verify -q HEAD` is even reached — verified directly, no additional or undiscovered failure mode exists beyond what `symbolic-ref`'s exit code already catches | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
+| `HEAD_UNAVAILABLE` | **Complete, final trigger condition (revised — corrects Round 4 review finding #5, which extended this beyond Round 1's `symbolic-ref`-exit-code-only definition): EITHER (a)** `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal/unborn/corrupt-but-symbolic) or 1 (detached) — verified as exit 128 for genuine `.git/HEAD` corruption — **OR (b)** `git symbolic-ref -q HEAD` succeeds (exit 0) but `git rev-parse --verify -q HEAD^{commit}` fails AND the resolved branch ref name itself (`git rev-parse --verify -q <resolved-ref-name>`, no `^{commit}`) exits 0 — i.e. HEAD is genuinely symbolic and points at a branch ref that exists, but that ref's stored value does not name a real commit object (§9's "corrupt HEAD" case; distinguished from the unborn case, where the same ref-name check exits 1) — **OR (c)** HEAD is direct/detached (`symbolic-ref -q HEAD` exits 1) but `git rev-parse --verify -q HEAD^{commit}` also fails (a detached HEAD pointing at a non-existent object). These three conditions are the exact, complete trigger set §9 defines; there is no fourth, undocumented path to this code | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
 | `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify --end-of-options <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
 | `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis |
 | `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line, or a path that is not valid UTF-8 — §13) | Exceptional — this should be unreachable against a conforming Git version and well-formed repository content; exists so a genuinely unexpected format change (or a non-UTF-8 path, §13) fails loudly and specifically rather than silently misparsing |
@@ -1804,6 +2133,94 @@ code in `packages/core/src/git/` that invokes `node:child_process`.**
   overflow, etc.) not covered by (1)/(2) → `GIT_COMMAND_FAILED` (or
   `GIT_EXECUTABLE_UNAVAILABLE` specifically for `ENOENT`). No fourth,
   silent "swallow the error" path exists anywhere.
+- **External-helper execution — new, mandatory per-invocation `-c`
+  overrides (Round 4 review finding #3):** `execFile`'s argv-array,
+  no-shell, deterministic-`env` discipline above governs the *one*
+  process BR3 itself spawns (`git` itself), but Git can, depending on
+  repository-local configuration, spawn **further, arbitrary external
+  programs of its own** as part of executing an otherwise-ordinary
+  read-oriented subcommand — completely bypassing every one of BR3's own
+  process-safety guarantees, since it is *Git itself*, not BR3's
+  `execFile` call, that performs the spawn. This is a structurally
+  different threat class from the environment-variable mitigations in
+  §19: these are **per-invocation `-c` config overrides on the argv
+  itself**, not environment variables, because the threat is
+  repository-local `.git/config`/`.gitattributes` content, which
+  environment sanitization alone does not address.
+  - **`core.fsmonitor` hook:** a repository can configure an arbitrary
+    executable (`git config core.fsmonitor <path>`) that Git invokes
+    automatically during `git status`. **Verified directly:** a test
+    hook script that writes a proof file to disk when invoked was
+    genuinely, automatically invoked by an ordinary `git status
+    --porcelain=v2 -z` call against a repository with that hook
+    configured. **Verified fix:** passing `-c core.fsmonitor=` (an
+    empty-value override, applied per-invocation via `execFile`'s argv,
+    not an environment variable) to the specific `git status` invocation
+    reliably prevented the configured hook from running, regardless of
+    what `.git/config` actually declares. **Mandatory requirement:**
+    every BR3 `git status` invocation (§11) includes `-c
+    core.fsmonitor=` in its argv, unconditionally — this is a fixed,
+    always-present argv entry, not a conditional one applied only when a
+    hook happens to be configured (unconditional application is simpler,
+    equally correct when no hook is configured — the override is then
+    inert — and avoids a detect-then-decide race against a
+    concurrently-modified `.git/config`).
+  - **`filter.<driver>.clean` / `filter.<driver>.process` content-filter
+    drivers:** a repository can configure, via `.gitattributes` +
+    `.git/config`, an arbitrary external program that transforms file
+    content during certain content-comparison operations. **Verified
+    directly, using the same marker-writing-script technique as the
+    fsmonitor case above, against BR3's exact invoked commands:** a
+    configured `filter.<name>.clean` driver is genuinely invoked by `git
+    status --porcelain=v2 -z` in at least one realistic circumstance (a
+    tracked, filter-attributed file whose mtime changed but whose content
+    did not — Git's stat-cache-invalidation path re-runs the clean filter
+    to confirm whether the content genuinely changed) and by `git diff
+    --no-color --no-ext-diff -z --name-status` whenever the compared
+    file's content genuinely differs (name-status still requires Git to
+    determine *whether* content differs, which can invoke the clean
+    filter for a filter-attributed path, even though no patch content is
+    ultimately emitted). It was **not** invoked for a merely-untracked
+    file matching the filter pattern, nor for `git status` against an
+    unmodified, untouched file. Since both of BR3's actual invoked
+    commands (`status`, `diff --name-status`) **can** trigger a configured
+    clean filter under realistic conditions, this is not a "never
+    triggered, no mitigation needed" case — a mitigation is required.
+    **Verified fix, mirroring the fsmonitor mechanism:** first,
+    enumerate any configured filter drivers via `git config
+    --get-regexp '^filter\..*\.(clean|process|smudge)$'` (a genuinely
+    read-only, machine-readable, `--get`-family config query — exits 1
+    with no output when none are configured, verified directly); for
+    every `<name>` this reports, add `-c filter.<name>.clean=` and `-c
+    filter.<name>.process=` to the subsequent `status`/`diff` invocation's
+    argv (both, unconditionally, regardless of which specific key
+    `--get-regexp` reported, since either key alone is sufficient to
+    invoke an external program and BR3 has no need to distinguish which
+    one a given driver defines). **Verified directly** that this override
+    reliably prevents the configured driver from running (the marker
+    file was not created), while `git diff --name-status` continued to
+    report the correct `M` (modified) classification with the override
+    applied — i.e. the mitigation does not silently break BR3's own
+    fact-reporting, it only prevents the external program from running.
+    This enumeration step runs once per `resolveRepository`-validated
+    `projectRoot` (or once per `status`/`diff` call — implementation's
+    choice, not a caller-visible contract) before the corresponding
+    `status`/`diff` invocation, and its result (the `-c` overrides to
+    append) is threaded into that invocation's argv construction.
+  - **No other BR3-invoked command** (`rev-parse`, `symbolic-ref`, `config
+    --get`) reads working-tree file content or triggers a content-filter
+    driver at all — they operate purely on refs/objects/config, so this
+    mitigation is scoped to exactly the two commands verified above
+    (`status`, `diff --name-status`) and is not applied elsewhere.
+  - **No new `GitErrorCode` is introduced for this mitigation.** Because
+    the `-c` overrides above are verified to reliably and unconditionally
+    prevent both external-helper mechanisms from running (not merely
+    "usually" or "when correctly detected"), BR3 never reaches a state
+    where it must choose between silently proceeding with an
+    external-helper invocation risk and failing outright — the mitigation
+    itself is the complete answer, not a detect-and-reject fallback. No
+    `EXTERNAL_GIT_HELPER_UNSUPPORTED`/`UNSAFE_GIT_CONFIGURATION`-style
+    code is added to §17's union.
 
 ## 19. Determinism
 
@@ -1877,14 +2294,146 @@ includes, unconditionally:
     Node's `os.devNull`>`** — **new (Round 3 review finding #2)**; see the
     "Global Git config neutralization" bullet below for the exact
     mechanism and verified evidence.
+  - **`GIT_ATTR_NOSYSTEM: "1"`** — **new (Round 4 review finding #2)**;
+    the direct `.gitattributes`-equivalent of `GIT_CONFIG_NOSYSTEM` —
+    prevents an unusual machine-wide system-level Git attributes file
+    from silently altering behavior (e.g. a path's `-text`/`-diff`
+    attribute), for the identical rationale as `GIT_CONFIG_NOSYSTEM`
+    above.
+
+  This brings the controlled `GIT_*` variable count to **six** (not five,
+  as of Round 3) — every occurrence of "five" describing this set
+  elsewhere in this document is updated to "six" as part of this round's
+  correction.
 
   Together, steps 1–4 mean the final `env` passed to every BR3 `execFile`
   call is `process.env` **minus every `GIT_*`-prefixed key, unconditionally**,
-  **plus** exactly the five `GIT_*` keys named above **plus** `LC_ALL`/
-  `LANG` — never a wholesale `{ ...process.env }` spread with ad-hoc
+  **plus** exactly the six `GIT_*` keys named above **plus** `LC_ALL`/
+  `LANG` **plus** the `XDG_CONFIG_HOME` override described immediately
+  below (which is not itself a `GIT_*`-prefixed variable, and is counted
+  separately) — never a wholesale `{ ...process.env }` spread with ad-hoc
   additions layered on top. This is constructed once, in the one shared
   `internal/exec.ts` helper (§18) — not per call site — so there is
   exactly one place in the codebase this sanitization could regress.
+
+- **User-level global ignore/attributes isolation — new (Round 4 review
+  finding #2):** `GIT_CONFIG_GLOBAL` (above) neutralizes the
+  `~/.gitconfig`-equivalent global **config** file, but Git independently
+  consults a **separate** pair of user-level default locations for a
+  global ignore file and a global attributes file —
+  `$XDG_CONFIG_HOME/git/ignore` (falling back to `$HOME/.config/git/ignore`
+  when `XDG_CONFIG_HOME` is unset) and `$XDG_CONFIG_HOME/git/attributes`
+  (falling back to `$HOME/.config/git/attributes`) respectively — neither
+  of which `GIT_CONFIG_GLOBAL` touches at all, and neither of which is a
+  `GIT_*`-prefixed environment variable (so the blanket `GIT_*` strip
+  above does not address them either). **Verified directly**, in a real
+  fixture repository with one untracked file:
+  ```
+  $ git status --porcelain=v2 --untracked-files=all
+  ? secret-untracked.txt                              # reported, baseline
+
+  $ echo "secret-untracked.txt" > $FAKE_XDG/git/ignore
+  $ XDG_CONFIG_HOME=$FAKE_XDG git status --porcelain=v2 --untracked-files=all
+                                                        # (empty — the file
+                                                        #  vanished from output)
+  ```
+  and, confirming the `$HOME` fallback independently (with `XDG_CONFIG_HOME`
+  genuinely unset, not merely empty):
+  ```
+  $ echo "secret-untracked.txt" > $FAKE_HOME/.config/git/ignore
+  $ env -u XDG_CONFIG_HOME HOME=$FAKE_HOME git status --porcelain=v2 --untracked-files=all
+                                                        # (empty — the
+                                                        #  $HOME fallback
+                                                        #  path is
+                                                        #  genuinely
+                                                        #  consulted too)
+  ```
+  and, for the attributes file specifically, using `git check-attr` as the
+  observable proof mechanism (chosen because it directly reports which
+  attributes are in effect for a path, rather than requiring an indirect,
+  diff-visible side effect):
+  ```
+  $ git check-attr text -- test.bin
+  test.bin: text: unspecified                          # baseline
+
+  $ echo "*.bin -text" > $FAKE_XDG/git/attributes
+  $ XDG_CONFIG_HOME=$FAKE_XDG git check-attr text -- test.bin
+  test.bin: text: unset                                 # attribute IS
+                                                          # being read from
+                                                          # the fake XDG
+                                                          # location
+  ```
+  **The fix, verified directly:** pointing `XDG_CONFIG_HOME` at a
+  fresh, empty directory (one BR3's own exec helper controls, containing
+  no `git/ignore` or `git/attributes` file) fully neutralizes **both** the
+  `XDG_CONFIG_HOME`-direct path and the `$HOME`-fallback path
+  simultaneously — verified by re-running the exact `$HOME`-fallback
+  reproduction above with `XDG_CONFIG_HOME` additionally set to an empty
+  directory (while `$HOME` still points at the fixture containing the
+  real ignore file):
+  ```
+  $ XDG_CONFIG_HOME=$EMPTY_DIR HOME=$FAKE_HOME git status --porcelain=v2 --untracked-files=all
+  ? secret-untracked.txt                                # REAPPEARS — the
+                                                          # empty
+                                                          # XDG_CONFIG_HOME
+                                                          # suppresses the
+                                                          # $HOME fallback
+                                                          # too, not merely
+                                                          # its own direct
+                                                          # path
+  ```
+  and the same for attributes:
+  ```
+  $ XDG_CONFIG_HOME=$EMPTY_DIR git check-attr text -- test.bin
+  test.bin: text: unspecified                            # back to baseline
+                                                          # — neutralized
+  ```
+  This single mechanism therefore fully addresses both the
+  `XDG_CONFIG_HOME`-direct and `$HOME`-fallback cases with one override —
+  BR3 does **not** additionally need to override `HOME` itself. The
+  mechanism: **`XDG_CONFIG_HOME` is unconditionally set to a fresh, empty
+  directory** BR3's own exec helper creates/controls (implementation may
+  reuse a single such directory across the process lifetime rather than
+  creating one per invocation — it need only be empty and contain no
+  `git/` subdirectory) as part of the same `env` construction algorithm
+  above (added as a non-`GIT_*` override, alongside `LC_ALL`/`LANG`, not
+  counted among the six `GIT_*` variables above since it is not itself
+  `GIT_*`-prefixed).
+  - **Repository-local `.git/info/exclude` — explicitly decided: honored
+    (verified directly, alongside repository-local `.gitignore` below).**
+    This is a third, distinct ignore mechanism (neither the repository's
+    own tracked `.gitignore` nor the neutralized global ignore file) —
+    but it is genuinely repository-local state, exactly like `.gitignore`
+    itself, and BR3's stated goal throughout this section is to honor
+    repository-local state while neutralizing user/global state. BR3 does
+    not suppress it.
+  - **Repository-local `.gitignore`/`.gitattributes` remain fully
+    honored — verified directly**, with the `XDG_CONFIG_HOME` override
+    from this fix applied simultaneously:
+    ```
+    $ echo "local-ignored.txt" > .gitignore   # tracked, repo-local
+    $ echo "info-excluded.txt" >> .git/info/exclude
+    $ XDG_CONFIG_HOME=$EMPTY_DIR git status --porcelain=v2 --untracked-files=all
+                                                # neither local-ignored.txt
+                                                # nor info-excluded.txt
+                                                # appear — both
+                                                # repository-local
+                                                # mechanisms remain fully
+                                                # effective
+    ```
+  - **Repository-local `.git/config` remains fully available —
+    unaffected by this mechanism** (confirmed explicitly for completeness,
+    consistent with Round 3's `GIT_CONFIG_GLOBAL` design): `XDG_CONFIG_HOME`
+    only ever influences Git's *global-default-location* ignore/attributes
+    file discovery, never `.git/config` resolution (which is governed by
+    `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/the repository's own
+    `.git/config` path directly, none of which `XDG_CONFIG_HOME` touches)
+    — §9/§10's `branch.<b>.remote`/`.merge` reads continue to work
+    unaffected, exactly as before this fix.
+  - Four dedicated regression tests (inherited `XDG_CONFIG_HOME`-based
+    ignore, inherited `XDG_CONFIG_HOME`-based attributes, `GIT_ATTR_NOSYSTEM`
+    disabling system attributes, and repository-local ignore/attributes
+    behavior remaining intact) are required (§20).
 
 - **Read-only guarantee — the actual enforcement mechanism, named
   explicitly (revised — corrects Round 3 review finding #1, which found
@@ -2008,8 +2557,11 @@ includes, unconditionally:
   local configuration).
 - **`git status`'s exact flag set is `--porcelain=v2 -z --find-renames=50%
   --untracked-files=all --ignore-submodules=none`, always together, never
-  a subset** (§11 — restated here so this section, §11, §20, and §27 all
-  name the identical command with no drift between them).
+  a subset, always preceded by the mandatory `-c core.fsmonitor=`
+  override and any configured-filter-driver `-c` overrides (§11, §18,
+  Round 4 review finding #3)** (§11 — restated here so this section, §11,
+  §20, and §27 all name the identical command with no drift between
+  them).
 - **No reliance on Git aliases:** every BR3 Git invocation uses a
   first-argument literal plumbing/porcelain subcommand name
   (`status`, `diff`, `rev-parse`, `symbolic-ref`, `config`) that ships
@@ -2087,18 +2639,64 @@ current validation algorithm)**
   earlier draft's algorithm would have incorrectly reported `true` here),
   and `gitDir === gitCommonDir` in the returned `RepositoryInfo`
 - Nonexistent `projectRoot` path → `PROJECT_ROOT_NOT_FOUND`
+- **Malformed `.git/config` (real repository, syntactically-broken local
+  config, e.g. an unterminated `[section` line) — new, Round 4 review
+  finding #4** → `GIT_COMMAND_FAILED`, genuinely distinct from
+  `NOT_A_GIT_REPOSITORY` — the specific regression test proving this
+  case (verified: `--is-bare-repository` fails with the identical exit
+  code, 128, as a plain non-Git directory) is correctly classified via
+  the filesystem-based secondary check (`<projectRoot>/.git` exists and
+  has the shape of a real Git directory), not collapsed into
+  `NOT_A_GIT_REPOSITORY`
+- **Ordinary non-Git directory, re-asserted as its own fixture alongside
+  the malformed-config fixture above — new, Round 4 review finding #4**
+  → `NOT_A_GIT_REPOSITORY`, proven distinct from the malformed-`.git/config`
+  case even though both produce the identical underlying Git exit code
+  (128) — the two fixtures run side-by-side in the same test to prove the
+  filesystem-based secondary check genuinely discriminates them
+- **Unsafe/dubious-ownership repository — not added as a fixture in this
+  round (Round 4 review finding #4):** this scenario requires genuinely
+  differing file ownership between the repository directory and the
+  test-runner process, which could not be reliably or portably
+  constructed in this environment; its typed behavior
+  (`GIT_COMMAND_FAILED`, per §8) is specified directly from Git's own
+  documented, stable dubious-ownership error contract rather than a
+  fresh verified repro. If a future environment can construct this
+  fixture (e.g. a container-based CI runner with a deliberately
+  mismatched UID), adding it is a straightforward extension of this test
+  category, not a design change.
 
 **Branch + HEAD (§9, §10) — determination method revised, corrects Round
-1 review findings #2 and #5, and Round 2 review finding #2 (upstream
+1 review findings #2 and #5, Round 2 review finding #2 (upstream
 resolution redesigned again to use `@{upstream}` rather than a
-hand-constructed `refs/remotes/<remote>/<branch>` path)**
+hand-constructed `refs/remotes/<remote>/<branch>` path), and Round 4
+review finding #5 (HEAD-resolves-to-a-real-commit validation via
+`HEAD^{commit}` peeling, and the new corrupt-HEAD outcome)**
 - Normal branch with commits → correct `branch`, `headSha`, `detached: false`, `unborn: false`
 - Detached HEAD (checked out to a SHA) → `branch: null`, `detached: true`, correct `headSha`
 - Unborn branch (fresh `git init`, zero commits) → `unborn: true`,
   `headSha: null`, correct pending `branch` name — the specific
   regression test proving this is derived from
-  `symbolic-ref -q HEAD`/`rev-parse --verify -q HEAD` exit codes alone
-  (§9), not from any stderr text
+  `symbolic-ref -q HEAD`/`rev-parse --verify -q HEAD^{commit}` exit codes
+  alone (§9), not from any stderr text
+- **Direct/detached HEAD pointing at a nonexistent object — new, Round 4
+  review finding #5** (constructed by writing a non-existent, all-zeros
+  SHA directly into a detached `.git/HEAD` file) → `HEAD_UNAVAILABLE`
+  (§9's case 5, §17) — the specific regression test proving `rev-parse
+  --verify -q HEAD` alone (bare, no `^{commit}`) is insufficient: it
+  would incorrectly report exit 0 for this fixture, while `rev-parse
+  --verify -q HEAD^{commit}` correctly fails
+- **Symbolic branch ref pointing at an invalid/missing object — new,
+  Round 4 review finding #5** (`.git/HEAD` says `ref: refs/heads/<name>`,
+  but `.git/refs/heads/<name>` itself is overwritten with a non-existent,
+  all-zeros SHA) → `HEAD_UNAVAILABLE` (§9's case 4, §17), with `branch`
+  still reporting the ref name from `symbolic-ref` — the specific
+  regression test proving this is distinguished from the unborn case
+  (§9's case 3) via the third, ref-name-only `rev-parse --verify -q
+  <resolved-ref-name>` check (exit 0 with a printed SHA here, vs. exit 1
+  for a genuinely unborn branch, both starting from the same
+  `symbolic-ref`-exit-0/`HEAD^{commit}`-exit-1 state) — not by naively
+  comparing two identical exit-1 results
 - No upstream configured (`branch.<branch>.remote`/`.merge` config both
   absent) → `upstream: null`
 - **Repository has no remotes configured at all, but `branch.<b>.remote`
@@ -2185,11 +2783,23 @@ hand-constructed `refs/remotes/<remote>/<branch>` path)**
   itself, independent of a real Git invocation) that raw, undecoded
   `Buffer` data reaches the strict per-path `TextDecoder` check, never an
   already-lossily-decoded string (Round 2 review finding #3)
+- **Canonical result ordering — mandatory, new (Round 4 review finding
+  #1):** a fixture with multiple simultaneous working-tree changes across
+  several paths (e.g. an added file, a deleted file, and an untracked
+  file, with `path` values deliberately not already in sorted order
+  relative to Git's own likely emission sequence) → `WorkingTreeStatus.entries`
+  is returned sorted per §7a's exact `path`/`kind`/`oldPath` key order —
+  asserted directly against the expected sorted sequence, not merely
+  checked for content correctness irrespective of order
 
 **Diff inspection (§13, §14, §15)**
 - Two valid refs/SHAs → correct `fromSha`/`toSha` and changed-path list
 - Added / modified / deleted / renamed (above threshold) / type-changed
   classification, each as its own test
+- **Canonical result ordering — mandatory, new (Round 4 review finding
+  #1):** a fixture diff with multiple simultaneous changes across several
+  paths (added, modified, deleted, at minimum) → `DiffResult.changes` is
+  returned sorted per §7a's exact `path`/`kind`/`oldPath` key order
 - Rename below threshold → delete + add, not a rename
 - Nonexistent ref → `REF_NOT_FOUND`
 - A ref string shaped like a Git option (e.g. `--upload-pack=x`) passed
@@ -2250,11 +2860,49 @@ signature, corrects Round 1 review finding #4**
   `\` is genuinely treated as glob escape syntax, not as an inert
   separator-like character and not as "matches nothing" (the now-corrected
   claim §12 previously made)
+- **Double-quoted literal region — new, Round 4 review finding #6, Part
+  A, Option A:** a declared pattern containing a `"..."` region (e.g.
+  `src/"a*b"/x.ts`) matches the literal quoted content exactly
+  (`src/a*b/x.ts`) and does **not** match the glob-expanded form the
+  quoted metacharacter would otherwise have produced (`src/aZZZb/x.ts`)
+  — confirming quoting genuinely suppresses metacharacter interpretation
+  within the quoted region
+- **Overlong pattern — new, Round 4 review finding #6, Part B:** a
+  declared `ProtectedSystem` path pattern exceeding `picomatch`'s
+  internal maximum length (65536 characters, verified from source) is
+  reported via `ProtectedPathMatchResult.invalidPatterns`, **not** thrown
+  as an uncaught `SyntaxError` — the specific regression test proving
+  `matchProtectedPaths`'s compilation step is wrapped in try/catch, not
+  left to propagate a `picomatch`-internal exception directly
+- **Matcher-compilation failure does not escape as an uncaught exception
+  — new, Round 4 review finding #6, Part B, general case:** independent
+  of the specific overlong-pattern case above, a dedicated test confirms
+  `matchProtectedPaths` never throws for any input, asserting the
+  function's return value is always a well-formed
+  `ProtectedPathMatchResult` object (never a thrown exception reaching
+  the caller) across every declared pattern this test suite exercises,
+  including the deliberately-invalid ones
 - `matchProtectedPaths` is confirmed **pure**: calling it twice with the
   same (deep-equal, but not reference-equal) `inputs`/`protectedSystems`
   arguments produces deep-equal outputs, and neither input array/object
   is mutated (snapshot-before/assert-unchanged-after, mirroring BR2's
   established purity-test pattern)
+- **Canonical result ordering — mandatory, new (Round 4 review finding
+  #1):** construct two `inputs` arrays that are permutations of one
+  another (the same set of `ProtectedPathCheckInput` entries, deliberately
+  supplied in different orders — including at least one case producing
+  multiple matches across different `ProtectedSystem` entries for the
+  identical `path`/`matchedVia`, to exercise the `system.name`
+  tie-breaker) against the same `protectedSystems`, and assert
+  `matchProtectedPaths` returns **deep-equal, identically-ordered**
+  `matches` arrays for both — proving the output order is a function of
+  the matched content alone, never of input array order. This is directly
+  controllable (no reliance on Git's own emission order, which was
+  confirmed during this round's verification to already track path order
+  under ordinary porcelain v2 output in the fixtures tested, making it an
+  unreliable basis for a targeted regression test) and fully exercises
+  §7a's documented sort keys (`path`, then `matchedVia`, then
+  `system.name`).
 
 **Process/command safety (§18, §19)**
 - No BR3 test, across the entire suite, ever leaves a fixture repository
@@ -2269,6 +2917,34 @@ signature, corrects Round 1 review finding #4**
   temporarily manipulating `PATH` in the test's own subprocess
   environment so `git` cannot be found — not by uninstalling Git from
   the actual test-runner environment)
+- **External-helper suppression — mandatory, new (Round 4 review finding
+  #3), two dedicated cases, both using a real, marker-writing external
+  script (never a mocked helper):**
+  - **(A) `core.fsmonitor` hook does not execute:** configure a fixture
+    repository's `core.fsmonitor` to point at a real script that writes a
+    distinctive marker file to disk when invoked (proving, first, in the
+    test's own setup, that an ordinary `git status` call *without* BR3's
+    override genuinely does invoke it — establishing the threat is real,
+    not hypothetical); then call `inspectWorkingTree` against that same
+    fixture and assert the marker file was **not** created — proving
+    BR3's own `-c core.fsmonitor=` override (§18) genuinely suppresses
+    the hook.
+  - **(B) `filter.<driver>.clean`/`.process` does not execute:** configure
+    a fixture repository with a `.gitattributes` rule assigning a
+    `filter=<name>` attribute to a path, and `filter.<name>.clean`
+    pointing at a real, marker-writing script; construct a scenario
+    verified to trigger the filter under an unmitigated invocation (a
+    tracked, filter-attributed file with a real content change, or an
+    mtime-only touch, per this round's own verified reproduction); first
+    confirm, in the test's own setup, that an ordinary `git status`/`git
+    diff --name-status` call *without* BR3's override genuinely invokes
+    the marker script; then call `inspectWorkingTree`/`inspectDiff`
+    against that same fixture and assert the marker file was **not**
+    created, while also asserting the reported `WorkingTreeEntry`/
+    `DiffChange` classification is still correct (e.g. still reports
+    `unstaged_modify`/`modified` accurately) — proving the mitigation
+    neither leaves the helper running nor silently breaks BR3's own
+    fact-reporting.
 - **Index-mutation regression — mandatory, new (Round 3 review finding
   #1):** against a fixture repository with one committed, unchanged
   tracked file, snapshot `.git/index`'s raw bytes (or a hash of them)
@@ -2323,6 +2999,44 @@ signature, corrects Round 1 review finding #4**
     both cases), proving BR3's own `GIT_CONFIG_GLOBAL=<null device>`
     override (§19) neutralizes the inherited global config regardless of
     what the surrounding environment supplies.
+  - **(E) Inherited `XDG_CONFIG_HOME`-based global ignore cannot hide an
+    untracked path — new, Round 4 review finding #2:** with a fixture
+    repository containing one untracked file, and a fixture
+    `$XDG_CONFIG_HOME/git/ignore` file (pointed at via an inherited
+    `XDG_CONFIG_HOME` environment variable in the test's own setup)
+    declaring a pattern matching that untracked file, call
+    `inspectWorkingTree` twice — once with that fabricated global ignore
+    file reachable in the inherited environment, once without — and
+    assert **identical** results both times (the untracked file reported
+    in both cases), proving BR3's own `XDG_CONFIG_HOME`-override
+    mechanism (§19) neutralizes it regardless of the inherited
+    environment. Include the `$HOME`-fallback subcase (a fixture
+    `$HOME/.config/git/ignore` file, with `XDG_CONFIG_HOME` itself unset
+    in the inherited environment) as part of this same test, since the
+    fix mechanism must neutralize both paths.
+  - **(F) Inherited `XDG_CONFIG_HOME`-based global attributes cannot alter
+    facts — new, Round 4 review finding #2:** analogous to (E), but with a
+    fixture `$XDG_CONFIG_HOME/git/attributes` file declaring an attribute
+    (e.g. `-text`) for a fixture file, using `git check-attr` (or an
+    equivalent observable effect BR3 actually relies on) as the proof
+    mechanism, asserting BR3's own `XDG_CONFIG_HOME`-override neutralizes
+    it.
+  - **(G) `GIT_ATTR_NOSYSTEM=1` disables system-wide attributes — new,
+    Round 4 review finding #2:** confirms the `GIT_ATTR_NOSYSTEM: "1"`
+    environment variable (§19) is genuinely present in every BR3
+    `execFile` call's `env` (a structural/unit-level check against the
+    shared `internal/exec.ts` helper's constructed `env` object, since a
+    genuine machine-wide system attributes file is not portably
+    constructible as a test fixture, mirroring how `GIT_CONFIG_NOSYSTEM`
+    is verified elsewhere in this document).
+  - **(H) Repository-local ignore/attribute behavior remains intact — new,
+    Round 4 review finding #2:** with the `XDG_CONFIG_HOME`-override fix
+    applied, a fixture repository's own tracked `.gitignore`, its
+    `.git/info/exclude`, and its own `.gitattributes` each continue to
+    correctly affect `inspectWorkingTree`'s reported result exactly as
+    they would with no BR3 involvement at all — proving the XDG isolation
+    mechanism neutralizes only user/global state, never repository-local
+    state.
 
 ## 20a. Acceptance Criteria
 
@@ -2395,10 +3109,16 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   correctly derives `matchedVia` from each input's own `origin` field,
   correctly reports `..`-containing inputs/patterns via
   `invalidInputs`/`invalidPatterns` rather than throwing or silently
-  dropping them, and correctly implements the final, complete picomatch
+  dropping them, correctly implements the final, complete picomatch
   feature grammar (negation and extglobs disabled; `*`, `**`, `?`,
-  backslash-escaping, brace expansion, and bracket expressions all
-  enabled — §16, Round 3 review finding #4, Option A) (§7a, §12, §16,
+  backslash-escaping, double-quoted literal regions, brace expansion, and
+  bracket expressions all enabled — §16, Round 3 review finding #4 and
+  Round 4 review finding #6, both Option A), and returns its `matches`
+  array in canonical sorted order (§7a, Round 4 review finding #1) and
+  never throws an uncaught exception for any schema-valid input,
+  including an overlong pattern — every compilation failure reported via
+  `invalidPatterns` instead (§16, Round 4 review finding #6, Part B)
+  (§7a, §12, §16,
   §17).
 - **H.** Zero Git mutation occurs anywhere in the implementation — every
   Git subcommand string used is one of `status`, `diff`, `rev-parse`,
@@ -2414,15 +3134,22 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   determinism `env`/flags (§19) applied at exactly one shared call site
   (§18); **and** that `env` is genuinely sanitized, not a wholesale
   `process.env` spread — every inherited `GIT_*`-prefixed variable is
-  stripped via a prefix filter, with only BR3's own five controlled
+  stripped via a prefix filter, with only BR3's own six controlled
   `GIT_*` variables (`GIT_PAGER`, `GIT_TERMINAL_PROMPT`,
-  `GIT_OPTIONAL_LOCKS`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`)
-  re-added, and global (non-repository-local) Git config is neutralized
-  via `GIT_CONFIG_GLOBAL` pointed at a null device — proven by the four
+  `GIT_OPTIONAL_LOCKS`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`,
+  `GIT_ATTR_NOSYSTEM` — the last new in Round 4) re-added, `XDG_CONFIG_HOME`
+  overridden to a fresh empty directory (also new in Round 4, §19), and
+  global (non-repository-local) Git config is neutralized via
+  `GIT_CONFIG_GLOBAL` pointed at a null device — proven by the four
   dedicated environment-sanitization regression tests (§20, Round 3
   review finding #2: inherited `GIT_DIR`, inherited `GIT_INDEX_FILE`,
   `GIT_CONFIG_COUNT`-style injection, fabricated global
-  `core.excludesFile` — none of which may alter BR3's result).
+  `core.excludesFile` — none of which may alter BR3's result); **and**
+  an inherited `XDG_CONFIG_HOME`/`$HOME`-fallback-based global ignore
+  file and global attributes file are likewise neutralized (new, Round 4
+  review finding #2), with repository-local `.gitignore`/`.git/info/exclude`/
+  `.gitattributes`/`.git/config` all remaining fully honored — proven by
+  the four dedicated regression tests §20 adds for this round.
 - **J.** A path that is not valid UTF-8 produces `MALFORMED_GIT_OUTPUT`
   for the containing operation — never silent corruption, never an
   uncaught decoding exception, and never a partial/filtered result
@@ -2669,7 +3396,7 @@ The independent reviewer must specifically examine, for BR3:
 - Whether the shared exec helper's `env` (§18, §19) is genuinely
   constructed by stripping every inherited `GIT_*`-prefixed variable
   (via a prefix filter, not an enumerated blocklist) and re-adding only
-  BR3's own five controlled `GIT_*` variables — never a wholesale
+  BR3's own six controlled `GIT_*` variables — never a wholesale
   `{ ...process.env }` spread — proven by the four dedicated real
   regression tests (§20, Round 3 review finding #2): an inherited
   `GIT_DIR` cannot redirect `resolveRepository`/`inspectHead` to a
@@ -2679,7 +3406,38 @@ The independent reviewer must specifically examine, for BR3:
   and a fabricated global `core.excludesFile`, reachable via
   `GIT_CONFIG_GLOBAL`, does not change `inspectWorkingTree`'s
   untracked-path reporting — with repository-local Git config (e.g.
-  `branch.<b>.remote`/`.merge`) still correctly read in every case
+  `branch.<b>.remote`/`.merge`) still correctly read in every case; **and**
+  (new, Round 4 review finding #2) whether an inherited `XDG_CONFIG_HOME`/
+  `$HOME`-fallback-reachable global ignore file and global attributes
+  file are likewise neutralized via the `XDG_CONFIG_HOME`-override
+  mechanism (§19) and `GIT_ATTR_NOSYSTEM=1`, proven by the four dedicated
+  regression tests §20 adds for this round, with repository-local
+  `.gitignore`/`.git/info/exclude`/`.gitattributes` still fully honored in
+  every case
+- Whether every BR3 `git status`/`git diff --name-status` invocation
+  genuinely includes the mandatory `-c core.fsmonitor=` override, and the
+  filter-driver `-c filter.<name>.clean=`/`-c filter.<name>.process=`
+  overrides for every configured driver discovered via `git config
+  --get-regexp` (§18, new — Round 4 review finding #3), proven by the two
+  dedicated real marker-script regression tests §20 adds for this round —
+  not merely documented as suppressed
+- Whether `resolveRepository`'s `NOT_A_GIT_REPOSITORY`/`GIT_COMMAND_FAILED`
+  classification (§8, new — Round 4 review finding #4) genuinely
+  distinguishes a plain non-Git directory from a real-but-malformed
+  repository (e.g. a syntactically-broken `.git/config`) via the
+  filesystem-based secondary check, not merely by `--is-bare-repository`'s
+  exit code alone (verified identical, 128, for both cases) — proven by
+  the dedicated malformed-config and ordinary-non-repository fixtures §20
+  adds for this round
+- Whether `inspectHead`'s corrupt-HEAD handling (§9, new — Round 4 review
+  finding #5) genuinely uses `HEAD^{commit}` peeling (not bare `HEAD`) to
+  validate HEAD resolves to a real commit object, and genuinely
+  distinguishes "unborn" from "corrupt-but-symbolic" via the third,
+  ref-name-only `rev-parse --verify -q <resolved-ref-name>` check — proven
+  by the dedicated dangling-direct-HEAD and dangling-symbolic-branch-ref
+  fixtures §20 adds for this round, and whether §17's `HEAD_UNAVAILABLE`
+  row states the complete, three-part trigger condition this round
+  defines, not merely the Round 1 `symbolic-ref`-exit-code-only subset
 - Whether BR3's read-only guarantee is genuinely mechanically enforced
   via `GIT_OPTIONAL_LOCKS=0` (§19, Round 3 review finding #1), not merely
   a byproduct of which Git subcommands are invoked — proven by the
@@ -2734,10 +3492,6 @@ The independent reviewer must specifically examine, for BR3:
   `picomatch` (runtime) and `@types/picomatch` (dev) — and no others,
   were added; and whether `@types/picomatch` was genuinely needed (i.e.
   `picomatch` itself ships no usable bundled `.d.ts`)
-- Whether §17's `HEAD_UNAVAILABLE` error-table row states the same exact
-  trigger §9 defines (`symbolic-ref -q HEAD` exiting with a code other
-  than 0 or 1) — not a stale reference to a different command or
-  mechanism
 - Whether zero Git mutation occurs anywhere in BR3's implementation —
   confirmed by literally searching the implementation for every
   Git-subcommand string used, and cross-checking each one against the
@@ -2755,11 +3509,25 @@ The independent reviewer must specifically examine, for BR3:
   not silently matched and not thrown
 - Whether `matchProtectedPaths`'s pattern grammar (§12, §16) is exactly
   and completely the documented set — `*`, `**`, `?`, backslash-escaping,
-  bracket expressions, and brace expansion all genuinely functional, with
-  negation and extglobs genuinely disabled (matched literally, not
-  thrown, not silently no-op) — proven by dedicated fixtures for each,
-  including `?`'s never-crosses-`/` behavior and backslash-escape's
-  literal-match behavior specifically (Round 3 review finding #4)
+  double-quoted literal regions, bracket expressions, and brace expansion
+  all genuinely functional, with negation and extglobs genuinely disabled
+  (matched literally, not thrown, not silently no-op) — proven by
+  dedicated fixtures for each, including `?`'s never-crosses-`/` behavior
+  and backslash-escape's literal-match behavior specifically (Round 3
+  review finding #4), and double-quoted literal-region behavior
+  specifically (Round 4 review finding #6, Part A)
+- Whether `matchProtectedPaths` genuinely never throws an uncaught
+  exception for any schema-valid input — including a pattern exceeding
+  `picomatch`'s internal 65536-character compilation limit, which must be
+  reported via `invalidPatterns`, not propagated as an uncaught
+  `SyntaxError` (§16, §20, Round 4 review finding #6, Part B)
+- Whether `WorkingTreeStatus.entries`, `DiffResult.changes`, and
+  `ProtectedPathMatchResult.matches` are each returned in the exact
+  canonical sorted order §7a defines (`path`, then kind/`matchedVia`,
+  then `oldPath`/`system.name`), proven by a dedicated fixture
+  constructing semantically-identical-but-differently-ordered inputs and
+  asserting deep-equal, identically-ordered output (§7a, §20, Round 4
+  review finding #1)
 - Whether copy detection is genuinely disabled (`--find-copies` never
   passed) — confirmed by a fixture proving a copy-shaped change is
   reported as a plain `added` entry, not by reading the specification's
