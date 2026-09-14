@@ -28,6 +28,45 @@ export function getActiveAuthorization(state: BuildRailState): Authorization | n
   return state.authorization ?? null;
 }
 
+/**
+ * The single shared semantic-field validation path for an `Authorization`
+ * record, checking ONLY: `specification` is a non-empty string, and
+ * `granted_by === "human"`. Deliberately does not check `status` or `id`
+ * — those are each caller's own operation-specific requirement (e.g.
+ * `checkImplementationAllowed`'s active-status/phase-match checks,
+ * `authorizeSpecifiedWork`'s `status === "authorized"` check,
+ * `activatePhase`'s equivalent for `request.newAuthorization`).
+ *
+ * This is the one semantic-validation path shared by
+ * `checkImplementationAllowed` (below), `authorizeSpecifiedWork`, and
+ * `activatePhase` (both in `lifecycle/index.ts`, imported directly from
+ * this module rather than duplicating this logic) — not part of the
+ * package's public `index.ts` barrel; it is exported here only so
+ * `lifecycle/index.ts` can import it directly.
+ */
+export function validateAuthorizationFields(authorization: Authorization): PolicyResult {
+  if (typeof authorization.specification !== "string" || authorization.specification.length === 0) {
+    return {
+      ok: false,
+      error: {
+        code: "AUTHORIZATION_MISSING",
+        message: "authorization.specification must be a non-empty string.",
+      },
+    };
+  }
+  if (authorization.granted_by !== "human") {
+    return {
+      ok: false,
+      error: {
+        code: "AUTHORIZATION_MISSING",
+        message: "authorization.granted_by must be 'human'.",
+        details: "authorization.granted_by must be 'human'",
+      },
+    };
+  }
+  return { ok: true };
+}
+
 function checkAuthorizationSemantics(authorization: Authorization, phaseId: string): PolicyResult {
   if (authorization.status === "revoked") {
     return {
@@ -53,26 +92,7 @@ function checkAuthorizationSemantics(authorization: Authorization, phaseId: stri
       },
     };
   }
-  if (typeof authorization.specification !== "string" || authorization.specification.length === 0) {
-    return {
-      ok: false,
-      error: {
-        code: "AUTHORIZATION_MISSING",
-        message: "authorization.specification must be a non-empty string.",
-      },
-    };
-  }
-  if (authorization.granted_by !== "human") {
-    return {
-      ok: false,
-      error: {
-        code: "AUTHORIZATION_MISSING",
-        message: "authorization.granted_by must be 'human'.",
-        details: "authorization.granted_by must be 'human'",
-      },
-    };
-  }
-  return { ok: true };
+  return validateAuthorizationFields(authorization);
 }
 
 /**

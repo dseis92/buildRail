@@ -1,6 +1,6 @@
 import type { Authorization, Baseline, BuildRailState } from "../state/types.js";
 import type { LifecycleState } from "../state/types.js";
-import { checkImplementationAllowed } from "../policy/index.js";
+import { checkImplementationAllowed, validateAuthorizationFields } from "../policy/index.js";
 import type { Result } from "../result.js";
 import {
   Actor,
@@ -24,38 +24,6 @@ export function requiredActor(from: LifecycleState, to: LifecycleState): Actor |
 }
 
 const BASELINE_SHA_PATTERN = /^[0-9a-f]{40}$/;
-
-function checkAuthorizationSemantics(authorization: Authorization | undefined, phaseId: string): TransitionError | null {
-  if (!authorization) {
-    return { code: "AUTHORIZATION_MISSING", message: "No authorization is present." };
-  }
-  if (authorization.status === "revoked") {
-    return { code: "AUTHORIZATION_REVOKED", message: "The supplied authorization has been revoked." };
-  }
-  if (authorization.status !== "authorized" && authorization.status !== "in_progress") {
-    return {
-      code: "AUTHORIZATION_INACTIVE",
-      message: `Authorization status "${authorization.status}" does not permit this operation.`,
-    };
-  }
-  if (authorization.id !== phaseId) {
-    return {
-      code: "AUTHORIZATION_PHASE_MISMATCH",
-      message: `Authorization id (${authorization.id}) does not match phase (${phaseId}).`,
-    };
-  }
-  if (typeof authorization.specification !== "string" || authorization.specification.length === 0) {
-    return { code: "AUTHORIZATION_MISSING", message: "authorization.specification must be a non-empty string." };
-  }
-  if (authorization.granted_by !== "human") {
-    return {
-      code: "AUTHORIZATION_MISSING",
-      message: "authorization.granted_by must be 'human'.",
-      details: "authorization.granted_by must be 'human'",
-    };
-  }
-  return null;
-}
 
 /**
  * Pure, non-mutating: executes the 24 generic-apply edges of the 26-edge
@@ -138,14 +106,9 @@ export function authorizeSpecifiedWork(
       error: { code: "LIFECYCLE_AUTHORITY_REQUIRED", message: "authorizeSpecifiedWork requires actor human_owner." },
     };
   }
-  if (typeof authorization.specification !== "string" || authorization.specification.length === 0) {
-    return { ok: false, error: { code: "AUTHORIZATION_MISSING", message: "authorization.specification must be a non-empty string." } };
-  }
-  if (authorization.granted_by !== "human") {
-    return {
-      ok: false,
-      error: { code: "AUTHORIZATION_MISSING", message: "authorization.granted_by must be 'human'.", details: "authorization.granted_by must be 'human'" },
-    };
+  const semanticResult = validateAuthorizationFields(authorization);
+  if (!semanticResult.ok) {
+    return { ok: false, error: semanticResult.error };
   }
   if (authorization.status !== "authorized") {
     return { ok: false, error: { code: "AUTHORIZATION_INACTIVE", message: 'authorization.status must be "authorized".' } };
@@ -223,14 +186,9 @@ export function activatePhase(
   }
 
   const newAuthorization = request.newAuthorization;
-  if (typeof newAuthorization.specification !== "string" || newAuthorization.specification.length === 0) {
-    return { ok: false, error: { code: "AUTHORIZATION_MISSING", message: "newAuthorization.specification must be a non-empty string." } };
-  }
-  if (newAuthorization.granted_by !== "human") {
-    return {
-      ok: false,
-      error: { code: "AUTHORIZATION_MISSING", message: "newAuthorization.granted_by must be 'human'.", details: "authorization.granted_by must be 'human'" },
-    };
+  const semanticResult = validateAuthorizationFields(newAuthorization);
+  if (!semanticResult.ok) {
+    return { ok: false, error: semanticResult.error };
   }
   if (newAuthorization.status !== "authorized") {
     return { ok: false, error: { code: "AUTHORIZATION_INACTIVE", message: 'newAuthorization.status must be "authorized".' } };

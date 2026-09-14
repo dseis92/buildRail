@@ -208,6 +208,25 @@ test("activatePhase accepts candidate absent as equivalent to fully-null (shape 
   assert.equal(r2.ok, true, "absent candidate (shape A) should be accepted equivalently");
 });
 
+test("activatePhase rejects a partially-populated candidate (schema-valid but not a recognized no-in-flight shape)", () => {
+  // The Candidate type permits branch/base_sha/candidate_sha to each be
+  // individually omitted (matching state.schema.json's own permissiveness
+  // — no `required` array on the candidate object) — but activatePhase's
+  // semantic closure-invariant check is stricter than the schema: it
+  // accepts only (A) candidate entirely absent, or (B) candidate present
+  // with ALL THREE fields explicitly null. A candidate with only two of
+  // the three fields set to null, and the third omitted, is neither
+  // shape and must be rejected.
+  const state = fullyClosedState({ candidate: { branch: null, base_sha: null } });
+  const result = activatePhase(
+    state,
+    { newPhaseId: "BR10", newAuthorization: makeAuthorization({ status: "authorized", id: "BR10" }) },
+    "human_owner",
+  );
+  assert.equal(result.ok, false, "a partially-populated candidate must not be accepted as a no-in-flight-candidate shape");
+  if (!result.ok) assert.equal(result.error.code, "LIFECYCLE_TRANSITION_ILLEGAL");
+});
+
 test("activatePhase rejects reactivating a phase ID already present in baselines", () => {
   const state = fullyClosedState({
     baselines: {
@@ -255,6 +274,33 @@ test("activatePhase fails with AUTHORIZATION_PHASE_MISMATCH when newAuthorizatio
   );
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error.code, "AUTHORIZATION_PHASE_MISMATCH");
+});
+
+test("activatePhase fails with the appropriate AUTHORIZATION_* code for a malformed newAuthorization (shared semantic validation regression)", () => {
+  // Regression coverage for sharing validateAuthorizationFields between
+  // authorizeSpecifiedWork, activatePhase, and checkImplementationAllowed
+  // instead of each duplicating the specification/granted_by checks:
+  // proves activatePhase still produces the exact same codes post-refactor.
+  const state = fullyClosedState();
+
+  const emptySpecResult = activatePhase(
+    state,
+    { newPhaseId: "BR10", newAuthorization: makeAuthorization({ status: "authorized", id: "BR10", specification: "" }) },
+    "human_owner",
+  );
+  assert.equal(emptySpecResult.ok, false);
+  if (!emptySpecResult.ok) assert.equal(emptySpecResult.error.code, "AUTHORIZATION_MISSING");
+
+  const wrongGrantedByResult = activatePhase(
+    state,
+    {
+      newPhaseId: "BR10",
+      newAuthorization: makeAuthorization({ status: "authorized", id: "BR10", granted_by: "agent" }),
+    },
+    "human_owner",
+  );
+  assert.equal(wrongGrantedByResult.ok, false);
+  if (!wrongGrantedByResult.ok) assert.equal(wrongGrantedByResult.error.code, "AUTHORIZATION_MISSING");
 });
 
 test("activatePhase purity: input state is unchanged after a successful call", () => {
