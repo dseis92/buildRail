@@ -75,15 +75,15 @@ function buildSanitizedEnv(xdgConfigHomeDir: string): SanitizedEnv {
 // XDG_CONFIG_HOME neutralization directory
 // -------------------------------------------------------------------------
 
-let cachedEmptyXdgDir: string | null = null;
-
+/**
+ * Creates a fresh, empty XDG_CONFIG_HOME directory for one top-level
+ * operation. Never reuses a directory from a previous operation, ensuring
+ * that any contamination (e.g., git/config or git/attributes written by
+ * Git during the previous operation) cannot affect subsequent operations
+ * (Finding 5 correction).
+ */
 function getEmptyXdgConfigHomeDir(): string {
-  if (cachedEmptyXdgDir !== null && fs.existsSync(cachedEmptyXdgDir)) {
-    return cachedEmptyXdgDir;
-  }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "buildrail-git-xdg-"));
-  cachedEmptyXdgDir = dir;
-  return dir;
+  return fs.mkdtempSync(path.join(os.tmpdir(), "buildrail-git-xdg-"));
 }
 
 // -------------------------------------------------------------------------

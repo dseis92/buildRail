@@ -1,8 +1,8 @@
 import type { GitError, GitResult } from "./errors.js";
 import { gitFail, gitOk } from "./errors.js";
 import { commandFailedError, prepareGitOperation, runGit, typedError, type GitOperationContext } from "./internal/exec.js";
-import { decodeNulFieldsStrict, strictDecode } from "./internal/git-parse.js";
-import { resolveRepository } from "./repository.js";
+import { decodeNulFieldsStrict, removeTrailingNewline, strictDecode } from "./internal/git-parse.js";
+import { validateRepositoryAt } from "./repository.js";
 import type { HeadInfo, UpstreamInfo } from "./types.js";
 
 const SHA_RE = /^[0-9a-f]{40}$/;
@@ -48,8 +48,8 @@ async function resolveUpstream(ctx: GitOperationContext, cwd: string, branch: st
     let sha: string;
     let ref: string;
     try {
-      sha = strictDecode(shaOutcome.stdout).trim();
-      ref = strictDecode(refOutcome.stdout).trim();
+      sha = removeTrailingNewline(strictDecode(shaOutcome.stdout));
+      ref = removeTrailingNewline(strictDecode(refOutcome.stdout));
     } catch {
       return gitFail("MALFORMED_GIT_OUTPUT", "@{upstream} resolution output was not valid UTF-8.");
     }
@@ -68,12 +68,13 @@ async function resolveUpstream(ctx: GitOperationContext, cwd: string, branch: st
 }
 
 export async function inspectHead(projectRoot: string): Promise<GitResult<HeadInfo>> {
-  const repoResult = await resolveRepository(projectRoot);
-  if (!repoResult.ok) return { ok: false, error: repoResult.error };
-
   const prep = await prepareGitOperation();
   if (!prep.ok) return { ok: false, error: prep.error };
   const ctx = prep.value;
+
+  const repoResult = await validateRepositoryAt(ctx, projectRoot);
+  if (!repoResult.ok) return { ok: false, error: repoResult.error };
+
   const cwd = projectRoot;
 
   const symbolicOutcome = await runGit(ctx, ["symbolic-ref", "-q", "HEAD"], cwd);
@@ -82,7 +83,7 @@ export async function inspectHead(projectRoot: string): Promise<GitResult<HeadIn
     // Symbolic (normal or unborn) — including possibly corrupt.
     let resolvedRefName: string;
     try {
-      resolvedRefName = strictDecode(symbolicOutcome.stdout).trim();
+      resolvedRefName = removeTrailingNewline(strictDecode(symbolicOutcome.stdout));
     } catch {
       return gitFail("MALFORMED_GIT_OUTPUT", "symbolic-ref HEAD output was not valid UTF-8.");
     }
@@ -93,7 +94,7 @@ export async function inspectHead(projectRoot: string): Promise<GitResult<HeadIn
       // Normal branch with commits.
       let headSha: string;
       try {
-        headSha = strictDecode(headCommitOutcome.stdout).trim();
+        headSha = removeTrailingNewline(strictDecode(headCommitOutcome.stdout));
       } catch {
         return gitFail("MALFORMED_GIT_OUTPUT", "HEAD^{commit} output was not valid UTF-8.");
       }
@@ -133,7 +134,7 @@ export async function inspectHead(projectRoot: string): Promise<GitResult<HeadIn
     if (headCommitOutcome.ok) {
       let headSha: string;
       try {
-        headSha = strictDecode(headCommitOutcome.stdout).trim();
+        headSha = removeTrailingNewline(strictDecode(headCommitOutcome.stdout));
       } catch {
         return gitFail("MALFORMED_GIT_OUTPUT", "HEAD^{commit} output was not valid UTF-8.");
       }

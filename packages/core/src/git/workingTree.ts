@@ -3,7 +3,7 @@ import { gitFail, gitOk } from "./errors.js";
 import { commandFailedError, prepareGitOperation, runGit, typedError } from "./internal/exec.js";
 import { scanForActiveFilters } from "./internal/filter-scan.js";
 import { splitNulFields, strictDecode } from "./internal/git-parse.js";
-import { resolveRepository } from "./repository.js";
+import { validateRepositoryAt } from "./repository.js";
 import type { SubmoduleState, WorkingTreeEntry, WorkingTreeEntryKind, WorkingTreeStatus } from "./types.js";
 
 const KIND_RANK: Record<WorkingTreeEntryKind, number> = {
@@ -52,11 +52,21 @@ function xKindOf(x: string): WorkingTreeEntryKind | null {
 }
 
 // S<c><m><u> — c: commitChanged, m: tracked-file modification, u: untracked content
-function decodeSub(sub: string): SubmoduleState | undefined {
-  if (sub.length !== 4 || sub[0] !== "S") return undefined;
-  const c = sub[1];
-  const m = sub[2];
-  const u = sub[3];
+function decodeSub(sub: string): SubmoduleState | "invalid" | undefined {
+  if (sub === "N..." || sub === "S..." || sub.startsWith("N") || sub === "....") {
+    // Valid non-submodule or uninitialized submodule markers
+    return undefined;
+  }
+  if (sub.length !== 4 || sub[0] !== "S") {
+    return "invalid";
+  }
+  const c = sub[1]!;
+  const m = sub[2]!;
+  const u = sub[3]!;
+  // Validate exact grammar: c must be 'C' or '.', m must be 'M' or '.', u must be 'U' or '.'
+  if ((c !== "C" && c !== ".") || (m !== "M" && m !== ".") || (u !== "U" && u !== ".")) {
+    return "invalid";
+  }
   return {
     commitChanged: c === "C",
     hasModifiedContent: m === "M",
@@ -102,9 +112,15 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
       const xy = parts[1]!;
       const sub = parts[2]!;
       const pathStr = parts.slice(8).join(" ");
+      if (xy.length !== 2) {
+        return new MalformedStatusOutput(`Invalid XY field length in type-1 record: ${headerStr}`);
+      }
       const x = xy[0]!;
       const y = xy[1]!;
       const submodule = decodeSub(sub);
+      if (submodule === "invalid") {
+        return new MalformedStatusOutput(`Invalid submodule field in type-1 record: ${headerStr}`);
+      }
 
       let matched = false;
       if (x !== ".") {
@@ -145,10 +161,23 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
       } catch {
         return new MalformedStatusOutput("Type-2 record oldPath was not valid UTF-8.");
       }
+      if (xy.length !== 2) {
+        return new MalformedStatusOutput(`Invalid XY field length in type-2 record: ${headerStr}`);
+      }
       const x = xy[0]!;
       const y = xy[1]!;
       const submodule = decodeSub(sub);
+      if (submodule === "invalid") {
+        return new MalformedStatusOutput(`Invalid submodule field in type-2 record: ${headerStr}`);
+      }
+      // Validate rename score format: must be "R" followed by digits
+      if (!scoreField.startsWith("R") || scoreField.length < 2) {
+        return new MalformedStatusOutput(`Invalid rename score format in type-2 record: ${headerStr}`);
+      }
       const similarity = Number(scoreField.slice(1));
+      if (isNaN(similarity) || similarity < 0 || similarity > 100) {
+        return new MalformedStatusOutput(`Invalid rename similarity value in type-2 record: ${headerStr}`);
+      }
 
       if (x !== "R" && x !== ".") {
         return new MalformedStatusOutput(`Unexpected type-2 X status: ${x} in ${headerStr}`);
@@ -200,6 +229,9 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
       const sub = parts[2]!;
       const pathStr = parts.slice(10).join(" ");
       const submodule = decodeSub(sub);
+      if (submodule === "invalid") {
+        return new MalformedStatusOutput(`Invalid submodule field in unmerged record: ${headerStr}`);
+      }
       const entry: WorkingTreeEntry = { kind: "conflicted", path: pathStr };
       if (submodule) entry.submodule = submodule;
       entries.push(entry);
@@ -240,13 +272,13 @@ function sortEntries(entries: WorkingTreeEntry[]): WorkingTreeEntry[] {
 }
 
 export async function inspectWorkingTree(projectRoot: string): Promise<GitResult<WorkingTreeStatus>> {
-  const repoResult = await resolveRepository(projectRoot);
-  if (!repoResult.ok) return { ok: false, error: repoResult.error };
-  const { gitDir, gitCommonDir } = repoResult.value;
-
   const prep = await prepareGitOperation();
   if (!prep.ok) return { ok: false, error: prep.error };
   const ctx = prep.value;
+
+  const repoResult = await validateRepositoryAt(ctx, projectRoot);
+  if (!repoResult.ok) return { ok: false, error: repoResult.error };
+  const { gitDir, gitCommonDir } = repoResult.value;
 
   const filterError = await scanForActiveFilters(ctx, projectRoot, gitDir, gitCommonDir);
   if (filterError !== null) {

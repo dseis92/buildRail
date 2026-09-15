@@ -78,17 +78,19 @@ function isLegitimateParentChildRelationship(
   childGitDir: string,
   childGitCommonDir: string,
 ): boolean {
-  if (childGitDir === childGitCommonDir) {
-    if (childGitDir === parentGitCommonDir) {
-      return false;
-    }
-    const parentPrefix = parentGitCommonDir.endsWith(path.sep) ? parentGitCommonDir : parentGitCommonDir + path.sep;
-    if (childGitDir.startsWith(parentPrefix)) {
-      return true;
-    }
-    return true;
+  // Reject linked-worktree metadata (§18 step 4a)
+  if (childGitDir !== childGitCommonDir) {
+    return false;
   }
-  return false;
+
+  // Reject if child metadata equals parent metadata (§18 step 4a)
+  if (childGitDir === parentGitCommonDir) {
+    return false;
+  }
+
+  // Accept only if child metadata is beneath parent's gitCommonDir tree (§18 step 4a)
+  const parentPrefix = parentGitCommonDir.endsWith(path.sep) ? parentGitCommonDir : parentGitCommonDir + path.sep;
+  return childGitDir.startsWith(parentPrefix);
 }
 
 function lstatSafe(p: string): fs.Stats | null {

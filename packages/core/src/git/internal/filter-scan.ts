@@ -35,8 +35,14 @@ async function scanOneRepo(ctx: GitOperationContext, cwd: string): Promise<GitEr
   }
 
   const fields = splitNulFields(outcome.stdout);
+
+  // Validate complete three-field record groups (path, attr, value)
+  if (fields.length % 3 !== 0) {
+    return typedError("MALFORMED_GIT_OUTPUT", `check-attr output has incomplete record group: ${fields.length} fields is not divisible by 3.`);
+  }
+
   const activePaths: string[] = [];
-  for (let i = 0; i + 2 < fields.length; i += 3) {
+  for (let i = 0; i < fields.length; i += 3) {
     let p: string;
     let attr: string;
     let value: string;
@@ -47,7 +53,10 @@ async function scanOneRepo(ctx: GitOperationContext, cwd: string): Promise<GitEr
     } catch {
       return typedError("MALFORMED_GIT_OUTPUT", "check-attr --stdin -z output was not valid UTF-8.");
     }
-    if (attr !== "filter") continue;
+    // Validate expected attribute name
+    if (attr !== "filter") {
+      return typedError("MALFORMED_GIT_OUTPUT", `check-attr returned unexpected attribute name: ${attr}`);
+    }
     if (value !== "unspecified" && value !== "unset") {
       activePaths.push(p);
     }

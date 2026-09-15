@@ -40,3 +40,14 @@ export function splitNulFields(buf: Buffer): Buffer[] {
 export function decodeNulFieldsStrict(buf: Buffer): string[] {
   return splitNulFields(buf).map((f) => strictDecode(f));
 }
+
+/**
+ * Removes exactly one trailing LF (0x0a) from a decoded string if present,
+ * per Git's line-oriented output convention (§13 Category 1/2). Never
+ * removes leading whitespace, never removes trailing whitespace other than
+ * the single LF record terminator. Preserves every byte belonging to the
+ * actual value — including trailing spaces, tabs, or embedded newlines.
+ */
+export function removeTrailingNewline(s: string): string {
+  return s.endsWith("\n") ? s.slice(0, -1) : s;
+}

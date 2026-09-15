@@ -1,8 +1,8 @@
 import type { GitResult } from "./errors.js";
 import { gitFail, gitOk } from "./errors.js";
 import { commandFailedError, prepareGitOperation, runGit } from "./internal/exec.js";
-import { splitNulFields, strictDecode } from "./internal/git-parse.js";
-import { resolveRepository } from "./repository.js";
+import { removeTrailingNewline, splitNulFields, strictDecode } from "./internal/git-parse.js";
+import { validateRepositoryAt } from "./repository.js";
 import type { DiffChange, DiffChangeKind, DiffRequest, DiffResult } from "./types.js";
 
 const SHA_RE = /^[0-9a-f]{40}$/;
@@ -21,7 +21,7 @@ async function resolveRef(
   }
   let sha: string;
   try {
-    sha = strictDecode(outcome.stdout).trim();
+    sha = removeTrailingNewline(strictDecode(outcome.stdout));
   } catch {
     return { ok: false, error: { code: "REF_NOT_FOUND", message: `Ref resolution output was not valid UTF-8: ${ref}` } };
   }
@@ -65,9 +65,9 @@ function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
     } catch {
       return new MalformedDiffOutput("diff status field was not valid UTF-8.");
     }
-    const letter = statusField[0];
 
-    if (letter === "A" || letter === "M" || letter === "D" || letter === "T") {
+    // Validate complete status token for single-letter statuses
+    if (statusField === "A" || statusField === "M" || statusField === "D" || statusField === "T") {
       if (i + 1 >= fields.length) return new MalformedDiffOutput(`Missing path for status ${statusField}`);
       let pathStr: string;
       try {
@@ -75,14 +75,18 @@ function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
       } catch {
         return new MalformedDiffOutput("diff path field was not valid UTF-8.");
       }
-      const kind: DiffChangeKind = letter === "A" ? "added" : letter === "M" ? "modified" : letter === "D" ? "deleted" : "type_changed";
+      const kind: DiffChangeKind = statusField === "A" ? "added" : statusField === "M" ? "modified" : statusField === "D" ? "deleted" : "type_changed";
       changes.push({ kind, path: pathStr });
       i += 2;
       continue;
     }
 
-    if (letter === "R") {
+    // Validate rename status token (R followed by similarity score)
+    if (statusField.startsWith("R") && statusField.length > 1) {
       const similarity = Number(statusField.slice(1));
+      if (isNaN(similarity) || similarity < 0 || similarity > 100) {
+        return new MalformedDiffOutput(`Invalid rename similarity value: ${statusField}`);
+      }
       if (i + 2 >= fields.length) return new MalformedDiffOutput(`Missing paths for rename status ${statusField}`);
       let oldPathStr: string;
       let newPathStr: string;
@@ -97,18 +101,18 @@ function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
       continue;
     }
 
-    return new MalformedDiffOutput(`Unrecognized diff status letter: ${statusField}`);
+    return new MalformedDiffOutput(`Unrecognized diff status token: ${statusField}`);
   }
   return changes;
 }
 
 export async function inspectDiff(projectRoot: string, request: DiffRequest): Promise<GitResult<DiffResult>> {
-  const repoResult = await resolveRepository(projectRoot);
-  if (!repoResult.ok) return { ok: false, error: repoResult.error };
-
   const prep = await prepareGitOperation();
   if (!prep.ok) return { ok: false, error: prep.error };
   const ctx = prep.value;
+
+  const repoResult = await validateRepositoryAt(ctx, projectRoot);
+  if (!repoResult.ok) return { ok: false, error: repoResult.error };
 
   const fromResolved = await resolveRef(ctx, projectRoot, request.fromRef);
   if (!fromResolved.ok) {

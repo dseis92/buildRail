@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { GitError, GitResult } from "./errors.js";
 import { gitFail, gitOk } from "./errors.js";
 import { commandFailedError, prepareGitOperation, runGit, typedError, type GitOperationContext } from "./internal/exec.js";
-import { strictDecode } from "./internal/git-parse.js";
+import { removeTrailingNewline, strictDecode } from "./internal/git-parse.js";
 import type { RepositoryInfo } from "./types.js";
 
 function realpathOrSelf(p: string): string {
@@ -150,8 +150,8 @@ async function resolveGitDirs(
   let gitDirRaw: string;
   let gitCommonDirRaw: string;
   try {
-    gitDirRaw = strictDecode(gitDirOutcome.stdout).trim();
-    gitCommonDirRaw = strictDecode(gitCommonDirOutcome.stdout).trim();
+    gitDirRaw = removeTrailingNewline(strictDecode(gitDirOutcome.stdout));
+    gitCommonDirRaw = removeTrailingNewline(strictDecode(gitCommonDirOutcome.stdout));
   } catch {
     return gitFail("MALFORMED_GIT_OUTPUT", "git-dir/git-common-dir output was not valid UTF-8.");
   }
@@ -182,7 +182,7 @@ export async function validateRepositoryAt(
 
   let isBareText: string;
   try {
-    isBareText = strictDecode(isBareOutcome.stdout).trim();
+    isBareText = removeTrailingNewline(strictDecode(isBareOutcome.stdout));
   } catch {
     return gitFail("MALFORMED_GIT_OUTPUT", "--is-bare-repository output was not valid UTF-8.");
   }
@@ -200,7 +200,7 @@ export async function validateRepositoryAt(
   }
   let toplevelRaw: string;
   try {
-    toplevelRaw = strictDecode(toplevelOutcome.stdout).trim();
+    toplevelRaw = removeTrailingNewline(strictDecode(toplevelOutcome.stdout));
   } catch {
     return gitFail("MALFORMED_GIT_OUTPUT", "--show-toplevel output was not valid UTF-8.");
   }
@@ -223,7 +223,7 @@ export async function validateRepositoryAt(
   }
   let objectFormat: string;
   try {
-    objectFormat = strictDecode(objectFormatOutcome.stdout).trim();
+    objectFormat = removeTrailingNewline(strictDecode(objectFormatOutcome.stdout));
   } catch {
     return gitFail("MALFORMED_GIT_OUTPUT", "--show-object-format output was not valid UTF-8.");
   }
@@ -241,7 +241,7 @@ export async function validateRepositoryAt(
   } else {
     let refStorageValue: string;
     try {
-      refStorageValue = strictDecode(refStorageOutcome.stdout).trim();
+      refStorageValue = removeTrailingNewline(strictDecode(refStorageOutcome.stdout));
     } catch {
       return gitFail("MALFORMED_GIT_OUTPUT", "extensions.refStorage output was not valid UTF-8.");
     }
