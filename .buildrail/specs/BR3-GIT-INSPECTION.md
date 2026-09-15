@@ -26,11 +26,14 @@ surface:
 - confirm a directory is a Git repository (and exactly which one)
 - determine the current branch, or detached-HEAD state
 - determine the current HEAD commit SHA
-- determine the upstream identity and upstream SHA, when one exists
-  (revised — corrects Round 4 review finding #7, reconciling this
-  summary line with §9/§10's terminology, which already distinguishes a
-  remote-tracking upstream from a local-branch upstream as two named
-  subcases — see §10), without ever contacting the network
+- determine the configured upstream identity and its locally-resolved
+  object/ref, when one is configured (revised — corrects Round 4 review
+  finding #7, reconciling this summary line with §9/§10's terminology;
+  made namespace-general — corrects Round 18 review finding #1, since an
+  earlier draft's "two named subcases" wording (remote-tracking vs.
+  local-branch) is incomplete — §9/§10 support any configured `mergeRef`
+  namespace, including local tags and arbitrary custom-namespace refs,
+  not only those two — see §10), without ever contacting the network
 - inspect the working tree: staged changes, unstaged changes, untracked
   paths, conflicts — as a structured per-path model, not a single
   clean/dirty boolean
@@ -2491,12 +2494,18 @@ data is actually present.
    in the context of `<branch>` (not whatever branch HEAD happens to
    currently be, so this remains correct if that ever diverges) — this
    step's result is called "upstream SHA" throughout this specification,
-   an umbrella term covering two distinct subcases (revised — corrects
+   the raw object ID `@{upstream}` itself resolves to for whatever target
+   `mergeRef` names, in any supported namespace (revised — corrects
    Round 3 review finding #3, which found the previous uniform
    "remote-tracking ref SHA"/"remote SHA" terminology misleading for the
-   local-upstream subcase below, whose SHA comes from a plain local
+   local-branch-upstream target below, whose SHA comes from a plain local
    branch ref under `refs/heads/`, never from anything under
-   `refs/remotes/`):**
+   `refs/remotes/`; made namespace-general — corrects Round 18 review
+   finding #1, since "upstream SHA" is not merely an umbrella term for
+   two subcases — remote-tracking and local-branch — but the general
+   result of resolving `@{upstream}` for **any** configured `mergeRef`
+   target, including a local tag or an arbitrary custom-namespace ref,
+   per §10's exact-meaning correction):**
    `git rev-parse --verify -q --end-of-options <branch>@{upstream}` for
    the SHA, and `git rev-parse --verify -q --symbolic-full-name
    --end-of-options <branch>@{upstream}` for the resolved ref name (both
@@ -2542,8 +2551,12 @@ data is actually present.
    `--end-of-options` there too.
    - If both succeed (exit 0): `sha` is populated with the printed SHA,
      and `ref` is populated with the printed symbolic full name — always
-     exactly what Git itself reports, never a BR3 guess. Two subcases,
-     both fully supported and both reachable in practice:
+     exactly what Git itself reports, never a BR3 guess. Every supported
+     target namespace below is fully supported and reachable in
+     practice — **not limited to the two most common shapes** (revised —
+     corrects Round 18 review finding #1, since an earlier draft's "Two
+     subcases" framing here was directly contradicted by the third,
+     "Non-branch local upstream target," case immediately below it):
      - **Remote-tracking upstream** (the ordinary case, and the
        custom-fetch-refspec case): `ref` is something under `refs/remotes/`
        — e.g. `refs/remotes/origin/main` under Git's default fetch
@@ -2590,14 +2603,18 @@ data is actually present.
        correction for the complete, namespace-general definition that
        applies uniformly to every subcase in this section.
 
-     **This is the entirety of what "upstream SHA" means in BR3, for
-     any subcase** — the SHA `@{upstream}`'s own already-resolved
-     target already records locally, never a live query to an actual
-     remote server. For a remote-tracking upstream specifically, that SHA
-     is exactly as fresh as whenever the *user* (not BR3) last ran an
-     actual `git fetch`; for a local-branch upstream, it is simply the
-     other local branch's current tip. BR3 never runs `git fetch` itself,
-     under any circumstance, for either subcase.
+     **This is the entirety of what "upstream SHA" means in BR3, for any
+     configured `mergeRef` target, in any namespace — corrected,
+     namespace-general, Round 18 review finding #1** — the raw object ID
+     `@{upstream}`'s own already-resolved target already records locally,
+     never a live query to an actual remote server. For a remote-tracking
+     upstream specifically, that SHA is exactly as fresh as whenever the
+     *user* (not BR3) last ran an actual `git fetch`; for a local-branch
+     upstream, it is simply the other local branch's current tip; for a
+     local tag or an arbitrary custom-namespace-ref target, it is that
+     ref's own raw, unpeeled object ID (§10's exact-meaning correction).
+     BR3 never runs `git fetch` itself, under any circumstance, for any
+     configured upstream target, regardless of namespace.
    - If either fails (exit 1, no stderr with `-q`): **both `sha` and `ref`
      are `null`** (revised — corrects Round 3 review finding #3: an
      earlier draft of this specification had `ref` fall back to a
@@ -2608,35 +2625,46 @@ data is actually present.
      local-branch upstream, neither of which has any real target under
      `refs/remotes/<remote>/<branch>` at all; presenting a fabricated
      path as if it were a real, Git-resolved fact is worse than reporting
-     nothing) — while `remote`/`branch` (populated directly from
+     nothing) — while `remote`/`mergeRef` (populated directly from
      `branch.<b>.remote`/`.merge` config in step 1, independent of
-     whether `@{upstream}` resolves) remain populated. This is the
-     explicit "configured but unresolvable" case: BR3 truthfully reports
-     "an upstream is configured, and its identity is `remote`/`branch`,
-     but I cannot tell you where its data lives" rather than guessing —
-     genuinely distinct from step 1's "no upstream configured" `null`
-     case, where the entire `upstream` value is `null`. Verified directly
-     against a scratch repository with `branch.main.remote`/`.merge`
-     configured but `refs/remotes/origin/main` deleted: step 1 still
-     reports the configured remote/branch (config keys are unaffected by
-     the tracking ref's deletion), and step 2's `@{upstream}` resolution
-     on the now-absent ref fails cleanly with exit 1 and no stderr.
+     whether `@{upstream}` resolves) remain populated, and `branch`
+     remains populated whenever `mergeRef` is genuinely under
+     `refs/heads/` (independent of resolvability, per step 1's derivation
+     rule — correctly `null` otherwise). This is the explicit "configured
+     but unresolvable" case: BR3 truthfully reports "an upstream is
+     configured, and its identity is `remote`/`mergeRef` (and `branch`
+     when applicable), but I cannot tell you where its data lives" rather
+     than guessing — genuinely distinct from step 1's "no upstream
+     configured" `null` case, where the entire `upstream` value is
+     `null`. Verified directly against a scratch repository with
+     `branch.main.remote`/`.merge` configured but
+     `refs/remotes/origin/main` deleted: step 1 still reports the
+     configured remote/mergeRef/branch (config keys are unaffected by the
+     tracking ref's deletion), and step 2's `@{upstream}` resolution on
+     the now-absent ref fails cleanly with exit 1 and no stderr.
 
-**"Upstream SHA" is therefore precisely and only: the SHA already
-recorded, locally, by whatever `@{upstream}` itself resolves to for the
-current branch's configured upstream, if any — for the ordinary
-remote-tracking-upstream subcase, the local remote-tracking ref's
-already-recorded SHA; for the local-branch-upstream subcase, the other
-local branch's own current tip — never a live query to an actual remote
-server, never triggering a fetch, for either subcase** (revised —
-"Remote SHA" is retired as the umbrella term, since it misdescribes the
-local-branch-upstream subcase, whose SHA comes from a plain
-`refs/heads/` ref, not anything under `refs/remotes/`; "remote-tracking
-ref"/"remote SHA" remain the correct, precise terms for the ordinary
-majority-case subcase specifically — see step 2 above). If a caller wants
-a truly up-to-date remote-tracking-upstream SHA, running `git fetch`
-themselves (outside BR3, which never mutates anything) before calling
-`inspectHead` is the only way to get one — this is stated explicitly so
+**"Upstream SHA" is therefore precisely and only: the raw object ID
+already recorded, locally, by whatever `@{upstream}` itself resolves to
+for the current branch's configured upstream, if any, in whatever
+namespace `mergeRef` names — corrected, namespace-general, Round 18
+review finding #1 (an earlier draft of this summary enumerated only the
+ordinary remote-tracking and local-branch subcases and concluded "for
+either subcase," a framing that has not described the complete state
+space since Round 13 added namespace-general `mergeRef` support): for
+the ordinary remote-tracking-upstream target, the local remote-tracking
+ref's already-recorded SHA; for the local-branch-upstream target, the
+other local branch's own current tip; for a local tag or an arbitrary
+custom-namespace-ref target, that ref's own raw, unpeeled object ID
+(§10) — never a live query to an actual remote server, never triggering
+a fetch, for any of them** (revised — "Remote SHA" is retired as the
+umbrella term, since it misdescribes the local-branch-upstream and
+non-branch-target cases, whose SHA comes from something other than
+`refs/remotes/`; "remote-tracking ref"/"remote SHA" remain the correct,
+precise terms for the ordinary majority-case target specifically — see
+step 2 above). If a caller wants a truly up-to-date remote-tracking-upstream
+SHA, running `git fetch` themselves (outside BR3, which never mutates
+anything) before calling `inspectHead` is the only way to get one — this
+is stated explicitly so
 no caller misreads `upstream.sha` as always-current.
 
 **Ahead/behind: explicitly excluded from BR3.** Commit-count-based
@@ -9384,11 +9412,14 @@ The independent reviewer must specifically examine, for BR3:
 - Whether the working-tree same-path-staged+unstaged case (§11) is
   genuinely represented as two separate entries, proven by a real fixture
   exercising it
-- Whether `inspectHead`'s "upstream SHA" (for either subcase —
-  remote-tracking or local-branch) is genuinely never derived from a
-  network call — proven by running the full BR3 test suite with network
-  access disabled (or an equivalent structural check) and confirming
-  every upstream-SHA test still passes using only already-local refs
+- Whether `inspectHead`'s "upstream SHA" — for **any** configured
+  `mergeRef` target namespace (remote-tracking, custom fetch-refspec,
+  local-branch, local tag, or arbitrary custom-namespace ref, per §10's
+  namespace-general contract, Round 18 review finding #1) — is genuinely
+  never derived from a network call — proven by running the full BR3
+  test suite with network access disabled (or an equivalent structural
+  check) and confirming every upstream-SHA test still passes using only
+  already-local refs
 - Whether `git -c core.fsmonitor= -c status.renameLimit=0 -c
   status.showStash=false status --porcelain=v2 -z --find-renames=50%
   --untracked-files=all --ignore-submodules=none` (§11, §19, Round 9
