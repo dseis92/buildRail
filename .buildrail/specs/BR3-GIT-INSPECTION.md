@@ -148,10 +148,12 @@ drafting this specification:
   of a Git working tree BR3 will operate against (§8)
 - Current branch / detached-HEAD / unborn-branch detection (§9)
 - HEAD commit SHA detection (§9)
-- Upstream identity and upstream SHA detection (covering both the
-  ordinary remote-tracking subcase and the local-branch subcase — §9,
-  §10; revised, corrects Round 4 review finding #7), entirely from local
-  repository state — no network access (§9, §10)
+- Configured upstream identity and locally-resolved upstream object/ref
+  detection — namespace-general: remote-tracking, local-branch, local
+  tag, and arbitrary custom-ref upstream targets are all supported (§9,
+  §10; revised, corrects Round 4 review finding #7, made namespace-general,
+  Round 13 review finding #3), entirely from local repository state — no
+  network access (§9, §10)
 - Working-tree status inspection as a structured, per-path model (§11)
 - Diff inspection between two resolved refs/SHAs, including
   added/modified/deleted/renamed classification (§13)
@@ -983,17 +985,20 @@ first, using only machine-readable facts:
            the object-format check (step 5a).
      - **If neither shape is present at `projectRoot` itself, check the
        ancestor chain before concluding `NOT_A_GIT_REPOSITORY` — new,
-       mandatory, Round 16 review finding #4 (an earlier draft of this
-       classifier checked only `projectRoot` itself, never accounting for
-       Git's own ordinary parent-directory repository discovery, which
-       step 2's authoritative `--is-bare-repository` invocation itself
-       already relies on).** `git rev-parse --is-bare-repository`
-       normally walks up from `cwd` to find the enclosing repository — a
-       `projectRoot` nested inside a real repository's own working tree
-       (e.g. `projectRoot = /repo/sub`, with the real repository rooted
-       at `/repo`) is genuinely, truthfully inside a Git repository, even
-       though `/repo/sub` itself has neither candidate shape. **Verified
-       directly:** a real repository at `/repo` with its own
+       mandatory, Round 16 review finding #4, corrected to additionally
+       recognize a bare ancestor shape, mandatory, Round 17 review
+       finding #1 (an earlier draft of this classifier checked only
+       `projectRoot` itself, never accounting for Git's own ordinary
+       parent-directory repository discovery, which step 2's
+       authoritative `--is-bare-repository` invocation itself already
+       relies on).** `git rev-parse --is-bare-repository` normally walks
+       up from `cwd` to find the enclosing repository — a `projectRoot`
+       nested inside a real repository (either a non-bare repository's
+       own working tree, **or** — corrected below — physically inside a
+       bare repository's own metadata directory) is genuinely,
+       truthfully inside a Git repository, even though `projectRoot`
+       itself has neither candidate shape. **Verified directly (non-bare
+       ancestor):** a real repository at `/repo` with its own
        `/repo/.git/config` deliberately malformed (the identical
        unterminated-`[section` technique already used above), and
        `projectRoot` set to a plain, non-repository subdirectory
@@ -1004,46 +1009,119 @@ first, using only machine-readable facts:
        `projectRoot` itself, neither the non-bare shape
        (`/repo/sub/.git` — absent) nor the bare shape
        (`/repo/sub/HEAD`+`objects/`+ref-storage — absent) is present, so
-       the pre-Round-16 classifier above would incorrectly conclude
-       `NOT_A_GIT_REPOSITORY` — **false**, since `projectRoot` is
-       demonstrably inside a real repository; Git was merely unable to
-       inspect it successfully. **The corrected check:** walk
-       `projectRoot`'s own ancestor chain (`path.dirname`, repeated, up
-       to and including the filesystem root — the identical directory
-       Git's own repository discovery would itself traverse), and at
-       each ancestor, apply the **identical** non-bare-shape check
-       already defined above (`<ancestor>/.git` exists, as file or
-       directory, with the same `HEAD`-entry shape discipline when it is
-       a directory) — **ancestor-chain discovery only ever looks for the
-       non-bare shape, never the bare shape**, since a bare repository is
-       never itself an ancestor directory of some other, different
-       `projectRoot` in the way a non-bare repository's root can be (a
-       bare repository has no working tree for a `projectRoot` to be
-       nested inside in the first place). **If a plausible ancestor
-       repository marker is found:** `resolveRepository` cannot
-       positively distinguish "this ancestor repository is real and
-       healthy, but `projectRoot` itself is simply not inside it
-       correctly" from "this ancestor repository is real but itself
-       malformed" from a filesystem check alone — but it does not need
-       to, because either way, Git already, authoritatively, failed
-       before establishing a toplevel, and a repository marker genuinely
-       exists in the discovery ancestry. The correct classification is
+       a classifier checking only `projectRoot` itself would incorrectly
+       conclude `NOT_A_GIT_REPOSITORY` — **false**, since `projectRoot`
+       is demonstrably inside a real repository; Git was merely unable to
+       inspect it successfully.
+
+       **A Round-16 draft of this correction additionally claimed
+       ancestor discovery should check only the non-bare shape, reasoning
+       "a bare repository is never itself an ancestor directory of some
+       other, different `projectRoot`" and "a bare repository has no
+       working tree for a `projectRoot` to be nested inside" — both
+       claims are false, corrected, mandatory, Round 17 review finding
+       #1.** A bare repository's own metadata sits directly inside its
+       own directory (`HEAD`, `objects/`, `refs/`/`reftable/` — no
+       separate `.git` subdirectory, no separate "working tree" at all),
+       and Git's own repository discovery walks up from `cwd` exactly as
+       readily through a bare repository's directory tree as through a
+       non-bare repository's working tree — a `projectRoot` that is
+       merely a plain subdirectory *physically located inside* a bare
+       repository's own directory (e.g. `<bareRoot>/sub/dir`) is
+       genuinely, authoritatively discovered by Git as being inside that
+       bare repository. **Verified directly (bare ancestor, healthy):** a
+       real bare repository at `/tmp/br3-bare/repo.git` (`git init
+       --bare`), with a plain subdirectory `/tmp/br3-bare/repo.git/sub/dir`
+       created inside it (containing no Git metadata of its own) — `git
+       rev-parse --is-bare-repository` run with
+       `cwd=/tmp/br3-bare/repo.git/sub/dir` **succeeds**, printing `true`,
+       and `git rev-parse --git-dir` from that same `cwd` resolves to
+       `/tmp/br3-bare/repo.git` itself — Git's own discovery correctly
+       walked up from the nested `cwd` and found the enclosing bare
+       repository. **Verified directly (bare ancestor, malformed):** the
+       identical fixture, with `/tmp/br3-bare/repo.git/config`
+       deliberately malformed the same way as every other malformed-
+       config fixture in this section — `git rev-parse
+       --is-bare-repository` run from the identical nested
+       `cwd=/tmp/br3-bare/repo.git/sub/dir` now fails with exit 128,
+       while `/tmp/br3-bare/repo.git` itself genuinely still has the
+       bare-repository-root shape (`HEAD`, `objects/`, and a recognized
+       ref-storage marker, all intact — only `config` is broken). **A
+       classifier that checks only the non-bare `<ancestor>/.git` shape
+       while walking the ancestor chain misses this case entirely** —
+       `/tmp/br3-bare/repo.git` has no `.git` child (it is itself the
+       bare root, not a working tree with a `.git` subdirectory), so a
+       non-bare-only ancestor walk finds nothing and would incorrectly
+       fall through to `NOT_A_GIT_REPOSITORY` — the exact false result
+       this correction exists to close, matching this document's own
+       error-table statement that `NOT_A_GIT_REPOSITORY` requires
+       `projectRoot` to be genuinely outside every repository shape
+       Git's own discovery could plausibly have found, bare or non-bare.
+
+       **The corrected check:** walk `projectRoot`'s own ancestor chain
+       (`path.dirname`, repeated — see the filesystem-boundary
+       qualification immediately below for exactly how far this walk
+       goes), and at **each** ancestor, check **both** candidate
+       repository shapes already defined above for `projectRoot` itself,
+       applied identically here:
+       - **Non-bare ancestor shape:** `<ancestor>/.git` exists (file or
+         directory), with the same `HEAD`-entry shape discipline already
+         defined when it is a directory.
+       - **Bare ancestor-root shape — new, mandatory, Round 17 review
+         finding #1:** `<ancestor>/HEAD` exists as a file, **and**
+         `<ancestor>/objects` exists as a directory, **and** `<ancestor>`
+         has ref storage in **either** of the two ref-backend shapes
+         already defined for `projectRoot`'s own bare-shape check above
+         (`<ancestor>/refs` as a directory, **or**
+         `<ancestor>/reftable/tables.list`) — the **identical** three-part
+         shape discipline already required for `projectRoot` itself,
+         applied at each ancestor; `HEAD` alone is never sufficient
+         proof, exactly as it is never sufficient for `projectRoot`'s own
+         check.
+
+       Both shapes are checked at **every** ancestor level, in the same
+       walk — this is not two separate passes; the bare check is an
+       additional shape considered at each step already being visited for
+       the non-bare check. **If a plausible ancestor repository marker of
+       either shape is found:** `resolveRepository` cannot positively
+       distinguish "this ancestor repository is real and healthy, but
+       `projectRoot` itself is simply not inside it correctly" from "this
+       ancestor repository is real but itself malformed" from a
+       filesystem check alone — but it does not need to, because either
+       way, Git already, authoritatively, failed before establishing a
+       toplevel, and a repository marker genuinely exists in the
+       discovery ancestry. The correct classification is
        `GIT_COMMAND_FAILED` (**not** `NOT_A_GIT_REPOSITORY`, and,
        critically, **not** `PROJECT_ROOT_MISMATCH` either) — `details`
-       naming the ancestor path where the marker was found, for caller
-       diagnosis. **Why not `PROJECT_ROOT_MISMATCH`:** that code is
-       reserved exclusively for the healthy path — Git successfully,
-       authoritatively resolves a real `--show-toplevel`, and that
-       resolved toplevel differs from `projectRoot` (§8, below) — a case
-       that requires Git to have actually, successfully told BR3 what the
-       real toplevel is. Here, Git failed *before* `--show-toplevel`
-       could ever run, let alone succeed — BR3 knows a real repository
-       marker exists somewhere in the discovery ancestry, but cannot
-       truthfully claim to know the exact repository root Git would have
-       authoritatively accepted had the repository been healthy, so it
-       must not claim `PROJECT_ROOT_MISMATCH`'s more specific meaning.
-       **If no ancestor marker is found anywhere up to the filesystem
-       root:** this is a genuine plain non-Git directory, not nested
+       naming the ancestor path where the marker was found and which
+       shape (bare or non-bare) it matched, for caller diagnosis. **Why
+       not `PROJECT_ROOT_MISMATCH`:** that code is reserved exclusively
+       for the healthy path — Git successfully, authoritatively resolves
+       a real `--show-toplevel`, and that resolved toplevel differs from
+       `projectRoot` (§8, below) — a case that requires Git to have
+       actually, successfully told BR3 what the real toplevel is. Here,
+       Git failed *before* `--show-toplevel` could ever run, let alone
+       succeed — BR3 knows a real repository marker exists somewhere in
+       the discovery ancestry, but cannot truthfully claim to know the
+       exact repository root Git would have authoritatively accepted had
+       the repository been healthy, so it must not claim
+       `PROJECT_ROOT_MISMATCH`'s more specific meaning.
+
+       **Healthy nested-bare case is unaffected — this correction touches
+       only the post-Git-failure fallback, never the authoritative path.**
+       When `projectRoot` is physically nested inside a **healthy** bare
+       repository, step 2's own authoritative `git rev-parse
+       --is-bare-repository` call itself **succeeds**, printing `true` —
+       exactly as the verified healthy-bare-ancestor reproduction above
+       shows — and BR3's existing, unchanged behavior applies:
+       `BARE_REPOSITORY_UNSUPPORTED` (§8's "Bare repositories" decision,
+       below). The secondary filesystem classifier described in this
+       whole bullet is never reached in that case at all — it exists
+       exclusively to classify an *already-failed* `--is-bare-repository`
+       call, and a healthy nested-bare `projectRoot` never produces one.
+
+       **If no ancestor marker of either shape is found anywhere the walk
+       covers:** this is a genuine plain non-Git directory, not nested
        inside anything Git would itself have discovered →
        `NOT_A_GIT_REPOSITORY`, exactly as below. **The same reasoning
        applies to an ancestor repository Git cannot inspect for another
@@ -1051,21 +1129,53 @@ first, using only machine-readable facts:
        where practical** — the ancestor-marker check is purely
        filesystem-shape-based and does not depend on knowing *why* Git's
        own discovery ultimately failed, only that a real repository
-       marker exists somewhere between `projectRoot` and the filesystem
-       root. This ancestor-chain check runs **only** as this
-       already-existing fallback's own extension — it does not run before
-       step 2's authoritative Git invocation, does not change when this
-       fallback itself runs (only after step 2 has already, authoritatively,
-       failed), and does not reintroduce any early, non-authoritative
-       precheck of any kind (the Round 2 correction removing the original
-       `<projectRoot>/.git`-existence precheck is fully preserved — this
-       check exists exclusively inside the post-failure secondary
-       classifier, never before it).
+       marker exists somewhere in `projectRoot`'s ancestry.
+
+       **Filesystem-boundary scope of this walk — narrowed, mandatory,
+       Round 17 review finding #1 (an earlier draft overclaimed this walk
+       covers "the identical directory Git's own repository discovery
+       would itself traverse," up to the filesystem root — this overstates
+       equivalence to Git's own, config-sensitive traversal behavior).**
+       Git's own repository discovery is itself influenced by
+       environment/config state BR3 deliberately does not forward — in
+       particular, `GIT_DISCOVERY_ACROSS_FILESYSTEM` (a caller-supplied
+       value for this variable is unconditionally stripped by §19's
+       `GIT_*`-prefix strip, and it is not one of BR3's own eight
+       re-added controlled variables), and Git's own default behavior of
+       stopping ancestor discovery at a filesystem/mount-point boundary
+       unless that variable is set. **BR3 does not claim exact,
+       traversal-step-for-traversal-step equivalence with Git's own
+       discovery behavior under every possible environment.** BR3's own
+       ancestor-chain fallback walk instead follows a simpler, explicitly
+       stated rule: it walks `path.dirname`, repeated, until either a
+       marker is found, or the walk reaches the filesystem root, or the
+       walk crosses a filesystem/mount-point boundary (detected via
+       `fs.statSync().dev` changing between one directory and its
+       parent — the same boundary-detection primitive Git's own default,
+       non-`GIT_DISCOVERY_ACROSS_FILESYSTEM` behavior relies on), **stopping
+       at the first mount-point boundary it encounters, matching Git's
+       own default (cross-filesystem-discovery-disabled) behavior** —
+       since BR3's sanitized environment (§19) never forwards a
+       caller-supplied `GIT_DISCOVERY_ACROSS_FILESYSTEM=1`, BR3's own Git
+       invocations always run under this identical, default,
+       boundary-respecting discovery behavior, and this fallback walk is
+       written to match that specific, known, sanitized-environment
+       behavior — not to claim general equivalence with every possible
+       unsanitized Git discovery configuration a caller's own direct Git
+       invocations elsewhere might exhibit. This ancestor-chain check
+       runs **only** as this already-existing fallback's own extension —
+       it does not run before step 2's authoritative Git invocation, does
+       not change when this fallback itself runs (only after step 2 has
+       already, authoritatively, failed), and does not reintroduce any
+       early, non-authoritative precheck of any kind (the Round 2
+       correction removing the original `<projectRoot>/.git`-existence
+       precheck is fully preserved — this check exists exclusively inside
+       the post-failure secondary classifier, never before it).
      - If **neither** the non-bare shape **nor** the bare shape is
        present at `projectRoot` itself, **and** no plausible ancestor
-       repository marker is found in the chain above: this is a genuine
-       plain non-Git directory → `NOT_A_GIT_REPOSITORY` (unchanged from
-       before).
+       repository marker of either shape is found in the chain above:
+       this is a genuine plain non-Git directory → `NOT_A_GIT_REPOSITORY`
+       (unchanged from before).
      - If **either** shape is present (non-bare `<projectRoot>/.git`, or
        bare `projectRoot/HEAD`+`objects/`+(`refs/` or
        `reftable/tables.list`)) but the authoritative
@@ -4024,8 +4134,8 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 | `GIT_EXECUTABLE_UNAVAILABLE` | Either (a) the `git` binary could not be spawned (`ENOENT` or equivalent from the underlying `child_process` call), or (b) — corrected, Round 11 review finding #2, candidate validity made exact Round 12 review finding #2 — BR3's own in-process executable-resolution mechanism (§8) found no valid `git` candidate at all before ever attempting to spawn one: on POSIX, no candidate anywhere in the effective search path (`PATH`'s value when present; `/usr/bin:/bin` when `PATH` is absent — Round 11 review finding #1) that is simultaneously (i) present, (ii) a regular file after symlink resolution — never a directory, FIFO, socket, device node, or broken symlink, and (iii) executable; on Windows, no candidate anywhere in the sanitized `PATH` that is simultaneously (i) literally named `git.exe` (never `.cmd`/`.bat`/`.com`/any other name) and (ii) a non-directory, regular-file executable target after resolution — never a directory or broken link — with an invalid candidate at one `PATH` entry never terminating the search while a later, valid candidate exists further down `PATH` — this is the single, exact typed outcome for "no usable Git executable," never an alternative, implementation-chosen code | Expected — a real, anticipated environment condition (Git not installed / not resolvable under the applicable search path); always a typed `GitResult` failure, never an uncaught exception |
 | `GIT_VERSION_UNSUPPORTED` | **New — Round 6 review finding #3.** The installed `git` binary spawns successfully but reports a version below BR3's supported floor (2.45.0), or `git --version`'s output does not match the expected `git version X.Y.Z` prefix shape at all (§8's "Git Capability Floor" subsection) — checked before any other `resolveRepository` step | Expected — distinct from `GIT_EXECUTABLE_UNAVAILABLE` (binary not found at all vs. found and run, but too old/unrecognized); `details` names the actual reported version string |
 | `PROJECT_ROOT_NOT_FOUND` | `projectRoot` does not exist or is not a directory | Expected |
-| `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4, further revised — corrects Round 5 review finding #4 and Round 6 review findings #5 and #7, further revised — corrects Round 16 review finding #4 (ancestor-chain discovery).** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms **neither** candidate repository shape is present at `projectRoot` itself — `<projectRoot>/.git` does not exist (non-bare shape) **and** `projectRoot` itself lacks the `HEAD`+`objects/`+(`refs/` or `reftable/tables.list`) bare-repository-root shape (bare shape, either ref backend) — **and** no plausible non-bare repository marker is found anywhere in `projectRoot`'s own ancestor chain up to the filesystem root (§8, Round 16 review finding #4) — i.e. `projectRoot` is genuinely not inside any Git repository, bare or non-bare, under either ref backend, and is not nested inside one either. A `--is-bare-repository` failure where **either** shape **is** present (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8. **`--show-toplevel` (§8 step 3) failing after step 2 already succeeded with `false` is no longer classified here at all — corrected, Round 6 review finding #7:** step 2 having already, positively, successfully established that Git recognizes `projectRoot` as a non-bare repository makes "no repository exists here" truthfully unreachable at that point; an unexpected step-3 failure is instead classified as `GIT_COMMAND_FAILED` (see that row) | Expected |
-| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) — reserved exclusively for the healthy path, where Git successfully, authoritatively resolves a real `--show-toplevel` that differs from `projectRoot`; **never** used for the case where step 2's own `--is-bare-repository` call fails before any toplevel is established, even when a plausible ancestor repository marker exists — that case is `GIT_COMMAND_FAILED` instead (§8, Round 16 review finding #4) | Expected — `details` names the actual resolved toplevel |
+| `NOT_A_GIT_REPOSITORY` | **Revised — corrects Round 4 review finding #4, further revised — corrects Round 5 review finding #4 and Round 6 review findings #5 and #7, further revised — corrects Round 16 review finding #4 (ancestor-chain discovery), further revised — corrects Round 17 review finding #1 (ancestor-chain discovery must recognize a bare ancestor shape too, not only non-bare).** `git rev-parse --is-bare-repository` (§8 step 2) fails **and** the filesystem-based secondary check (§8) confirms **neither** candidate repository shape is present at `projectRoot` itself — `<projectRoot>/.git` does not exist (non-bare shape) **and** `projectRoot` itself lacks the `HEAD`+`objects/`+(`refs/` or `reftable/tables.list`) bare-repository-root shape (bare shape, either ref backend) — **and** no plausible repository marker of **either** shape (non-bare `<ancestor>/.git`, or bare `<ancestor>/HEAD`+`objects/`+ref-storage) is found anywhere in `projectRoot`'s own ancestor chain, within the filesystem-boundary scope §8 defines for that walk (§8, Round 16 review finding #4, Round 17 review finding #1) — i.e. `projectRoot` is genuinely not inside any Git repository, bare or non-bare, under either ref backend, and is not nested inside one either. A `--is-bare-repository` failure where **either** shape **is** present (malformed config, permission failure, dubious ownership) is `GIT_COMMAND_FAILED` instead — see that row and §8. **`--show-toplevel` (§8 step 3) failing after step 2 already succeeded with `false` is no longer classified here at all — corrected, Round 6 review finding #7:** step 2 having already, positively, successfully established that Git recognizes `projectRoot` as a non-bare repository makes "no repository exists here" truthfully unreachable at that point; an unexpected step-3 failure is instead classified as `GIT_COMMAND_FAILED` (see that row) | Expected |
+| `PROJECT_ROOT_MISMATCH` | `projectRoot` is inside a real Git repository, but is not that repository's root (§8 step 3) — reserved exclusively for the healthy path, where Git successfully, authoritatively resolves a real `--show-toplevel` that differs from `projectRoot`; **never** used for the case where step 2's own `--is-bare-repository` call fails before any toplevel is established, even when a plausible ancestor repository marker (bare or non-bare) exists — that case is `GIT_COMMAND_FAILED` instead (§8, Round 16 review finding #4, Round 17 review finding #1) | Expected — `details` names the actual resolved toplevel |
 | `BARE_REPOSITORY_UNSUPPORTED` | `git rev-parse --is-bare-repository` reports `true` for `projectRoot` (§8 step 2) | Expected |
 | `UNSUPPORTED_OBJECT_FORMAT` | **New — Round 6 review finding #4.** `git rev-parse --show-object-format` (§8 step 5a) reports anything other than `sha1` for `projectRoot` (e.g. `sha256`, for a repository created via `git init --object-format=sha256`) | Expected — BR3 v0.1 supports SHA-1 repositories only, a deliberate scope decision (§8); `details` names the actual reported object format; `resolveRepository` fails before any SHA-producing BR3 function can be reached for that repository |
 | `UNSUPPORTED_REF_FORMAT` | **New — Round 7 review finding #1, made fail-closed Round 8 review finding #5.** `git config --get extensions.refStorage` (§8 step 5b) successfully reports any value other than `files` for `projectRoot` (a healthy repository using a ref-storage backend BR3 does not support) — this includes `reftable` **and any other, including future/unrecognized, backend value** the key might report; BR3 v0.1's contract is an allowlist of exactly one supported value (`files`, or the key's ordinary absence), not a denylist of `reftable` specifically | Expected — BR3 v0.1 supports the traditional `files` ref-storage backend only, a deliberate scope decision (§8); `details` contains the actual reported value verbatim; `resolveRepository` fails before any later step is reached for that repository. Distinct from a **malformed** repository (either ref backend), which is `GIT_COMMAND_FAILED` via the post-Git-failure secondary classifier (§8) — this code is reserved for a positively-recognized, *healthy* repository reporting an unsupported format; also distinct from the `extensions.refStorage` query itself failing for a reason other than ordinary key-absence, which is likewise `GIT_COMMAND_FAILED`, never inferred as `files`-backend support (§8) |
@@ -4033,7 +4143,7 @@ reported via `ProtectedPathMatchResult.invalidInputs`/`.invalidPatterns`
 | `UNSAFE_SUBMODULE_PATH` | **New — Round 7 review finding #5, extended to cover repository-metadata identity and the parent→child relationship, Round 8 review finding #3, tightened to exclude linked-worktree metadata and the `.git`-entry-itself symlink case, Round 9 review finding #4; explicitly never triggered merely by an unmerged gitlink's multiple index-stage records for one legitimate path, Round 16 review finding #3A.** A gitlink working-tree path (mode `160000` in `git ls-files --stage -z`, §18) discovered during initialized-submodule enumeration is itself a symbolic link (detected via `lstat`, never a symlink-following `stat`); **or** its own `.git` *entry* (one level inside an already-accepted, non-symlinked working-tree directory) is itself a symbolic link; **or** its canonical working-tree root **or** its canonical `(gitDir, gitCommonDir)` metadata identity has already been visited earlier in the same recursive enumeration (a cycle/alias, reachable even when the working-tree roots are themselves canonically distinct — §18 step 4a); **or** its resolved `.git` pointer names a location outside the three explicitly-recognized legitimate parent→child submodule shapes (§18 step 4a) — in particular, a pointer resolving to the parent's own `--git-dir`/`--git-common-dir`, to a location outside the parent's own `--git-common-dir` tree entirely, or to a location beneath the parent's `--git-common-dir` that is nonetheless a linked-worktree metadata directory rather than genuine, self-contained submodule metadata (`gitDir !== gitCommonDir` for the child) | Expected — a real, anticipated adversarial-or-corrupted-repository condition; BR3 fails safely rather than recursing into a symlink-redirected, cyclic, aliased, externally-pointed, or linked-worktree-redirected submodule path, and never recursively inspects the aliased/external/worktree repository before the refusal is produced; `details` names the offending gitlink path |
 | `HEAD_UNAVAILABLE` | **Complete, final trigger condition (revised — corrects Round 4 review finding #5, which extended this beyond Round 1's `symbolic-ref`-exit-code-only definition): EITHER (a)** `git symbolic-ref -q HEAD` (§9) exits with a code other than 0 (normal/unborn/corrupt-but-symbolic) or 1 (detached) — verified as exit 128 for genuine `.git/HEAD` corruption — **OR (b)** `git symbolic-ref -q HEAD` succeeds (exit 0) but `git rev-parse --verify -q HEAD^{commit}` fails AND the resolved branch ref name itself (`git rev-parse --verify -q <resolved-ref-name>`, no `^{commit}`) exits 0 — i.e. HEAD is genuinely symbolic and points at a branch ref that exists, but that ref's stored value does not name a real commit object (§9's "corrupt HEAD" case; distinguished from the unborn case, where the same ref-name check exits 1) — **OR (c)** HEAD is direct/detached (`symbolic-ref -q HEAD` exits 1) but `git rev-parse --verify -q HEAD^{commit}` also fails (a detached HEAD pointing at a non-existent object). These three conditions are the exact, complete trigger set §9 defines; there is no fourth, undocumented path to this code | Exceptional — this indicates repository corruption BR3 cannot meaningfully recover from; still returned as a typed `GitResult` failure (never a raw uncaught exception reaching a caller), but callers should treat it as unusual, not routine |
 | `REF_NOT_FOUND` | Either `DiffRequest.fromRef` or `.toRef` failed to resolve via `rev-parse --verify --end-of-options <ref>^{commit}` (§13) | Expected — a caller can legitimately pass a ref that doesn't exist (e.g. a stale/mistyped SHA) |
-| `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) — this includes, per §8's Round 16 review finding #4 correction, `resolveRepository`'s step-2 `--is-bare-repository` failure where a plausible non-bare repository marker is found either at `projectRoot` itself or anywhere in its ancestor chain, meaning a real repository genuinely exists but Git could not authoritatively establish a toplevel for it | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis (or, for the ancestor-marker case, the ancestor path where the marker was found) |
+| `GIT_COMMAND_FAILED` | A Git subprocess exited non-zero for a reason not covered by a more specific code above (i.e., the catch-all for a genuine, unanticipated Git failure) — this includes, per §8's Round 16/17 review finding corrections, `resolveRepository`'s step-2 `--is-bare-repository` failure where a plausible repository marker of **either** the non-bare or the bare shape is found either at `projectRoot` itself or anywhere in its ancestor chain (bare-ancestor recognition added, Round 17 review finding #1), meaning a real repository genuinely exists but Git could not authoritatively establish a toplevel for it | Expected as a *result shape* (always returned via `GitResult`, never thrown), but the underlying cause is inherently open-ended — `details` carries the captured stderr for diagnosis (or, for the ancestor-marker case, the ancestor path where the marker was found and which shape it matched) |
 | `MALFORMED_GIT_OUTPUT` | Git's own output did not match the expected machine-readable format this specification defines (e.g. an unrecognized porcelain v2 record type, an unparseable `--name-status` line, a path that is not valid UTF-8, or — corrected, Round 10 review finding #1 — any Category 2 repository-controlled textual value (a ref/branch name, `config --get`/`--get-all` value, `--show-toplevel`/`--git-dir`/`--git-common-dir` output) that is not valid UTF-8 — §13) | Exceptional — this should be unreachable against a conforming Git version and well-formed repository content; exists so a genuinely unexpected format change, a non-UTF-8 path, or a non-UTF-8 ref/branch/config-derived textual value (§13) fails loudly and specifically rather than silently misparsing or substituting U+FFFD |
 
 **`matchProtectedPaths`'s own error-shaped handling (§7a is the single
@@ -5857,40 +5967,89 @@ current validation algorithm)**
   malformed-non-bare-config fixture above run side-by-side with the
   ordinary-non-Git-directory fixture in the same test to prove the
   secondary check correctly discriminates all three
-- **Ancestor-chain repository discovery, four fixtures run side-by-side
-  in the same test to prove correct four-way discrimination — mandatory,
-  new, Round 16 review finding #4:**
-  - **(A) Existing healthy nested directory** — a real, healthy
-    repository at `/repo` with a plain, non-repository subdirectory
-    `/repo/sub` used as `projectRoot` → `PROJECT_ROOT_MISMATCH`, `details`
-    naming `/repo` as the actual resolved toplevel (the unchanged, healthy
-    path — Git's `--is-bare-repository`/`--show-toplevel` both succeed).
-  - **(B) Existing plain non-Git directory** — an entirely standalone
-    directory with **no** repository anywhere in its own ancestor chain
-    up to the filesystem root used as `projectRoot` →
-    `NOT_A_GIT_REPOSITORY` (the ancestor-chain check runs and correctly
-    finds no marker anywhere).
-  - **(C) Existing malformed repository ROOT** — the malformed-bare and
-    malformed-non-bare fixtures already above, `projectRoot` set directly
-    to the malformed repository's own root → `GIT_COMMAND_FAILED`
-    (unchanged from the existing fixtures above; re-asserted here
-    explicitly alongside (D) to prove the new ancestor-chain logic does
-    not alter this already-correct case).
-  - **(D) NEW — malformed repository PARENT, nested `projectRoot` — the
-    specific regression case this round's finding targets:** a real
-    repository at `/repo` with its own `/repo/.git/config` deliberately
-    malformed (the identical unterminated-`[section` technique used
-    throughout this section), and `projectRoot` set to a plain,
-    non-repository subdirectory `/repo/sub` (no `/repo/sub/.git` of any
-    kind) → first confirm, in the test's own setup, that `git
-    rev-parse --is-bare-repository` run with `cwd=/repo/sub` genuinely
-    fails with exit 128 (Git's own discovery walks up to `/repo` and
-    fails there); then call `resolveRepository("/repo/sub")` and assert
-    `GIT_COMMAND_FAILED` — **never** `NOT_A_GIT_REPOSITORY` (the
-    pre-Round-16 classifier's incorrect result) and **never**
-    `PROJECT_ROOT_MISMATCH` (which would falsely claim Git successfully
-    established a real toplevel) — `details` naming `/repo` as the
-    ancestor path where the non-bare repository marker was found.
+- **Ancestor-chain repository discovery, eight fixtures run side-by-side
+  in the same test to prove correct discrimination across every
+  bare/non-bare, healthy/malformed, root/nested combination — mandatory,
+  new, Round 16 review finding #4, extended with bare-ancestor coverage,
+  mandatory, Round 17 review finding #1:**
+  - **(1) Existing healthy nested (non-bare) directory** — a real,
+    healthy repository at `/repo` with a plain, non-repository
+    subdirectory `/repo/sub` used as `projectRoot` →
+    `PROJECT_ROOT_MISMATCH`, `details` naming `/repo` as the actual
+    resolved toplevel (the unchanged, healthy path — Git's
+    `--is-bare-repository`/`--show-toplevel` both succeed).
+  - **(2) Existing healthy bare repository root** — a real, healthy bare
+    repository at `/tmp/br3-bare/repo.git` used directly as `projectRoot`
+    → `BARE_REPOSITORY_UNSUPPORTED` (unchanged, existing behavior — step
+    2's own authoritative call succeeds with `true`).
+  - **(3) NEW — `projectRoot` physically nested beneath a healthy bare
+    repository's own metadata directory — mandatory, Round 17 review
+    finding #1** — the identical healthy bare repository from (2), with
+    `projectRoot` set to a plain subdirectory created inside it
+    (`/tmp/br3-bare/repo.git/sub/dir`, containing no Git metadata of its
+    own) → first confirm, in the test's own setup, that `git rev-parse
+    --is-bare-repository` run with `cwd=/tmp/br3-bare/repo.git/sub/dir`
+    genuinely succeeds, printing `true` (Git's own discovery correctly
+    walks up and finds the enclosing bare repository even though
+    `projectRoot` itself has no repository shape of its own); then call
+    `resolveRepository("/tmp/br3-bare/repo.git/sub/dir")` and assert
+    `BARE_REPOSITORY_UNSUPPORTED` — proving the authoritative, healthy
+    path is completely unaffected by this round's fallback-only
+    correction, and the secondary filesystem classifier is never reached
+    for this case at all.
+  - **(4) Existing malformed repository ROOT (non-bare)** — the
+    malformed-non-bare-config fixture already above, `projectRoot` set
+    directly to the malformed repository's own root → `GIT_COMMAND_FAILED`
+    (unchanged from the existing fixture above; re-asserted here
+    explicitly to prove the new ancestor-chain logic does not alter this
+    already-correct case).
+  - **(5) Existing malformed bare repository ROOT** — the malformed-bare
+    fixture already above, `projectRoot` set directly to the malformed
+    bare repository's own root → `GIT_COMMAND_FAILED` (unchanged; also
+    re-asserted here alongside (6) below to prove the new ancestor-chain
+    logic does not alter this already-correct root-level case).
+  - **(6) Existing malformed repository PARENT (non-bare), nested
+    `projectRoot`** — a real repository at `/repo` with its own
+    `/repo/.git/config` deliberately malformed (the identical
+    unterminated-`[section` technique used throughout this section), and
+    `projectRoot` set to a plain, non-repository subdirectory `/repo/sub`
+    (no `/repo/sub/.git` of any kind) → first confirm, in the test's own
+    setup, that `git rev-parse --is-bare-repository` run with
+    `cwd=/repo/sub` genuinely fails with exit 128 (Git's own discovery
+    walks up to `/repo` and fails there); then call
+    `resolveRepository("/repo/sub")` and assert `GIT_COMMAND_FAILED` —
+    **never** `NOT_A_GIT_REPOSITORY` (the pre-Round-16 classifier's
+    incorrect result) and **never** `PROJECT_ROOT_MISMATCH` (which would
+    falsely claim Git successfully established a real toplevel) —
+    `details` naming `/repo` as the ancestor path where the non-bare
+    repository marker was found.
+  - **(7) NEW — malformed bare repository PARENT, nested `projectRoot` —
+    the specific regression case this round's finding targets, mandatory,
+    Round 17 review finding #1:** the healthy bare repository from (2)/(3),
+    with `/tmp/br3-bare/repo.git/config` deliberately malformed the same
+    way as every other malformed-config fixture in this section (`HEAD`,
+    `objects/`, and ref storage all left genuinely intact — only `config`
+    is broken), and `projectRoot` set to the identical nested subdirectory
+    used in (3) (`/tmp/br3-bare/repo.git/sub/dir`) → first confirm, in the
+    test's own setup, that `git rev-parse --is-bare-repository` run with
+    `cwd=/tmp/br3-bare/repo.git/sub/dir` genuinely fails with exit 128
+    (Git's own discovery walks up to the bare repository's own directory
+    and fails reading its malformed `config`); then call
+    `resolveRepository("/tmp/br3-bare/repo.git/sub/dir")` and assert
+    `GIT_COMMAND_FAILED` — **never** `NOT_A_GIT_REPOSITORY` (the false
+    result a non-bare-only ancestor walk would produce, since the bare
+    ancestor root has no `.git` child of its own to find) — `details`
+    naming `/tmp/br3-bare/repo.git` as the ancestor path where the
+    **bare** repository marker was found, proving the ancestor walk
+    genuinely checks the bare shape at each level, not only the non-bare
+    shape.
+  - **(8) Existing plain non-Git directory, no marker of either shape
+    anywhere in its ancestry** — an entirely standalone directory with
+    **no** repository (bare or non-bare) anywhere in its own ancestor
+    chain, within the filesystem-boundary scope §8 defines, used as
+    `projectRoot` → `NOT_A_GIT_REPOSITORY` (the ancestor-chain check runs,
+    checks both shapes at every level, and correctly finds no marker of
+    either kind anywhere).
 - **Unsafe/dubious-ownership repository — not added as a fixture in this
   round (Round 4 review finding #4):** this scenario requires genuinely
   differing file ownership between the repository directory and the
@@ -7559,34 +7718,74 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   call correctly producing `UNSUPPORTED_OBJECT_FORMAT`/
   `UNSUPPORTED_REF_FORMAT` rather than reusing the first call's
   "supported" verdict.
-- **B.** `inspectHead` correctly reports all three branch/HEAD states
-  (normal, detached, unborn) and all upstream states — not configured,
-  configured and resolving (both the remote-tracking and the
-  local-branch subcase), and configured but unresolvable (`ref: null`,
-  `sha: null`, `remote`/`branch` still populated — never a
-  fallback-constructed `refs/remotes/<remote>/<branch>` guess, for any of
-  the three configured-but-unresolvable shapes: ordinary remote-tracking,
-  custom-refspec, or local-branch upstream) — and correctly treats
-  "no remotes configured" as merely one way `branch.<b>.remote`/`.merge`
-  can be absent, never as an overriding rule that a local-branch
-  (`remote="."`) upstream with zero remotes configured is somehow not a
-  real upstream — with every classification derived from exit codes
-  and/or machine-readable output only — never from inspecting
-  human-readable stderr text (§9, §10). `branch.<branch>.merge` is
-  genuinely read via `--get-all`, never a bare `--get` — corrected,
-  Round 9 review finding #2 — so a legal, multi-valued `.merge`
-  configuration (octopus-merge-style) yields a single, internally
-  consistent `UpstreamInfo` where `branch` is derived from the same
-  first configured value `ref`/`sha` (via `@{upstream}`) already
-  resolve, never a mismatched combination of the first and last
-  configured values.
-- **C.** "Upstream SHA" is precisely and only whatever `@{upstream}`
-  itself already resolves to locally — the local remote-tracking ref's
-  already-recorded SHA for the ordinary/custom-refspec subcase, or the
-  other local branch's own tip for the local-branch-upstream subcase; no
-  BR3 code path ever invokes `git fetch` or otherwise contacts a network
-  endpoint, proven by running the full BR3 suite with network access
-  disabled (§9, §10, §20).
+- **B.** — rewritten to the final, namespace-general `UpstreamInfo`
+  model, mandatory, Round 17 review finding #2 (an earlier draft of this
+  criterion described only two configured-upstream subcases —
+  remote-tracking and local-branch — omitted the mandatory `mergeRef`
+  field entirely, and falsely implied `remote`/`branch` are always both
+  populated together for every configured upstream; none of that matches
+  the final §7a/§9/§10 contract, which supports arbitrary `mergeRef`
+  namespaces with `branch` independently nullable). `inspectHead`
+  correctly reports all three branch/HEAD states (normal, detached,
+  unborn) and every upstream state the final `UpstreamInfo` model (§7a)
+  defines:
+  - **No upstream configured:** `upstream: null`.
+  - **Configured and resolvable:** a non-null `UpstreamInfo` with
+    `remote`, `mergeRef` (the exact, complete, first configured
+    `branch.<b>.merge` value, verbatim, any namespace), `branch` (`string
+    | null` — populated **only** when `mergeRef` genuinely begins with
+    `refs/heads/`, `null` for any other namespace), `ref` (the symbolic
+    full name `@{upstream}` resolves to), and `sha` (the raw object ID
+    `@{upstream}` resolves to, per §10's exact-meaning correction) all
+    correctly populated.
+  - **Configured but unresolvable:** a non-null `UpstreamInfo` with
+    `remote`/`mergeRef`/`branch` still correctly populated (config-key
+    presence and `mergeRef`-namespace-derived `branch`, independent of
+    resolvability) and `ref: null`/`sha: null` — never a
+    fallback-constructed `refs/remotes/<remote>/<branch>` guess for any
+    configured-but-unresolvable shape (ordinary remote-tracking,
+    custom-refspec, or local-branch upstream) — and never assumed merely
+    from the current branch being unborn (§9's Round 14 correction: an
+    unborn current branch's configured upstream is still genuinely
+    attempted, `ref`/`sha` null only on an actual resolution failure).
+  - **Explicitly covering every supported `mergeRef` target shape:**
+    ordinary remote-tracking upstream, local-branch upstream
+    (`remote="."`), local annotated-tag upstream, local lightweight-tag
+    upstream, arbitrary local custom-namespace-ref upstream, and a custom
+    remote fetch-refspec target — each correctly reported with `branch`
+    populated only for the `refs/heads/*`-namespace cases and `null` for
+    every other namespace.
+  - **Detached HEAD:** `upstream: null` unconditionally.
+  - **The governing invariant — never overstated as "remote/branch remain
+    populated":** `remote` and `mergeRef` remain populated for every
+    configured upstream, resolvable or not; `branch` is **derived**, and
+    is nullable **solely** according to whether `mergeRef` is actually
+    under `refs/heads/` — it is not a field that "remains populated"
+    alongside `remote` as a pair.
+  - **"No remotes configured" is correctly treated as merely one way
+    `branch.<b>.remote`/`.merge` can be absent**, never as an overriding
+    rule that a local-branch (`remote="."`) upstream with zero remotes
+    configured is somehow not a real upstream — with every classification
+    derived from exit codes and/or machine-readable output only — never
+    from inspecting human-readable stderr text (§9, §10).
+  - **`branch.<branch>.merge` is genuinely read via `-z --get-all`, never
+    a bare `--get`** — corrected, Round 9 review finding #2, made
+    NUL-safe, Round 13 review finding #2 — so a legal, multi-valued
+    `.merge` configuration (octopus-merge-style) yields a single,
+    internally consistent `UpstreamInfo` where `mergeRef`/`branch` are
+    both derived from the same first configured value `ref`/`sha` (via
+    `@{upstream}`) already resolve, never a mismatched combination of the
+    first and last configured values.
+- **C.** "Upstream SHA" (`UpstreamInfo.sha`) is precisely and only the
+  raw object ID `@{upstream}` itself already resolves to locally, for
+  **any** supported `mergeRef` namespace — the local remote-tracking
+  ref's already-recorded object ID for the ordinary/custom-refspec
+  subcase, the other local branch's own tip for the local-branch-upstream
+  subcase, or the raw, unpeeled object ID for a local tag/custom-ref
+  upstream target (§10's exact-meaning correction — never a `^{commit}`
+  peel); no BR3 code path ever invokes `git fetch` or otherwise contacts
+  a network endpoint, proven by running the full BR3 suite with network
+  access disabled (§9, §10, §20).
 - **D.** `inspectWorkingTree` returns a structured, per-path
   `WorkingTreeEntry[]` — never a single boolean — correctly
   distinguishing staged/unstaged/both-on-the-same-path/added(including
@@ -8200,17 +8399,21 @@ plan. Mirrors BR2 specification §26's own lettered-checklist convention.
   `WorkingTreeEntry` one source record produces, proven by dedicated
   type-2-rename and unmerged-conflict fixtures in addition to the
   existing type-1 fixture (§11, §18, §20).
-- **AS.** — new, Round 16 review finding #4. `resolveRepository`'s
-  post-Git-failure secondary classifier checks `projectRoot`'s own
-  ancestor chain, not only `projectRoot` itself, for a plausible non-bare
-  repository marker before concluding `NOT_A_GIT_REPOSITORY` — a
-  `projectRoot` nested inside a real repository whose own config is too
+- **AS.** — new, Round 16 review finding #4, extended, Round 17 review
+  finding #1. `resolveRepository`'s post-Git-failure secondary classifier
+  checks `projectRoot`'s own ancestor chain, not only `projectRoot`
+  itself, for a plausible repository marker of **either** the non-bare
+  (`<ancestor>/.git`) or the bare (`<ancestor>/HEAD`+`objects/`+ref-storage)
+  shape before concluding `NOT_A_GIT_REPOSITORY` — a `projectRoot` nested
+  inside a real repository (bare or non-bare) whose own config is too
   malformed for Git to establish a toplevel correctly reports
   `GIT_COMMAND_FAILED`, never `NOT_A_GIT_REPOSITORY` and never
-  `PROJECT_ROOT_MISMATCH` (reserved exclusively for the healthy path),
-  proven by a dedicated four-fixture regression (healthy nested
-  directory, plain non-Git directory, malformed repository root,
-  malformed repository parent with a nested `projectRoot`) (§8, §17, §20).
+  `PROJECT_ROOT_MISMATCH` (reserved exclusively for the healthy path). A
+  `projectRoot` physically nested inside a **healthy** bare repository is
+  unaffected — step 2's own authoritative call succeeds with `true` and
+  the secondary classifier is never reached. Proven by a dedicated
+  eight-fixture regression covering every bare/non-bare,
+  healthy/malformed, root/nested combination (§8, §17, §20).
 
 ## 20b. Implementation Plan
 
@@ -9430,20 +9633,38 @@ The independent reviewer must specifically examine, for BR3:
   dedicated type-2-dirty-rename and unmerged-conflicted-submodule
   fixtures in addition to the existing type-1 fixture (§11, §18, §20)
 - **Ancestor-chain repository discovery in the post-Git-failure secondary
-  classifier — new, mandatory, Round 16 review finding #4:** whether
-  `resolveRepository` correctly reports `GIT_COMMAND_FAILED` — never
-  `NOT_A_GIT_REPOSITORY`, never `PROJECT_ROOT_MISMATCH` — for a
-  `projectRoot` nested inside a real repository whose own, ancestor-level
-  config is too malformed for Git's `--is-bare-repository` to
-  authoritatively establish a toplevel, proven by the dedicated
-  four-fixture regression (§20: healthy nested directory →
-  `PROJECT_ROOT_MISMATCH`; plain non-Git directory → `NOT_A_GIT_REPOSITORY`;
-  malformed repository root → `GIT_COMMAND_FAILED`; malformed repository
-  parent with nested `projectRoot` → `GIT_COMMAND_FAILED`, never the
-  other two codes) — and whether §8's own prose makes clear this
-  ancestor-chain check runs only inside the existing post-failure
-  fallback, never before step 2's authoritative Git invocation, and does
-  not reintroduce the Round-2-removed early `.git`-existence precheck
+  classifier, including the bare-ancestor shape — new, mandatory, Round
+  16 review finding #4, extended, mandatory, Round 17 review finding #1:**
+  whether `resolveRepository` correctly reports `GIT_COMMAND_FAILED` —
+  never `NOT_A_GIT_REPOSITORY`, never `PROJECT_ROOT_MISMATCH` — for a
+  `projectRoot` nested inside a real repository (bare **or** non-bare)
+  whose own, ancestor-level config is too malformed for Git's
+  `--is-bare-repository` to authoritatively establish a toplevel; whether
+  the ancestor walk genuinely checks **both** the non-bare (`.git`) and
+  bare (`HEAD`+`objects/`+ref-storage) shapes at every level, not only
+  non-bare; and whether a `projectRoot` physically nested inside a
+  **healthy** bare repository is correctly, unconditionally unaffected
+  (step 2's own authoritative call succeeds with `true`, the secondary
+  classifier is never reached, and the result remains
+  `BARE_REPOSITORY_UNSUPPORTED`) — proven by the dedicated eight-fixture
+  regression (§20: healthy nested non-bare directory →
+  `PROJECT_ROOT_MISMATCH`; healthy bare repository root →
+  `BARE_REPOSITORY_UNSUPPORTED`; `projectRoot` nested inside a healthy
+  bare repository → `BARE_REPOSITORY_UNSUPPORTED`; malformed non-bare
+  repository root → `GIT_COMMAND_FAILED`; malformed bare repository root
+  → `GIT_COMMAND_FAILED`; malformed non-bare repository parent with
+  nested `projectRoot` → `GIT_COMMAND_FAILED`; malformed bare repository
+  parent with nested `projectRoot` → `GIT_COMMAND_FAILED`; plain non-Git
+  directory with no marker of either shape anywhere in its ancestry →
+  `NOT_A_GIT_REPOSITORY`) — and whether §8's own prose correctly states
+  the filesystem-boundary scope of this walk (matching BR3's own
+  sanitized, `GIT_DISCOVERY_ACROSS_FILESYSTEM`-never-forwarded Git
+  invocation behavior, never overclaiming exact traversal equivalence
+  with every possible unsanitized Git discovery configuration), makes
+  clear this ancestor-chain check runs only inside the existing
+  post-failure fallback, never before step 2's authoritative Git
+  invocation, and does not reintroduce the Round-2-removed early
+  `.git`-existence precheck
 - Whether test evidence is real (tests actually run against real,
   ephemeral, temporary Git repositories — not mocked Git command output)
 
