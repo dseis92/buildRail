@@ -9,20 +9,20 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: PRODUCTION_VERIFIED
+  lifecycle_state: FROZEN
   development_phase: BR3
 
 authorization:
   id: BR3
   type: feature
   title: Git Inspection
-  status: authorized
+  status: completed
   specification: .buildrail/specs/BR3-GIT-INSPECTION.md
   granted_by: human
 
 candidate:
-  branch: feature/br3-git-inspection
-  base_sha: 0348cf90d06f5519f774e0793fbbded3c7e496a3
+  branch: null
+  base_sha: null
   candidate_sha: null
 
 # Immutable approved checkpoints for completed/frozen phases. Distinct from
@@ -43,9 +43,12 @@ baselines:
   BR2:
     approved_sha: 720abf34d80933714475ec56ab43fd39fa82f484
     status: frozen
+  BR3:
+    approved_sha: b12f9a59cf79e7025f929b8f712c0a37384b8c7f
+    status: frozen
 
-# BR0, BR1, and BR2 have each been independently reviewed, approved, and
-# frozen at the SHAs recorded under `baselines`. BR1 established the
+# BR0, BR1, BR2, and BR3 have each been independently reviewed, approved,
+# and frozen at the SHAs recorded under `baselines`. BR1 established the
 # first real, executable BuildRail CLI (packages/cli). BR2 implemented
 # the provider-neutral governance engine (@buildrail/core) — config/state
 # loading, schema validation, authorization policy, and the lifecycle
@@ -53,16 +56,15 @@ baselines:
 # (Git Inspection) — resolveRepository, inspectHead, inspectWorkingTree,
 # inspectDiff, matchProtectedPaths in @buildrail/core, per
 # `.buildrail/specs/BR3-GIT-INSPECTION.md` (approved candidate
-# c3996dd6b764bfd2246277e92e3bef03e84179dc) — is now implemented on
-# feature/br3-git-inspection; implementation candidate
-# b12f9a59cf79e7025f929b8f712c0a37384b8c7f has passed independent review,
-# Human QA, merge authorization, and production verification by the Human Owner.
-# Phase closure/freeze remains outstanding before BR3 can be marked complete.
-# Verification-report generation remains unimplemented until BR4.
+# c3996dd6b764bfd2246277e92e3bef03e84179dc) — implementation candidate
+# b12f9a59cf79e7025f929b8f712c0a37384b8c7f passed independent review,
+# Human QA, merge authorization, and production verification, and is now
+# frozen. Verification-report generation remains unimplemented until BR4.
 completed_phases:
   - BR0
   - BR1
   - BR2
+  - BR3
 
 planned_phases:
   - BR4
