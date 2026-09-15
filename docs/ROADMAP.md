@@ -9,7 +9,7 @@ authorized, regardless of how "obviously next" it may seem.
 | BR0 | Constitution | Repository foundation, specification, governance, architecture, schemas, roadmap. No functional CLI. | **COMPLETE + INDEPENDENTLY APPROVED + FROZEN** (baseline `04c93767510c51916fcc51f60b85b674c7d6f1cc`) |
 | BR1 | CLI Skeleton | `buildrail --help`, `buildrail init`, `buildrail status` | **COMPLETE + INDEPENDENTLY APPROVED + HUMAN QA PASSED + FROZEN** (approved candidate `36f7b0a569eeee0cd1c5d7472cf176763c818a2e`, merged as `3b695399eae01720804ec496e7735d636edaed41`) |
 | BR2 | Governance Engine | Config loading, state loading, validation, lifecycle transitions | **COMPLETE + INDEPENDENTLY APPROVED + FROZEN** (approved candidate `720abf34d80933714475ec56ab43fd39fa82f484`) |
-| BR3 | Git Inspection | Branch detection, HEAD/remote SHA, working tree, diff inspection, protected-path/deletion/rename detection | **AUTHORIZED — IMPLEMENTATION NOT STARTED** (approved specification candidate `c3996dd6b764bfd2246277e92e3bef03e84179dc`; implementation authorization granted, `.buildrail/state.yml`) |
+| BR3 | Git Inspection | Branch detection, HEAD SHA and configured upstream identity/object-ref resolution, working tree, diff inspection, protected-path/deletion/rename detection | **AUTHORIZED — IMPLEMENTATION NOT STARTED** (approved specification candidate `c3996dd6b764bfd2246277e92e3bef03e84179dc`; implementation authorization granted, `.buildrail/state.yml`; specification/activation PR #11 still open, pending merge) |
 | BR4 | Verification | Quality gate commands, candidate-bound verification, `buildrail verify`, evidence reports | PLANNED |
 | BR5 | Agent Skills | Planning, preflight, implementation, verification, review, completion, handoff skills | PLANNED |
 | BR6 | Claude Code Adapter | Claude Code integration | PLANNED |
@@ -51,5 +51,8 @@ reviewed, approved, and frozen at the baseline SHAs recorded in
 BR1 additionally passed Human QA before merge. BR3 (Git Inspection) is
 now authorized for implementation (`.buildrail/state.yml`:
 `current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR3`)
-— implementation has not yet started; the next required step is BR3
-preflight. BR4–BR8 remain planned and not implementation-authorized.
+— implementation has not yet started; the specification/activation PR
+(#11) is still open, pending merge, and the next required steps are
+merging it, then the `AUTHORIZED` → `PREFLIGHT` governance transition on
+a dedicated implementation branch created from the post-merge `main`
+baseline. BR4–BR8 remain planned and not implementation-authorized.

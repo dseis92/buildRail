@@ -15,8 +15,7 @@ schema registry and `$ref` resolution strategy, active/historical
 authorization semantics, lifecycle engine, CLI integration, error model,
 dependency proposals, test architecture, and acceptance criteria). That
 document is the authoritative BR2 specification; this page remains a
-short summary. This governance activation does not itself change or
-reinterpret that specification's architecture or contracts in any way.
+short summary.
 
 ## Goal
 
@@ -63,13 +62,15 @@ and enforcing legal lifecycle transitions.
 
 - BR1 (CLI surface to expose this through)
 
-## Deferred from BR0 review — resolved at specification level
+## Deferred from BR0 review — resolved at specification level and implemented
 
 The independent BR0 review flagged that
 `packages/core/schemas/state.schema.json`'s `authorization` property uses
 `"$ref": "authorization.schema.json"` — a bare relative reference that
 requires a schema loader to register both files under a shared base
 URI/registry to resolve correctly. The detailed BR2 specification
-(`.buildrail/specs/BR2-GOVERNANCE-ENGINE.md` §11) resolves this with a
-concrete schema-registry `$ref`-resolution strategy. Actually implementing
-that strategy remains BR2 implementation work, not yet performed.
+(`.buildrail/specs/BR2-GOVERNANCE-ENGINE.md` §11) resolved this with a
+concrete schema-registry `$ref`-resolution strategy, which was
+implemented as part of BR2 and is now real, tested code in
+`packages/core` — BR2 is complete and frozen; no further work on this
+item remains.

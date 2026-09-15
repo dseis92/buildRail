@@ -16,5 +16,6 @@ README is a directory index, not a status record.
 - [`BR2-GOVERNANCE-ENGINE.md`](BR2-GOVERNANCE-ENGINE.md) — BR2 (Governance
   Engine). Complete, independently approved, and frozen.
 - [`BR3-GIT-INSPECTION.md`](BR3-GIT-INSPECTION.md) — BR3 (Git Inspection).
-  Independently approved and merged; implementation-authorized by the
-  human owner; implementation not yet started.
+  Independently approved and implementation-authorized by the human
+  owner; the specification/activation PR (#11) is still open, pending
+  merge; implementation not yet started.

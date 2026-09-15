@@ -2,13 +2,17 @@
 
 **Status: AUTHORIZED — IMPLEMENTATION NOT STARTED**
 
-The BR3 specification was independently reviewed, approved, and merged
-(approved candidate `c3996dd6b764bfd2246277e92e3bef03e84179dc`). The
-human owner has since granted implementation authorization
-(`.buildrail/state.yml`: `current.lifecycle_state: AUTHORIZED`,
-`current.development_phase: BR3`). **Implementation has not yet
-started** — the next required step is BR3 preflight, followed by
-implementation, verification, independent review, and human QA.
+The BR3 specification was independently reviewed and approved (approved
+candidate `c3996dd6b764bfd2246277e92e3bef03e84179dc`). The human owner
+has since granted implementation authorization (`.buildrail/state.yml`:
+`current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR3`).
+The specification/activation pull request (PR #11) is still **open,
+pending merge**. **Implementation has not yet started** — the next
+required steps are merging PR #11, then the `AUTHORIZED` → `PREFLIGHT`
+governance transition (a separate commit, on a dedicated implementation
+branch created from the post-merge `main` baseline — the same sequencing
+BR2 followed), followed by implementation, verification, independent
+review, and human QA.
 
 See `.buildrail/specs/BR3-GIT-INSPECTION.md` for the detailed BR3
 specification (repository-root semantics, branch/HEAD/upstream model,
@@ -28,7 +32,7 @@ agent self-report.
 ## Scope
 
 - Branch detection
-- HEAD SHA and remote SHA detection
+- HEAD SHA and configured upstream identity/object-ref resolution
 - Working tree status inspection
 - Diff inspection between two refs/SHAs
 - Protected-path detection (matching config-declared protected systems)
