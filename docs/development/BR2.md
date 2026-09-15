@@ -1,15 +1,13 @@
 # BR2 — Governance Engine
 
-**Status: AUTHORIZED — IMPLEMENTATION NOT STARTED**
+**Status: COMPLETE + INDEPENDENTLY APPROVED + FROZEN**
 
-The BR2 specification was independently reviewed and approved at
-candidate `d5a8a8762daf90d7ea628faa8be55b272e12c03b`, merged via
-`2c0fc991e9df15025f19e761ab27dddf917fe61d`. The human owner has since
-granted implementation authorization (`.buildrail/state.yml`:
-`current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR2`).
-**Implementation has not yet started** — the next required step is BR2
-preflight, followed by implementation, verification, independent review,
-and human QA.
+BR2 is complete, independently reviewed, approved, and frozen at approved
+candidate `720abf34d80933714475ec56ab43fd39fa82f484`
+(`.buildrail/state.yml`: `baselines.BR2`). `@buildrail/core`'s
+provider-neutral governance engine — config/state loading, schema
+validation, authorization policy, and the lifecycle transition engine —
+is real and wired into `buildrail status` output.
 
 See `.buildrail/specs/BR2-GOVERNANCE-ENGINE.md` for the detailed BR2
 specification (architectural boundary, config/state loading contracts,
@@ -53,13 +51,13 @@ and enforcing legal lifecycle transitions.
 - BR1 reviewed, approved, and authorized as a base — **satisfied** (BR1
   complete, independently approved, Human-QA-passed, merged, and frozen)
 - BR2 explicitly authorized by the human owner — **satisfied**
-  (`.buildrail/state.yml`: `authorization.id: BR2`, `status: authorized`)
 
 ## Exit Conditions
 
-- Config/state loading rejects invalid documents
-- Illegal lifecycle transitions are rejected
-- Independent review and human approval of BR2
+- Config/state loading rejects invalid documents — **satisfied**
+- Illegal lifecycle transitions are rejected — **satisfied**
+- Independent review and human approval of BR2 — **satisfied** (approved
+  candidate `720abf34d80933714475ec56ab43fd39fa82f484`, frozen)
 
 ## Dependencies
 
