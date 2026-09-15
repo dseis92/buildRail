@@ -66,3 +66,30 @@ export type {
   PhaseActivationRequest,
   PhaseClosureRequest,
 } from "./lifecycle/index.js";
+
+export {
+  resolveRepository,
+  inspectHead,
+  inspectWorkingTree,
+  inspectDiff,
+  matchProtectedPaths,
+} from "./git/index.js";
+export type {
+  GitError,
+  GitErrorCode,
+  GitResult,
+  RepositoryInfo,
+  HeadInfo,
+  UpstreamInfo,
+  WorkingTreeStatus,
+  WorkingTreeEntry,
+  WorkingTreeEntryKind,
+  SubmoduleState,
+  DiffRequest,
+  DiffResult,
+  DiffChange,
+  DiffChangeKind,
+  ProtectedPathCheckInput,
+  ProtectedPathMatch,
+  ProtectedPathMatchResult,
+} from "./git/index.js";

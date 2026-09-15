@@ -16,7 +16,7 @@ test("packages/core/package.json matches the approved §20.4 target contract", (
   assert.equal(pkg.main, "dist/index.js");
   assert.equal(pkg.types, "dist/index.d.ts");
   assert.equal(pkg.engines?.node, ">=22");
-  assert.deepEqual(Object.keys(pkg.dependencies ?? {}).sort(), ["ajv", "yaml"]);
+  assert.deepEqual(Object.keys(pkg.dependencies ?? {}).sort(), ["ajv", "picomatch", "yaml"]);
   assert.ok(pkg.devDependencies?.typescript, "typescript must be a devDependency");
   assert.ok(pkg.devDependencies?.["@types/node"], "@types/node must be a devDependency");
   assert.equal(pkg.dependencies?.["ajv-formats"], undefined, "ajv-formats must never be a dependency");
