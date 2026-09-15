@@ -14,5 +14,8 @@ README is a directory index, not a status record.
 - [`BR1-CLI-SKELETON.md`](BR1-CLI-SKELETON.md) — BR1 (CLI Skeleton).
   Complete, independently approved, Human-QA-passed, and frozen.
 - [`BR2-GOVERNANCE-ENGINE.md`](BR2-GOVERNANCE-ENGINE.md) — BR2 (Governance
-  Engine). Independently approved and merged; implementation-authorized
-  by the human owner; implementation not yet started.
+  Engine). Complete, independently approved, and frozen.
+- [`BR3-GIT-INSPECTION.md`](BR3-GIT-INSPECTION.md) — BR3 (Git Inspection).
+  Independently approved and implementation-authorized by the human
+  owner; the specification/activation PR (#11) is still open, pending
+  merge; implementation not yet started.

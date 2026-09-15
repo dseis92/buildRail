@@ -34,17 +34,24 @@ baseline `04c93767510c51916fcc51f60b85b674c7d6f1cc` (see
 `.buildrail/state.yml`). **BR1 (CLI Skeleton) is complete, independently
 approved, Human-QA-passed, merged, and frozen** at approved candidate
 `36f7b0a569eeee0cd1c5d7472cf176763c818a2e` (merged to `main` as
-`3b695399eae01720804ec496e7735d636edaed41`). BuildRail now has a real,
-executable `buildrail` CLI shell (`packages/cli`) — see
-`.buildrail/specs/BR1-CLI-SKELETON.md`. **BR2 (Governance Engine) is now
+`3b695399eae01720804ec496e7735d636edaed41`). **BR2 (Governance Engine) is
+complete, independently approved, merged, and frozen** at approved
+candidate `720abf34d80933714475ec56ab43fd39fa82f484` — see
+`.buildrail/specs/BR2-GOVERNANCE-ENGINE.md`. BuildRail now has a real,
+executable `buildrail` CLI shell (`packages/cli`) wired to a real,
+provider-neutral governance engine (`@buildrail/core`) — config/state
+loading, schema validation, authorization policy, and lifecycle
+transitions all work against real `.buildrail/state.yml`/`config.yml`
+files, surfaced through `buildrail status`. **BR3 (Git Inspection) is now
 AUTHORIZED for implementation** (`.buildrail/state.yml`:
-`current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR2`)
+`current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR3`)
 under its independently reviewed and approved specification
-(`.buildrail/specs/BR2-GOVERNANCE-ENGINE.md`) — **implementation has not
-yet started.** The next required step is BR2 preflight, followed by
+(`.buildrail/specs/BR3-GIT-INSPECTION.md`, approved candidate
+`c3996dd6b764bfd2246277e92e3bef03e84179dc`) — **implementation has not
+yet started.** The next required step is BR3 preflight, followed by
 implementation, verification, independent review, and human QA, exactly
-as BR1's lifecycle proceeded. BR3–BR8 remain planning only — do not begin
-implementation on any of BR3–BR8. See `docs/ROADMAP.md` and
+as BR1/BR2's lifecycle proceeded. BR4–BR8 remain planning only — do not
+begin implementation on any of BR4–BR8. See `docs/ROADMAP.md` and
 `docs/development/` for what each phase covers.
 
 For the full governance model, see `docs/GOVERNANCE.md`.

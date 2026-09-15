@@ -9,15 +9,15 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: FROZEN
-  development_phase: BR2
+  lifecycle_state: AUTHORIZED
+  development_phase: BR3
 
 authorization:
-  id: BR2
+  id: BR3
   type: feature
-  title: Governance Engine
-  status: completed
-  specification: .buildrail/specs/BR2-GOVERNANCE-ENGINE.md
+  title: Git Inspection
+  status: authorized
+  specification: .buildrail/specs/BR3-GIT-INSPECTION.md
   granted_by: human
 
 candidate:
@@ -49,16 +49,19 @@ baselines:
 # first real, executable BuildRail CLI (packages/cli). BR2 implemented
 # the provider-neutral governance engine (@buildrail/core) — config/state
 # loading, schema validation, authorization policy, and the lifecycle
-# transition engine — wired into real `buildrail status` output. Git
-# inspection and verification-report generation remain unimplemented
-# until BR3/BR4.
+# transition engine — wired into real `buildrail status` output. BR3
+# (Git Inspection) is now authorized for implementation — its
+# specification (`.buildrail/specs/BR3-GIT-INSPECTION.md`) was
+# independently reviewed and approved at candidate
+# c3996dd6b764bfd2246277e92e3bef03e84179dc; implementation has not yet
+# started. Verification-report generation remains unimplemented until
+# BR4.
 completed_phases:
   - BR0
   - BR1
   - BR2
 
 planned_phases:
-  - BR3
   - BR4
   - BR5
   - BR6

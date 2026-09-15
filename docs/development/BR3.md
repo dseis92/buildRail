@@ -1,6 +1,27 @@
 # BR3 — Git Inspection
 
-**Status: PLANNED / NOT IMPLEMENTATION AUTHORIZED**
+**Status: AUTHORIZED — IMPLEMENTATION NOT STARTED**
+
+The BR3 specification was independently reviewed and approved (approved
+candidate `c3996dd6b764bfd2246277e92e3bef03e84179dc`). The human owner
+has since granted implementation authorization (`.buildrail/state.yml`:
+`current.lifecycle_state: AUTHORIZED`, `current.development_phase: BR3`).
+The specification/activation pull request (PR #11) is still **open,
+pending merge**. **Implementation has not yet started** — the next
+required steps are merging PR #11, then the `AUTHORIZED` → `PREFLIGHT`
+governance transition (a separate commit, on a dedicated implementation
+branch created from the post-merge `main` baseline — the same sequencing
+BR2 followed), followed by implementation, verification, independent
+review, and human QA.
+
+See `.buildrail/specs/BR3-GIT-INSPECTION.md` for the detailed BR3
+specification (repository-root semantics, branch/HEAD/upstream model,
+working-tree and diff inspection, protected-path matching, process
+execution safety, determinism, error model, dependency policy, test
+architecture, and acceptance criteria). That document is the
+authoritative BR3 specification; this page remains a short summary.
+This governance activation does not itself change or reinterpret that
+specification's architecture or contracts in any way.
 
 ## Goal
 
@@ -11,7 +32,7 @@ agent self-report.
 ## Scope
 
 - Branch detection
-- HEAD SHA and remote SHA detection
+- HEAD SHA and configured upstream identity/object-ref resolution
 - Working tree status inspection
 - Diff inspection between two refs/SHAs
 - Protected-path detection (matching config-declared protected systems)
@@ -33,8 +54,10 @@ agent self-report.
 
 ## Entry Conditions
 
-- BR2 reviewed, approved, and authorized as a base
-- BR3 explicitly authorized by the human owner
+- BR2 reviewed, approved, and authorized as a base — **satisfied** (BR2
+  complete, independently approved, merged, and frozen)
+- BR3 explicitly authorized by the human owner — **satisfied**
+  (`.buildrail/state.yml`: `authorization.id: BR3`, `status: authorized`)
 
 ## Exit Conditions
 
