@@ -38,6 +38,7 @@ export function splitNulFields(buf: Buffer): Buffer[] {
 
 /** Splits a NUL-delimited buffer into raw records (each still needing its own internal parsing), by NUL only where records are single-field. */
 export function decodeNulFieldsStrict(buf: Buffer): string[] {
+  if (buf.length && buf.at(-1) !== 0) throw new MalformedOutputError("Missing final NUL.");
   return splitNulFields(buf).map((f) => strictDecode(f));
 }
 

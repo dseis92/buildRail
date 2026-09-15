@@ -24,21 +24,26 @@ test("inspectWorkingTree: unusual-but-legal characters in a filename are decoded
   }
 });
 
-test("inspectWorkingTree: a filename with an invalid-UTF-8 byte sequence -> MALFORMED_GIT_OUTPUT, never silent corruption", async () => {
+test("inspectWorkingTree: a filename with an invalid-UTF-8 byte sequence -> MALFORMED_GIT_OUTPUT, never silent corruption", async (t) => {
+  if (process.platform === "win32") return t.skip("Windows paths use Unicode; raw POSIX byte names are unavailable.");
   const fx = await createGitFixture();
   try {
     writeFile(fx.root, "base.txt", "base");
     await commitAll(fx, "init");
     // Construct a filename containing a raw, invalid UTF-8 byte via Node's Buffer-based fs APIs.
     const badNameBytes = Buffer.concat([Buffer.from("bad-"), Buffer.from([0xff]), Buffer.from(".txt")]);
-    fs.writeFileSync(path.join(fx.root, badNameBytes.toString("binary")), "x");
-    const r = await inspectWorkingTree(fx.root);
-    // Depending on filesystem encoding enforcement this may or may not construct
-    // successfully; only assert MALFORMED_GIT_OUTPUT when the write actually
-    // produced a non-UTF-8-named file Git can see.
-    if (!r.ok) {
-      assert.equal(r.error.code, "MALFORMED_GIT_OUTPUT");
+    const rawPath = Buffer.concat([Buffer.from(fx.root + path.sep), badNameBytes]);
+    try { fs.writeFileSync(rawPath, "x"); }
+    catch (error) {
+      if (process.platform === "darwin" && (error as NodeJS.ErrnoException).code === "EILSEQ") return t.skip("Darwin filesystem rejects raw 0xff filenames with EILSEQ (verified outside sandbox).");
+      throw error;
     }
+    const names = fs.readdirSync(fx.root, { encoding: "buffer" });
+    assert.ok(names.some(name => name.equals(badNameBytes) && name.includes(0xff)), "raw 0xff fixture precondition");
+    const r = await inspectWorkingTree(fx.root);
+    assert.equal(r.ok, false);
+    if (r.ok) assert.fail("Invalid UTF-8 must fail the whole operation");
+    assert.equal(r.error.code, "MALFORMED_GIT_OUTPUT");
   } finally {
     fx.cleanup();
   }

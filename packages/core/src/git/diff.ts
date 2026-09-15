@@ -1,8 +1,8 @@
-import type { GitResult } from "./errors.js";
+import type { GitError, GitResult } from "./errors.js";
 import { gitFail, gitOk } from "./errors.js";
 import { commandFailedError, prepareGitOperation, runGit } from "./internal/exec.js";
 import { removeTrailingNewline, splitNulFields, strictDecode } from "./internal/git-parse.js";
-import { validateRepositoryAt } from "./repository.js";
+import { resolveRepositoryWithContext } from "./repository.js";
 import type { DiffChange, DiffChangeKind, DiffRequest, DiffResult } from "./types.js";
 
 const SHA_RE = /^[0-9a-f]{40}$/;
@@ -11,7 +11,7 @@ async function resolveRef(
   ctx: Parameters<typeof runGit>[0],
   projectRoot: string,
   ref: string,
-): Promise<{ ok: true; sha: string } | { ok: false; error: ReturnType<typeof commandFailedError> | { code: "REF_NOT_FOUND"; message: string; details?: unknown } }> {
+): Promise<{ ok: true; sha: string } | { ok: false; error: GitError }> {
   const outcome = await runGit(ctx, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], projectRoot);
   if (!outcome.ok) {
     if (outcome.code === 128 || outcome.code === 1) {
@@ -23,10 +23,10 @@ async function resolveRef(
   try {
     sha = removeTrailingNewline(strictDecode(outcome.stdout));
   } catch {
-    return { ok: false, error: { code: "REF_NOT_FOUND", message: `Ref resolution output was not valid UTF-8: ${ref}` } };
+    return { ok: false, error: { code: "MALFORMED_GIT_OUTPUT", message: `Ref resolution output was not valid UTF-8: ${ref}` } };
   }
-  if (!SHA_RE.test(sha)) {
-    return { ok: false, error: { code: "REF_NOT_FOUND", message: `Unexpected rev-parse output for ref: ${ref}` } };
+  if ((sha.length !== 40 || !SHA_RE.test(sha))) {
+    return { ok: false, error: { code: "MALFORMED_GIT_OUTPUT", message: `Unexpected rev-parse output for ref: ${ref}` } };
   }
   return { ok: true, sha };
 }
@@ -54,7 +54,8 @@ function sortChanges(changes: DiffChange[]): DiffChange[] {
 
 class MalformedDiffOutput extends Error {}
 
-function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
+export function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
+  if (stdout.length && stdout.at(-1) !== 0) return new MalformedDiffOutput("Missing final NUL.");
   const fields = splitNulFields(stdout);
   const changes: DiffChange[] = [];
   let i = 0;
@@ -75,6 +76,7 @@ function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
       } catch {
         return new MalformedDiffOutput("diff path field was not valid UTF-8.");
       }
+      if (!pathStr) return new MalformedDiffOutput("Empty diff path.");
       const kind: DiffChangeKind = statusField === "A" ? "added" : statusField === "M" ? "modified" : statusField === "D" ? "deleted" : "type_changed";
       changes.push({ kind, path: pathStr });
       i += 2;
@@ -82,7 +84,7 @@ function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
     }
 
     // Validate rename status token (R followed by similarity score)
-    if (statusField.startsWith("R") && statusField.length > 1) {
+    if (!/[\r\n\u2028\u2029]/.test(statusField) && /^R(?:[0-9]{1,2}|0[0-9]{2}|100)$/.test(statusField)) {
       const similarity = Number(statusField.slice(1));
       if (isNaN(similarity) || similarity < 0 || similarity > 100) {
         return new MalformedDiffOutput(`Invalid rename similarity value: ${statusField}`);
@@ -96,6 +98,7 @@ function parseNameStatus(stdout: Buffer): DiffChange[] | MalformedDiffOutput {
       } catch {
         return new MalformedDiffOutput("diff rename path field was not valid UTF-8.");
       }
+      if (!oldPathStr || !newPathStr) return new MalformedDiffOutput("Empty rename path.");
       changes.push({ kind: "renamed", path: newPathStr, oldPath: oldPathStr, similarity });
       i += 3;
       continue;
@@ -111,7 +114,7 @@ export async function inspectDiff(projectRoot: string, request: DiffRequest): Pr
   if (!prep.ok) return { ok: false, error: prep.error };
   const ctx = prep.value;
 
-  const repoResult = await validateRepositoryAt(ctx, projectRoot);
+  const repoResult = await resolveRepositoryWithContext(ctx, projectRoot);
   if (!repoResult.ok) return { ok: false, error: repoResult.error };
 
   const fromResolved = await resolveRef(ctx, projectRoot, request.fromRef);

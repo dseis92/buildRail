@@ -2,19 +2,22 @@ import type { GitError, GitResult } from "../errors.js";
 import { gitOk } from "../errors.js";
 import { commandFailedError, runGit, typedError, type GitOperationContext } from "./exec.js";
 import { splitNulFields, strictDecode } from "./git-parse.js";
-import { validateRepositoryAt } from "../repository.js";
 import { enumerateInitializedSubmodules } from "./submodules.js";
 
 async function listTrackedPaths(ctx: GitOperationContext, cwd: string): Promise<GitResult<string[]>> {
-  const outcome = await runGit(ctx, ["ls-files", "-z"], cwd);
+  const outcome = await runGit(ctx, ["ls-files", "--stage", "-z"], cwd);
   if (!outcome.ok) {
-    return { ok: false, error: commandFailedError("ls-files -z", outcome) };
+    return { ok: false, error: commandFailedError("ls-files --stage -z", outcome) };
   }
+  if (outcome.stdout.length && outcome.stdout.at(-1) !== 0) return { ok: false, error: typedError("MALFORMED_GIT_OUTPUT", "Missing ls-files NUL.") };
   const fields = splitNulFields(outcome.stdout);
   const paths: string[] = [];
   for (const f of fields) {
     try {
-      paths.push(strictDecode(f));
+      const text = strictDecode(f);
+      const match = /^(?:100644|100755|120000|160000) [0-9a-f]{40} [0-3]\t([\s\S]+)$/.exec(text);
+      if (!match) return { ok: false, error: typedError("MALFORMED_GIT_OUTPUT", "Invalid ls-files stage record.") };
+      if (!paths.includes(match[1]!)) paths.push(match[1]!);
     } catch {
       return { ok: false, error: typedError("MALFORMED_GIT_OUTPUT", "ls-files -z output was not valid UTF-8.") };
     }
@@ -25,7 +28,6 @@ async function listTrackedPaths(ctx: GitOperationContext, cwd: string): Promise<
 async function scanOneRepo(ctx: GitOperationContext, cwd: string): Promise<GitError | null> {
   const pathsResult = await listTrackedPaths(ctx, cwd);
   if (!pathsResult.ok) return pathsResult.error;
-  if (pathsResult.value.length === 0) return null;
 
   const stdinBuf = Buffer.concat(pathsResult.value.map((p) => Buffer.concat([Buffer.from(p, "utf-8"), Buffer.from([0])])));
 
@@ -37,7 +39,7 @@ async function scanOneRepo(ctx: GitOperationContext, cwd: string): Promise<GitEr
   const fields = splitNulFields(outcome.stdout);
 
   // Validate complete three-field record groups (path, attr, value)
-  if (fields.length % 3 !== 0) {
+  if ((outcome.stdout.length > 0 && outcome.stdout.at(-1) !== 0) || fields.length !== pathsResult.value.length * 3) {
     return typedError("MALFORMED_GIT_OUTPUT", `check-attr output has incomplete record group: ${fields.length} fields is not divisible by 3.`);
   }
 
@@ -54,7 +56,7 @@ async function scanOneRepo(ctx: GitOperationContext, cwd: string): Promise<GitEr
       return typedError("MALFORMED_GIT_OUTPUT", "check-attr --stdin -z output was not valid UTF-8.");
     }
     // Validate expected attribute name
-    if (attr !== "filter") {
+    if (attr !== "filter" || p !== pathsResult.value[i / 3]) {
       return typedError("MALFORMED_GIT_OUTPUT", `check-attr returned unexpected attribute name: ${attr}`);
     }
     if (value !== "unspecified" && value !== "unset") {

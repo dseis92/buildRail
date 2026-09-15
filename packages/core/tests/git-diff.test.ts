@@ -135,6 +135,7 @@ test("inspectDiff: diff.ignoreSubmodules=all repository-local config cannot supp
     const toSha = await commitAll(superproject, "bump sub");
 
     await superproject.git(["config", "diff.ignoreSubmodules", "all"]);
+    assert.equal((await superproject.git(["diff", "--name-status", fromSha, toSha])).stdout, "");
     const r = await inspectDiff(superproject.root, { fromRef: fromSha, toRef: toSha });
     assert.equal(r.ok, true);
     if (r.ok) {

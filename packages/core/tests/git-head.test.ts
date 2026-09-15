@@ -58,7 +58,7 @@ test("inspectHead: detached HEAD -> upstream null", async () => {
   }
 });
 
-test("inspectHead: local-branch upstream (remote-tracking-style) resolvable", async () => {
+test('inspectHead: local-branch upstream (remote=".") resolvable', async () => {
   const fx = await createGitFixture();
   try {
     writeFile(fx.root, "f.txt", "hi");
@@ -238,6 +238,8 @@ test("inspectHead: embedded-newline branch.<b>.merge value is recovered as one c
     // First configured value contains an embedded newline in its own content.
     await fx.git(["config", `branch.${branch}.merge`, "refs/heads/foo\nrefs/heads/bar"]);
     await fx.git(["config", "--add", `branch.${branch}.merge`, "refs/heads/bar"]);
+    assert.equal((await fx.git(["config", "-z", "--get-all", `branch.${branch}.merge`])).stdout, "refs/heads/foo\nrefs/heads/bar\0refs/heads/bar\0");
+    assert.equal((await fx.git(["config", "--get-all", `branch.${branch}.merge`])).stdout, "refs/heads/foo\nrefs/heads/bar\nrefs/heads/bar\n");
     const r = await inspectHead(fx.root);
     assert.equal(r.ok, true);
     if (r.ok) {

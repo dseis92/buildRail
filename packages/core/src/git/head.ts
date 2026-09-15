@@ -2,7 +2,7 @@ import type { GitError, GitResult } from "./errors.js";
 import { gitFail, gitOk } from "./errors.js";
 import { commandFailedError, prepareGitOperation, runGit, typedError, type GitOperationContext } from "./internal/exec.js";
 import { decodeNulFieldsStrict, removeTrailingNewline, strictDecode } from "./internal/git-parse.js";
-import { validateRepositoryAt } from "./repository.js";
+import { resolveRepositoryWithContext } from "./repository.js";
 import type { HeadInfo, UpstreamInfo } from "./types.js";
 
 const SHA_RE = /^[0-9a-f]{40}$/;
@@ -44,17 +44,18 @@ async function resolveUpstream(ctx: GitOperationContext, cwd: string, branch: st
   const shaOutcome = await runGit(ctx, ["rev-parse", "--verify", "-q", "--end-of-options", `${branch}@{upstream}`], cwd);
   const refOutcome = await runGit(ctx, ["rev-parse", "--verify", "-q", "--symbolic-full-name", "--end-of-options", `${branch}@{upstream}`], cwd);
 
-  if (shaOutcome.ok && refOutcome.ok) {
-    let sha: string;
-    let ref: string;
-    try {
+  let sha: string | null = null;
+  let ref: string | null = null;
+  try {
+    if (shaOutcome.ok) {
       sha = removeTrailingNewline(strictDecode(shaOutcome.stdout));
-      ref = removeTrailingNewline(strictDecode(refOutcome.stdout));
-    } catch {
-      return gitFail("MALFORMED_GIT_OUTPUT", "@{upstream} resolution output was not valid UTF-8.");
+      if (sha.length !== 40 || !SHA_RE.test(sha)) return gitFail("MALFORMED_GIT_OUTPUT", "Upstream object ID is not a SHA-1.");
     }
-    return gitOk({ remote, mergeRef, branch: branchName, ref, sha });
+    if (refOutcome.ok) ref = removeTrailingNewline(strictDecode(refOutcome.stdout));
+  } catch {
+    return gitFail("MALFORMED_GIT_OUTPUT", "@{upstream} resolution output was not valid UTF-8.");
   }
+  if (shaOutcome.ok && refOutcome.ok) return gitOk({ remote, mergeRef, branch: branchName, ref, sha });
 
   if (
     (!shaOutcome.ok && shaOutcome.code !== 1) ||
@@ -72,7 +73,7 @@ export async function inspectHead(projectRoot: string): Promise<GitResult<HeadIn
   if (!prep.ok) return { ok: false, error: prep.error };
   const ctx = prep.value;
 
-  const repoResult = await validateRepositoryAt(ctx, projectRoot);
+  const repoResult = await resolveRepositoryWithContext(ctx, projectRoot);
   if (!repoResult.ok) return { ok: false, error: repoResult.error };
 
   const cwd = projectRoot;
@@ -98,7 +99,7 @@ export async function inspectHead(projectRoot: string): Promise<GitResult<HeadIn
       } catch {
         return gitFail("MALFORMED_GIT_OUTPUT", "HEAD^{commit} output was not valid UTF-8.");
       }
-      if (!SHA_RE.test(headSha)) {
+      if ((headSha.length !== 40 || !SHA_RE.test(headSha))) {
         return gitFail("MALFORMED_GIT_OUTPUT", `Unexpected HEAD^{commit} output: ${headSha}`);
       }
       const branch = resolvedRefName.startsWith("refs/heads/") ? resolvedRefName.slice("refs/heads/".length) : resolvedRefName;
@@ -138,7 +139,7 @@ export async function inspectHead(projectRoot: string): Promise<GitResult<HeadIn
       } catch {
         return gitFail("MALFORMED_GIT_OUTPUT", "HEAD^{commit} output was not valid UTF-8.");
       }
-      if (!SHA_RE.test(headSha)) {
+      if ((headSha.length !== 40 || !SHA_RE.test(headSha))) {
         return gitFail("MALFORMED_GIT_OUTPUT", `Unexpected HEAD^{commit} output: ${headSha}`);
       }
       return gitOk({ branch: null, detached: true, unborn: false, headSha, upstream: null });

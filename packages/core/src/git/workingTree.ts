@@ -3,7 +3,7 @@ import { gitFail, gitOk } from "./errors.js";
 import { commandFailedError, prepareGitOperation, runGit, typedError } from "./internal/exec.js";
 import { scanForActiveFilters } from "./internal/filter-scan.js";
 import { splitNulFields, strictDecode } from "./internal/git-parse.js";
-import { validateRepositoryAt } from "./repository.js";
+import { resolveRepositoryWithContext } from "./repository.js";
 import type { SubmoduleState, WorkingTreeEntry, WorkingTreeEntryKind, WorkingTreeStatus } from "./types.js";
 
 const KIND_RANK: Record<WorkingTreeEntryKind, number> = {
@@ -53,10 +53,7 @@ function xKindOf(x: string): WorkingTreeEntryKind | null {
 
 // S<c><m><u> — c: commitChanged, m: tracked-file modification, u: untracked content
 function decodeSub(sub: string): SubmoduleState | "invalid" | undefined {
-  if (sub === "N..." || sub === "S..." || sub.startsWith("N") || sub === "....") {
-    // Valid non-submodule or uninitialized submodule markers
-    return undefined;
-  }
+  if (sub === "N...") return undefined;
   if (sub.length !== 4 || sub[0] !== "S") {
     return "invalid";
   }
@@ -84,8 +81,14 @@ function splitFields(bytesFields: string): string[] {
   return bytesFields.split(" ");
 }
 
-async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | MalformedStatusOutput> {
+function validFixed(parts: string[], modeStart: number, modeCount: number, shaStart: number, shaCount: number): boolean {
+  return parts.slice(modeStart, modeStart + modeCount).every(v => v.length === 6 && /^(?:000000|100644|100755|120000|160000)$/.test(v)) &&
+    parts.slice(shaStart, shaStart + shaCount).every(v => v.length === 40 && /^[0-9a-f]{40}$/.test(v));
+}
+
+export async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | MalformedStatusOutput> {
   const entries: WorkingTreeEntry[] = [];
+  if (stdout.length && stdout.at(-1) !== 0) return new MalformedStatusOutput("Missing final NUL.");
   const fields = splitNulFields(stdout);
 
   let i = 0;
@@ -97,21 +100,16 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
       return new MalformedStatusOutput("status record header was not valid UTF-8.");
     }
 
-    if (headerStr.startsWith("# ")) {
-      // A header/comment record (e.g. branch info if ever emitted) — skip.
-      i += 1;
-      continue;
-    }
-
     const recordType = headerStr[0];
 
     if (recordType === "1") {
       // "1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>"
       const parts = splitFields(headerStr);
-      if (parts.length < 9) return new MalformedStatusOutput(`Malformed type-1 record: ${headerStr}`);
+      if (parts[0] !== "1" || parts.length < 9) return new MalformedStatusOutput(`Malformed type-1 record: ${headerStr}`);
       const xy = parts[1]!;
       const sub = parts[2]!;
       const pathStr = parts.slice(8).join(" ");
+      if (!pathStr || !validFixed(parts, 3, 3, 6, 2)) return new MalformedStatusOutput("Invalid type-1 fields.");
       if (xy.length !== 2) {
         return new MalformedStatusOutput(`Invalid XY field length in type-1 record: ${headerStr}`);
       }
@@ -149,11 +147,13 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
     if (recordType === "2") {
       // "2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X score> <path>" then NUL then "<origPath>"
       const parts = splitFields(headerStr);
-      if (parts.length < 9) return new MalformedStatusOutput(`Malformed type-2 record: ${headerStr}`);
+      if (parts[0] !== "2" || parts.length < 10) return new MalformedStatusOutput(`Malformed type-2 record: ${headerStr}`);
       const xy = parts[1]!;
       const sub = parts[2]!;
       const scoreField = parts[8]!;
       const pathStr = parts.slice(9).join(" ");
+      if (!pathStr || !validFixed(parts, 3, 3, 6, 2)) return new MalformedStatusOutput("Invalid type-2 fields.");
+      if (!/^(?:R[.MDT]|\.R)$/.test(xy)) return new MalformedStatusOutput("Invalid type-2 XY.");
       if (i + 1 >= fields.length) return new MalformedStatusOutput(`Type-2 record missing oldPath field: ${headerStr}`);
       let oldPathStr: string;
       try {
@@ -161,7 +161,7 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
       } catch {
         return new MalformedStatusOutput("Type-2 record oldPath was not valid UTF-8.");
       }
-      if (xy.length !== 2) {
+      if (!oldPathStr || xy.length !== 2) {
         return new MalformedStatusOutput(`Invalid XY field length in type-2 record: ${headerStr}`);
       }
       const x = xy[0]!;
@@ -171,7 +171,7 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
         return new MalformedStatusOutput(`Invalid submodule field in type-2 record: ${headerStr}`);
       }
       // Validate rename score format: must be "R" followed by digits
-      if (!scoreField.startsWith("R") || scoreField.length < 2) {
+      if (/[\r\n\u2028\u2029]/.test(scoreField) || !/^R(?:[0-9]{1,2}|0[0-9]{2}|100)$/.test(scoreField)) {
         return new MalformedStatusOutput(`Invalid rename score format in type-2 record: ${headerStr}`);
       }
       const similarity = Number(scoreField.slice(1));
@@ -225,9 +225,10 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
     if (recordType === "u") {
       // "u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>"
       const parts = splitFields(headerStr);
-      if (parts.length < 11) return new MalformedStatusOutput(`Malformed unmerged record: ${headerStr}`);
+      if (parts[0] !== "u" || parts.length < 11) return new MalformedStatusOutput(`Malformed unmerged record: ${headerStr}`);
       const sub = parts[2]!;
       const pathStr = parts.slice(10).join(" ");
+      if (!pathStr || !/^(?:DD|AU|UD|UA|DU|AA|UU)$/.test(parts[1]!) || !validFixed(parts, 3, 4, 7, 3)) return new MalformedStatusOutput("Invalid unmerged fields.");
       const submodule = decodeSub(sub);
       if (submodule === "invalid") {
         return new MalformedStatusOutput(`Invalid submodule field in unmerged record: ${headerStr}`);
@@ -241,13 +242,8 @@ async function parseStatusOutput(stdout: Buffer): Promise<WorkingTreeEntry[] | M
 
     if (recordType === "?") {
       const pathStr = headerStr.slice(2);
+      if (!headerStr.startsWith("? ") || !pathStr) return new MalformedStatusOutput("Invalid untracked record.");
       entries.push({ kind: "untracked", path: pathStr });
-      i += 1;
-      continue;
-    }
-
-    if (recordType === "!") {
-      // Ignored-file record — never emitted since --ignored is not passed; skip defensively.
       i += 1;
       continue;
     }
@@ -276,7 +272,7 @@ export async function inspectWorkingTree(projectRoot: string): Promise<GitResult
   if (!prep.ok) return { ok: false, error: prep.error };
   const ctx = prep.value;
 
-  const repoResult = await validateRepositoryAt(ctx, projectRoot);
+  const repoResult = await resolveRepositoryWithContext(ctx, projectRoot);
   if (!repoResult.ok) return { ok: false, error: repoResult.error };
   const { gitDir, gitCommonDir } = repoResult.value;
 

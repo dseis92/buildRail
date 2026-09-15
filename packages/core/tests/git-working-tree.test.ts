@@ -244,24 +244,22 @@ test("inspectWorkingTree: conflicted gitlink with three index stages does not fa
     await superproject.git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", src.root, "sub"]);
     await superproject.git(["-C", "sub", "checkout", "-q", srcSha1]);
     await commitAll(superproject, "base with sub sha1");
-    await superproject.git(["checkout", "-q", "-b", "b1"]);
-    await superproject.git(["-C", "sub", "checkout", "-q", srcSha2]);
-    await superproject.git(["add", "sub"]);
-    await commitAll(superproject, "b1 sub sha2");
-    await superproject.git(["checkout", "-q", "-b", "b2", "HEAD~1"]);
-    await superproject.git(["commit", "--allow-empty", "-q", "-m", "b2 no change"]);
-    await superproject.git(["checkout", "-q", "b1"]);
-    try {
-      await superproject.git(["merge", "-q", "b2"]);
-    } catch {
-      // May or may not conflict depending on Git's own gitlink merge heuristics; proceed regardless.
-    }
-
+    await src.git(["checkout", "-q", srcSha1]);
+    writeFile(src.root, "sf.txt", "divergent");
+    const srcSha3 = await commitAll(src, "divergent");
+    await superproject.git(["update-index", "--force-remove", "sub"]);
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("git", ["update-index", "--index-info"], { cwd: superproject.root, input: `160000 ${srcSha1} 1\tsub\n160000 ${srcSha2} 2\tsub\n160000 ${srcSha3} 3\tsub\n` });
+    const staged = (await superproject.git(["ls-files", "--stage", "-z", "--", "sub"])).stdout.split("\0").filter(Boolean);
+    assert.equal(staged.length, 3);
+    assert.deepEqual(staged.map(record => record.split(" ")[2]?.split("\t")[0]), ["1", "2", "3"]);
+    fs.appendFileSync(path.join(superproject.root, "sub", "sf.txt"), "dirty");
     const r = await inspectWorkingTree(superproject.root);
-    // The key assertion: this must not fail with UNSAFE_SUBMODULE_PATH merely
-    // because ls-files reports multiple stage records for "sub".
-    if (!r.ok) {
-      assert.notEqual(r.error.code, "UNSAFE_SUBMODULE_PATH");
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      const entry = r.value.entries.find(e => e.path === "sub");
+      assert.equal(entry?.kind, "conflicted");
+      assert.equal(entry?.submodule?.hasModifiedContent, true);
     }
   } finally {
     src.cleanup();
@@ -301,11 +299,11 @@ test("inspectWorkingTree: status.showStash=true does not break parsing (# stash 
     await fx.git(["stash", "push", "-q"]);
     await fx.git(["config", "status.showStash", "true"]);
     writeFile(fx.root, "u.txt", "untracked");
+    assert.ok((await fx.git(["status", "--porcelain=v2", "-z"])).stdout.includes("# stash 1"));
     const r = await inspectWorkingTree(fx.root);
     assert.equal(r.ok, true);
     if (r.ok) {
-      const kinds = r.value.entries.map((e) => e.kind);
-      assert.ok(!kinds.includes("staged_add" as never) || true);
+      assert.deepEqual(r.value.entries, [{ kind: "untracked", path: "u.txt" }]);
       const untracked = r.value.entries.find((e) => e.path === "u.txt");
       assert.equal(untracked?.kind, "untracked");
     }

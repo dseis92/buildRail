@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { removeTrailingNewline, strictDecode } from "./git-parse.js";
 import { execFile as execFileCb } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -25,11 +27,11 @@ interface SanitizedEnv {
  * variables, normalizes PATH per the platform-specific rule, and adds the
  * non-GIT_* determinism overrides (LC_ALL/LANG/XDG_CONFIG_HOME).
  */
-function buildSanitizedEnv(xdgConfigHomeDir: string): SanitizedEnv {
-  const isWindows = os.platform() === "win32";
+export function buildSanitizedEnv(xdgConfigHomeDir: string, inherited: NodeJS.ProcessEnv = process.env, platform: string = os.platform()): SanitizedEnv {
+  const isWindows = platform === "win32";
 
   const stripped: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(inherited)) {
     if (value === undefined) continue;
     if (key.toUpperCase().startsWith("GIT_")) continue;
     stripped[key] = value;
@@ -118,7 +120,7 @@ function posixCandidateIsValid(candidate: string): boolean {
   }
 }
 
-function windowsCandidateIsValid(candidate: string): boolean {
+export function windowsCandidateIsValid(candidate: string): boolean {
   try {
     const st = fs.statSync(candidate);
     return st.isFile();
@@ -127,13 +129,14 @@ function windowsCandidateIsValid(candidate: string): boolean {
   }
 }
 
-function resolveGitExecutable(resolverCwd: string, effectivePath: string | undefined): string | null {
-  const isWindows = os.platform() === "win32";
+export function resolveGitExecutable(resolverCwd: string, effectivePath: string | undefined, platform: string = os.platform(), valid?: (candidate: string) => boolean): string | null {
+  resolutionProbe.getStore()?.({ resolverCwd, effectivePath, platform });
+  const isWindows = platform === "win32";
 
   let searchDirs: string[];
   if (isWindows) {
-    const pathValue = effectivePath ?? "";
-    searchDirs = normalizePathEntries(pathValue, resolverCwd);
+    if (effectivePath === undefined) return null;
+    searchDirs = effectivePath.split(";").map(entry => path.win32.resolve(resolverCwd, entry));
   } else {
     const pathValue = effectivePath !== undefined ? effectivePath : "/usr/bin:/bin";
     searchDirs = normalizePathEntries(pathValue, resolverCwd);
@@ -141,8 +144,8 @@ function resolveGitExecutable(resolverCwd: string, effectivePath: string | undef
 
   if (isWindows) {
     for (const dir of searchDirs) {
-      const candidate = path.join(dir, "git.exe");
-      if (windowsCandidateIsValid(candidate)) {
+      const candidate = path.win32.join(dir, "git.exe");
+      if ((valid ?? windowsCandidateIsValid)(candidate)) {
         return candidate;
       }
     }
@@ -151,7 +154,7 @@ function resolveGitExecutable(resolverCwd: string, effectivePath: string | undef
 
   for (const dir of searchDirs) {
     const candidate = path.join(dir, "git");
-    if (posixCandidateIsValid(candidate)) {
+    if ((valid ?? posixCandidateIsValid)(candidate)) {
       return candidate;
     }
   }
@@ -172,9 +175,10 @@ function canonicalize(execPath: string): string {
 
 const MIN_GIT_VERSION: readonly [number, number, number] = [2, 45, 0];
 
-function parseGitVersion(stdout: string): [number, number, number] | null {
-  const match = /^git version (\d+)\.(\d+)\.(\d+)/.exec(stdout.trim());
-  if (!match) return null;
+export function parseGitVersion(stdout: string): [number, number, number] | null {
+  const value = removeTrailingNewline(stdout);
+  const match = /^git version (\d+)\.(\d+)\.(\d+)(?:[ .][^\r\n]*)?$/.exec(value);
+  if (!match || match[0] !== value) return null;
   return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
@@ -219,22 +223,12 @@ export async function prepareGitOperation(): Promise<PrepareResult> {
   }
   const execPath = canonicalize(resolved);
 
+  const ctx = { execPath, env };
+  const outcome = await runGit(ctx, ["--version"], resolverCwd);
+  if (!outcome.ok) return { ok: false, error: commandFailedError("--version", outcome) };
   let stdout: string;
-  try {
-    const result = await execFileAsync(execPath, ["--version"], {
-      cwd: resolverCwd,
-      env,
-      encoding: "buffer",
-      maxBuffer: MAX_BUFFER,
-    });
-    stdout = result.stdout.toString("utf-8");
-  } catch (err) {
-    const nodeErr = err as NodeJS.ErrnoException;
-    if (nodeErr.code === "ENOENT") {
-      return { ok: false, error: gitError("GIT_EXECUTABLE_UNAVAILABLE", "git executable could not be spawned.") };
-    }
-    return { ok: false, error: gitError("GIT_COMMAND_FAILED", "git --version failed.", String(nodeErr.message ?? nodeErr)) };
-  }
+  try { stdout = strictDecode(outcome.stdout); }
+  catch { return { ok: false, error: gitError("GIT_VERSION_UNSUPPORTED", "Invalid UTF-8 in version response.") }; }
 
   const parsed = parseGitVersion(stdout);
   if (parsed === null) {
@@ -249,12 +243,12 @@ export async function prepareGitOperation(): Promise<PrepareResult> {
       error: gitError(
         "GIT_VERSION_UNSUPPORTED",
         `git version ${parsed.join(".")} is below BR3's supported floor (${MIN_GIT_VERSION.join(".")}).`,
-        stdout.trim(),
+        stdout,
       ),
     };
   }
 
-  return { ok: true, value: { execPath, env } };
+  return { ok: true, value: ctx };
 }
 
 // -------------------------------------------------------------------------
@@ -276,7 +270,7 @@ export interface ExecOutcome {
  * must be supplied explicitly by the caller (projectRoot, a submodule
  * path, or the capability-probe's own fixed cwd) — there is no default.
  */
-export async function runGit(ctx: GitOperationContext, args: string[], cwd: string, stdin?: Buffer): Promise<ExecOutcome> {
+async function executeGit(ctx: GitOperationContext, args: string[], cwd: string, stdin?: Buffer): Promise<ExecOutcome> {
   if (stdin === undefined) {
     try {
       const result = await execFileAsync(ctx.execPath, args, {
@@ -334,6 +328,38 @@ export async function runGit(ctx: GitOperationContext, args: string[], cwd: stri
     );
     child.stdin?.end(stdin);
   });
+}
+
+/** Package-private, async-scoped execution seam. Never exported by @buildrail/core.
+ * Real-Git probes observe calls; malformed-output tests may supply an outcome.
+ */
+export interface GitExecutionEvent {
+  ctx: GitOperationContext;
+  args: string[];
+  cwd: string;
+  stdin?: Buffer;
+}
+export interface GitResolutionEvent {
+  resolverCwd: string;
+  effectivePath: string | undefined;
+  platform: string;
+}
+const resolutionProbe = new AsyncLocalStorage<(event: GitResolutionEvent) => void>();
+export function withGitResolutionProbe<T>(probe: (event: GitResolutionEvent) => void, action: () => Promise<T>): Promise<T> {
+  return resolutionProbe.run(probe, action);
+}
+
+type ExecutionProbe = (event: GitExecutionEvent) => ExecOutcome | void;
+const executionProbe = new AsyncLocalStorage<ExecutionProbe>();
+export function withGitExecutionProbe<T>(probe: ExecutionProbe, action: () => Promise<T>): Promise<T> {
+  return executionProbe.run(probe, action);
+}
+export async function runGit(ctx: GitOperationContext, args: string[], cwd: string, stdin?: Buffer): Promise<ExecOutcome> {
+  // Index readers can invoke repository-local fsmonitor before status runs.
+  // Suppress it on every index/attribute probe, including recursive children.
+  if (args[0] === "ls-files" || args[0] === "check-attr") args = ["-c", "core.fsmonitor=", ...args];
+  const injected = executionProbe.getStore()?.({ ctx, args, cwd, stdin });
+  return injected ?? executeGit(ctx, args, cwd, stdin);
 }
 
 export function commandFailedError(operation: string, outcome: ExecOutcome): GitError {

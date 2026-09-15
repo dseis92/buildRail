@@ -162,18 +162,21 @@ async function resolveGitDirs(
   return gitOk({ gitDir: realpathOrSelf(gitDir), gitCommonDir: realpathOrSelf(gitCommonDir) });
 }
 
-/**
- * Validates a candidate Git repository root using the same Git-first
- * sequence as resolveRepository's own algorithm, but WITHOUT the
- * step-3 toplevel-comparison requirement — used both by the top-level
- * resolveRepository and by §18's submodule-enumeration mechanism, which
- * needs the resolved gitDir/gitCommonDir themselves, not merely a
- * pass/fail outcome.
- */
-export async function validateRepositoryAt(
+/** Complete post-capability repository resolution, shared by every public Git operation. */
+export async function resolveRepositoryWithContext(
   ctx: GitOperationContext,
   candidateRoot: string,
 ): Promise<GitResult<RepositoryInfo>> {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(candidateRoot);
+  } catch {
+    return gitFail("PROJECT_ROOT_NOT_FOUND", "projectRoot does not exist.");
+  }
+  if (!stat.isDirectory()) {
+    return gitFail("PROJECT_ROOT_NOT_FOUND", "projectRoot is not a directory.");
+  }
+
   const isBareOutcome = await runGit(ctx, ["rev-parse", "--is-bare-repository"], candidateRoot);
   if (!isBareOutcome.ok) {
     const error = await classifyBareCheckFailure(candidateRoot);
@@ -263,15 +266,5 @@ export async function resolveRepository(projectRoot: string): Promise<GitResult<
   if (!prep.ok) return { ok: false, error: prep.error };
   const ctx = prep.value;
 
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(projectRoot);
-  } catch {
-    return gitFail("PROJECT_ROOT_NOT_FOUND", "projectRoot does not exist.");
-  }
-  if (!stat.isDirectory()) {
-    return gitFail("PROJECT_ROOT_NOT_FOUND", "projectRoot is not a directory.");
-  }
-
-  return validateRepositoryAt(ctx, projectRoot);
+  return resolveRepositoryWithContext(ctx, projectRoot);
 }
