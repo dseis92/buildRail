@@ -98,7 +98,7 @@ test("matchProtectedPaths: extglob pattern matched literally, not as extglob syn
   assert.equal(r.matches.length, 1);
 });
 
-test("matchProtectedPaths: bracket expression and brace expansion both match as expected", () => {
+test("matchProtectedPaths: brace expansion produces matches for both alternatives", () => {
   const r = matchProtectedPaths(
     [
       { path: "src/auth/x.ts", origin: "current" },

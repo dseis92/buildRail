@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { GitError, GitResult } from "./errors.js";
 import { gitFail, gitOk } from "./errors.js";
-import { commandFailedError, prepareGitOperation, runGit, typedError, type GitOperationContext } from "./internal/exec.js";
+import { commandFailedError, prepareGitOperation, runGit, typedError, type GitOperationContext, type ExecOutcome } from "./internal/exec.js";
 import { removeTrailingNewline, strictDecode } from "./internal/git-parse.js";
 import type { RepositoryInfo } from "./types.js";
 
@@ -114,11 +114,12 @@ function findAncestorMarker(startDir: string): AncestorMarker | null {
   }
 }
 
-async function classifyBareCheckFailure(projectRoot: string): Promise<GitError> {
+async function classifyBareCheckFailure(projectRoot: string, outcome: ExecOutcome): Promise<GitError> {
   if (hasNonBareShape(projectRoot) || hasBareShape(projectRoot)) {
     return typedError(
       "GIT_COMMAND_FAILED",
       "git rev-parse --is-bare-repository failed against a repository whose shape is present at projectRoot.",
+      outcome.stderr.toString("utf-8") || outcome.errno || `exit code ${outcome.code}`,
     );
   }
 
@@ -179,7 +180,7 @@ export async function resolveRepositoryWithContext(
 
   const isBareOutcome = await runGit(ctx, ["rev-parse", "--is-bare-repository"], candidateRoot);
   if (!isBareOutcome.ok) {
-    const error = await classifyBareCheckFailure(candidateRoot);
+    const error = await classifyBareCheckFailure(candidateRoot, isBareOutcome);
     return { ok: false, error };
   }
 
