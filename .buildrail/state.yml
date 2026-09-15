@@ -9,7 +9,7 @@ project:
   name: BuildRail
 
 current:
-  lifecycle_state: HUMAN_QA
+  lifecycle_state: MERGE_AUTHORIZED
   development_phase: BR3
 
 authorization:
@@ -56,7 +56,7 @@ baselines:
 # c3996dd6b764bfd2246277e92e3bef03e84179dc) — is now implemented on
 # feature/br3-git-inspection; implementation candidate
 # b12f9a59cf79e7025f929b8f712c0a37384b8c7f has passed independent review
-# and is currently undergoing Human QA before BR3 can be frozen.
+# and Human QA, and merge has been explicitly authorized by the Human Owner.
 # Verification-report generation remains unimplemented until BR4.
 completed_phases:
   - BR0
